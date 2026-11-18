@@ -9,6 +9,7 @@ from database.db_manager import (
     add_corte,
     list_cortes,
     update_corte_status,
+    save_analysis,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "add_corte",
     "list_cortes",
     "update_corte_status",
+    "save_analysis",
 ]

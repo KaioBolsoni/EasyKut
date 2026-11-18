@@ -227,3 +227,43 @@ def update_corte_status(
         cursor.execute(query, params)
         conn.commit()
         return cursor.rowcount > 0
+
+
+def save_analysis(
+    video_id: int,
+    transcript: Any,
+    analysis_data: Any,
+    db_path: Optional[Path] = None
+) -> List[int]:
+    """
+    Salva a análise de cortes gerada pela IA para um determinado vídeo.
+    Compatível com listas de dicionários ou objetos contendo a chave 'cortes'.
+    Atualiza o status do vídeo para 'analyzed' e insere cada corte na tabela 'cortes'.
+    Retorna a lista de IDs dos cortes gerados.
+    """
+    # Atualiza o status do vídeo
+    update_video_status(video_id=video_id, status="analyzed", db_path=db_path)
+
+    # Normaliza lista de cortes
+    cortes = []
+    if isinstance(analysis_data, dict):
+        cortes = analysis_data.get("cortes", []) or analysis_data.get("cuts", [])
+    elif isinstance(analysis_data, list):
+        cortes = analysis_data
+
+    inserted_ids: List[int] = []
+    for c in cortes:
+        if isinstance(c, dict):
+            c_id = add_corte(
+                video_id=video_id,
+                start_time=float(c.get("start_time", 0.0)),
+                end_time=float(c.get("end_time", 0.0)),
+                title=str(c.get("title", "")),
+                virality_score=float(c.get("virality_score", 0.0)),
+                justification=str(c.get("justification", "")),
+                status="pending",
+                db_path=db_path
+            )
+            inserted_ids.append(c_id)
+
+    return inserted_ids
