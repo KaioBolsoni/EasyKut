@@ -70,12 +70,15 @@ Para abrir o EasyKut no Windows sem precisar digitar comandos no terminal:
    - Selecione o **Formato e Enquadramento** desejado (Face Tracking 9:16, Fundo Desfocado 9:16, Recorte Central 9:16 ou Horizontal 16:9).
    - Marque ou desmarque a opção **Queimar legendas automáticas sincronizadas (.srt)**.
    - Defina a **Qualidade Máxima de Download** (`720p` ou `1080p`) e o **Limite Máximo de Cortes a Renderizar** (1 a 6).
-2. **Aba `🚀 Processar Novo Vídeo`:**
-   - Cole a URL de um vídeo público do YouTube e clique em **✨ Criar Cortes Automáticos**.
-   - Acompanhe a barra de progresso nas 6 etapas (Metadados ➔ Áudio ➔ Transcrição Whisper ➔ Curadoria IA ➔ Vídeo HD ➔ Renderização FFmpeg).
-   - Assista aos clipes gerados diretamente na galeria e clique em **⬇️ Baixar Corte (.mp4)**.
+2. **Aba `🚀 Processar Novo Vídeo` (Fluxo em 2 Passos):**
+   - **Passo 1 (Analisar Vídeo):** Cole a URL do YouTube e clique em **🔍 Analisar Vídeo & Detectar Cortes**. O app baixa apenas o áudio leve, transcreve com Whisper e analisa com IA, exibindo os tempos em tempo real com `st.status`.
+   - **Revisão Interativa (Human-in-the-Loop):** Ajuste os títulos, refine os segundos de início e fim e marque quais cortes deseja renderizar.
+   - **Passo 2 (Renderizar Cortes Selecionados):** Clique em **🎬 Renderizar Cortes Selecionados**. O app baixa o vídeo em HD sob demanda e renderiza apenas os trechos aprovados.
+   - Assista aos clipes prontos na galeria persistente e baixe os arquivos `.mp4` com 1 clique.
 3. **Aba `📂 Histórico & Cortes Salvos`:**
-   - Consulte todos os vídeos processados anteriormente, expanda para rever os cortes, baixe os arquivos `.mp4` ou exclua registros do banco de dados.
+   - Botão **📂 Abrir Pasta de Cortes** para acessar `data/cortes/` direto no Explorador de Arquivos do Windows.
+   - Filtros de **busca por título/URL** e **nota mínima de viralidade**.
+   - Reproduza cortes antigos, baixe clipes e exclua registros com opção de apagar também os arquivos físicos do disco.
 
 ---
 

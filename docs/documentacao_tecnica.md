@@ -46,8 +46,8 @@ cortador_automatico/
 
 | Módulo / Arquivo | Responsabilidade Técnica |
 | :--- | :--- |
-| `app.py` | Ponto de entrada da interface gráfica em Streamlit. Renderiza o painel de controle lateral (diagnóstico de chaves/FFmpeg, seleção de modelo IA, modo de enquadramento, toggle de legendas, resolução 720p/1080p, limite de cortes e limpeza manual) e duas abas principais: **Processar Novo Vídeo** (esteira de 6 etapas com barra de progresso e galeria de download) e **Histórico & Cortes Salvos** (listagem do SQLite, player embutido e exclusão em cascata). |
-| `core/config.py` | Injeta automaticamente diretórios conhecidos do FFmpeg (`C:\ffmpeg\bin`, `C:\Ghost Toolbox\wget\Youtube-DLP`, `C:\ProgramData\chocolatey\bin`) na variável `os.environ["PATH"]`. Define e cria as pastas `DATA_DIR`, `DOWNLOADS_DIR`, `CUTS_DIR` e `PROMPTS_DIR`. Carrega o arquivo `.env` de forma determinística e disponibiliza `validate_config()` para verificar `GROQ_API_KEY`, `GEMINI_API_KEY` e `FFMPEG_AVAILABLE`. |
+| `app.py` | Ponto de entrada da interface gráfica em Streamlit. Implementa o fluxo em **2 Passos** com revisão **Human-in-the-Loop** antes de renderizar: Passo 1 (download apenas de áudio, transcrição Whisper, análise IA ordenada por `virality_score` decrescente e persistência em `st.session_state`), Tela de Revisão (ajuste fino de início, fim, título e seleção dos cortes), Passo 2 (download do vídeo HD e renderização via FFmpeg/OpenCV apenas dos clipes selecionados com feedback rico via `st.status`), Galeria Persistente pós-rerun e Aba de Histórico com busca por título, nota mínima, exclusão de arquivos físicos e botão para abrir pasta no Explorador. |
+| `core/config.py` | Injeta automaticamente diretórios conhecidos do FFmpeg (`C:\ffmpeg\bin`, `C:\Ghost Toolbox\wget\Youtube-DLP`, `C:\ProgramData\chocolatey\bin`) na variável `os.environ["PATH"]`. Define e cria as pastas `DATA_DIR`, `DOWNLOADS_DIR`, `CUTS_DIR` e `PROMPTS_DIR`. Carrega o arquivo `.env` de forma determinística e disponibiliza `validate_config(provider)` com validação flexível (exigindo `GROQ_API_KEY` + `FFMPEG` como base, e `GEMINI_API_KEY` apenas se Gemini for selecionado). |
 | `core/downloader.py` | Valida URLs com regex (`is_valid_video_url`), sanitiza nomes de arquivos (`sanitize_filename`), consulta metadados sem baixar mídia (`extract_video_info`), baixa áudio comprimido em MP3 64kbps via pós-processador `FFmpegExtractAudio` (`download_audio`) e baixa o vídeo em MP4 limitado à altura máxima escolhida (`download_video`). |
 | `core/ai_apis.py` | Gerencia clientes autenticados da Groq (`get_groq_client`) e Google GenAI (`get_gemini_client`). Executa a transcrição com timestamps via `transcribe_audio_groq` (`whisper-large-v3-turbo`), formata a transcrição em linhas `[MM:SS - MM:SS (start -> end)] texto` (`format_transcript_with_timestamps`), realiza a curadoria viral via Gemini (`analyze_viral_cuts_gemini`) ou Groq (`analyze_viral_cuts_groq`) sob orientação de `prompts/diretor_cortes.txt`, orquestra o chaveamento automático entre provedores (`detect_viral_moments`) e sanitiza o JSON retornado (`_clean_and_parse_json`). |
 | `core/video_engine.py` | Valida binários (`check_ffmpeg`), extrai metadados técnicos via `ffprobe` (`get_video_metadata`), converte segundos em timestamp SRT (`format_srt_time`), gera legendas `.srt` ajustadas para `00:00:00,000` (`generate_srt_for_segment`), executa rastreamento facial compatível com OpenCV 4 e 5 (`_FaceDetectorWrapper` e `detect_smooth_face_crop_x`), monta e executa a linha de comando FFmpeg para os 4 modos de corte (`cut_video`), gera thumbnails JPEG (`extract_frame_thumbnail`) e remove arquivos temporários (`cleanup_temporary_files`). |
@@ -57,43 +57,62 @@ cortador_automatico/
 
 ---
 
-## 2. Fluxo de Dados Ponta a Ponta
+## 2. Fluxo de Dados Ponta a Ponta (Fluxo em 2 Passos com Revisão Interativa)
 
 ```mermaid
 flowchart TD
-    A["1. Ingestão (URL YouTube)"] --> B["yt-dlp: extract_video_info() & add_video() no SQLite"]
-    B --> C["yt-dlp: download_audio() -> data/downloads/{id}_audio.mp3 (64kbps)"]
-    C --> D["2. Transcrição: transcribe_audio_groq() (whisper-large-v3-turbo)"]
-    D --> E["Segmentos temporais: [{start, end, text}, ...]"]
-    E --> F["3. Análise & Scoring: detect_viral_moments() (Gemini / Groq LLM)"]
-    F --> G["Parser & Sanitização JSON: _clean_and_parse_json()"]
-    G --> H["yt-dlp: download_video() -> data/downloads/{id}_video.mp4 (720p/1080p)"]
-    H --> I["Loop sobre os N cortes (até max_cuts_limit)"]
-    I --> J["4. Legenda: generate_srt_for_segment() -> data/temp/sub_{start}_{end}.srt"]
-    J --> K["5. Face Tracking (se modo face_tracking_9_16): detect_smooth_face_crop_x()"]
-    K --> L["6. Renderização FFmpeg: cut_video() -> data/cortes/{stem}_cut_{start}_{end}.mp4"]
-    L --> M["Atualiza SQLite: update_corte_status(completed) & update_video_status(completed)"]
-    M --> N["7. Limpeza: cleanup_temporary_files() remove data/temp/*"]
+    subgraph Passo1["Passo 1: Ingestão e Curadoria com IA"]
+        A["URL do YouTube"] --> B["yt-dlp: extract_video_info() & add_video()"]
+        B --> C["yt-dlp: download_audio() -> MP3 48kbps mono 16kHz"]
+        C --> D["Groq Whisper: transcribe_audio_groq()"]
+        D --> E["IA Generativa: detect_viral_moments() (Gemini / Groq)"]
+        E --> F["Ordenação por virality_score decrescente"]
+        F --> G["Persistência em st.session_state['analise_atual'] & save_analysis()"]
+    end
+
+    subgraph Revisao["Tela de Revisão (Human-in-the-Loop)"]
+        G --> H["Exibição dos cartões de corte editáveis"]
+        H --> I["Usuário: marca/desmarca cortes, edita títulos, ajusta start_time e end_time"]
+    end
+
+    subgraph Passo2["Passo 2: Renderização dos Cortes Selecionados"]
+        I --> J["Botão: Renderizar Cortes Selecionados"]
+        J --> K["yt-dlp: download_video() em 720p/1080p (apenas sob demanda)"]
+        K --> L["Loop sobre cortes marcados (selected=True)"]
+        L --> M["Geração SRT (generate_srt_for_segment)"]
+        M --> N["Face Tracking OpenCV (cap.grab acelerado)"]
+        N --> O["FFmpeg: renderização do corte 9:16 vertical"]
+        O --> P["Atualiza SQLite (update_corte_status) e salva em st.session_state['ultimos_cortes']"]
+    end
+
+    subgraph Galeria["Galeria Persistente"]
+        P --> Q["Renderização fora de blocos condicionais: player de vídeo e download seguro"]
+    end
 ```
 
-### Detalhamento das 7 Etapas do Pipeline
+### Detalhamento das Etapas do Pipeline
 
-1. **Ingestão (`core/downloader.py`):**
-   - A URL informada é validada por `is_valid_video_url()`.
-   - `extract_video_info()` coleta `id`, `title`, `duration`, `thumbnail`, `uploader` e `view_count` sem baixar o vídeo.
-   - O registro inicial é criado na tabela `videos` com `status="processing"`.
-   - `download_audio()` baixa a melhor faixa de áudio e a converte em `data/downloads/{id}_audio.mp3` (64kbps) para reduzir latência de upload na API de transcrição. O status no banco avança para `"transcribing"`.
+1. **Passo 1 — Ingestão e Curadoria Inicial:**
+   - O usuário insere a URL do YouTube e clica em **"🔍 Analisar Vídeo & Detectar Cortes"**.
+   - O `yt-dlp` coleta metadados (`extract_video_info`) e registra o vídeo no SQLite com `status="processing"`.
+   - Baixa exclusivamente a faixa de áudio leve (`download_audio`) em mono 16kHz (48kbps), otimizando o envio e reduzindo a latência.
+   - `transcribe_audio_groq` transcreve o áudio com `whisper-large-v3-turbo` na Groq Cloud.
+   - `detect_viral_moments` analisa os ganchos e momentos de retenção com o provedor escolhido (**Gemini** ou **Groq LLM**).
+   - Os cortes retornados são ordenados de forma estrita pelo maior `virality_score` e salvos em `st.session_state["analise_atual"]`.
+   - O feedback visual de cada etapa e seu tempo de execução são exibidos em tempo real via `st.status(..., expanded=True)`.
 
-2. **Transcrição (`core/ai_apis.py`):**
-   - `transcribe_audio_groq()` envia o binário `.mp3` para a Groq Cloud utilizando o modelo `whisper-large-v3-turbo` com `response_format="verbose_json"`, `language="pt"` e `temperature=0.0`.
-   - Os segmentos retornados são normalizados em uma lista de dicionários `{"start": float, "end": float, "text": str}`.
+2. **Tela de Revisão Interativa (Human-in-the-Loop):**
+   - Apresenta os metadados do vídeo (thumbnail, título, duração e canal) e cartões para cada corte sugerido.
+   - O usuário pode marcar ou desmarcar quais cortes deseja renderizar, editar o título gerado e ajustar com precisão milimétrica os segundos de `Início` e `Fim`.
+   - Isso evita o download desnecessário de vídeos de horas inteiras caso o usuário queira descartar ou ajustar trechos antes da renderização.
 
-3. **Análise e Scoring Viral (`core/ai_apis.py`):**
-   - `format_transcript_with_timestamps()` converte os segmentos no formato textual `[MM:SS - MM:SS (start.s -> end.s)] Texto`.
-   - `detect_viral_moments()` combina o conteúdo de `prompts/diretor_cortes.txt` com a transcrição e consulta o provedor selecionado:
-     - **Primário (Gemini):** modelo `gemini-3.1-flash-lite` com `response_mime_type="application/json"` e `temperature=0.3`.
-     - **Alternativo / Fallback (Groq):** modelo `openai/gpt-oss-120b` (com fallback interno imediato para `qwen/qwen3.8-27b`) com `response_format={"type": "json_object"}` e `temperature=0.3`.
-   - `_clean_and_parse_json()` remove blocos markdown (` ```json `), decodifica o JSON (ou recupera via regex em caso de malformação) e filtra apenas cortes válidos com duração mínima de **5.0 segundos** (`end - start >= 5.0`).
+3. **Passo 2 — Renderização Sob Demanda:**
+   - Ao clicar em **"🎬 Renderizar Cortes Selecionados"**, o sistema baixa o vídeo fonte em alta definição (`download_video`, 720p ou 1080p).
+   - O motor FFmpeg/OpenCV renderiza apenas os clipes que foram marcados com `selected=True`, aplicando legendas sincronizadas (`00:00:00,000`), Face Tracking suave e o modo de enquadramento escolhido.
+   - Os clipes prontos são salvos em `st.session_state["ultimos_cortes"]`.
+
+4. **Galeria Persistente:**
+   - A galeria é exibida fora de condicionais de botões. Clicar em qualquer botão de download gera o download do arquivo sem fazer a tela recarregar vazia.
 
 4. **Face Tracking e Estabilização (`core/video_engine.py`):**
    - Após o download do vídeo em alta resolução (`download_video()`), se o modo selecionado for `face_tracking_9_16`, `cut_video()` calcula a largura do recorte 9:16 proporcional à altura original (`crop_w = int(orig_h * (9.0 / 16.0))`, ajustado para número par) e aciona `detect_smooth_face_crop_x()`.

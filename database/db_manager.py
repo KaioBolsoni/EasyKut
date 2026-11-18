@@ -145,13 +145,24 @@ def update_video_status(
         return cursor.rowcount > 0
 
 
-def list_videos(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+def list_videos(
+    search: Optional[str] = None,
+    db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
     """
-    Lista todos os vídeos cadastrados ordenados pelo mais recente.
+    Lista vídeos cadastrados ordenados pelo mais recente.
+    Suporta busca parcial por título ou URL.
     """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM videos ORDER BY created_at DESC, id DESC")
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            cursor.execute(
+                "SELECT * FROM videos WHERE title LIKE ? OR url LIKE ? ORDER BY created_at DESC, id DESC",
+                (term, term)
+            )
+        else:
+            cursor.execute("SELECT * FROM videos ORDER BY created_at DESC, id DESC")
         return [dict(row) for row in cursor.fetchall()]
 
 
@@ -217,16 +228,37 @@ def add_corte(
         return cursor.lastrowid
 
 
-def list_cortes(video_id: Optional[int] = None, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+def list_cortes(
+    video_id: Optional[int] = None,
+    min_virality_score: Optional[float] = None,
+    search: Optional[str] = None,
+    db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
     """
-    Lista cortes cadastrados. Se video_id for fornecido, filtra por ele.
+    Lista cortes cadastrados. Suporta filtros opcionais por video_id, nota mínima de viralidade e busca por título.
     """
+    conditions = []
+    params: List[Any] = []
+
+    if video_id is not None:
+        conditions.append("video_id = ?")
+        params.append(video_id)
+
+    if min_virality_score is not None and min_virality_score > 0:
+        conditions.append("virality_score >= ?")
+        params.append(min_virality_score)
+
+    if search and search.strip():
+        conditions.append("title LIKE ?")
+        params.append(f"%{search.strip()}%")
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    order_clause = "ORDER BY start_time ASC" if video_id is not None else "ORDER BY created_at DESC, id DESC"
+    query = f"SELECT * FROM cortes {where_clause} {order_clause}"
+
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
-        if video_id is not None:
-            cursor.execute("SELECT * FROM cortes WHERE video_id = ? ORDER BY start_time ASC", (video_id,))
-        else:
-            cursor.execute("SELECT * FROM cortes ORDER BY created_at DESC, id DESC")
+        cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
 
