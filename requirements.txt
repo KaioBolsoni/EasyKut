@@ -1,7 +1,7 @@
 ﻿streamlit
 yt-dlp
 ffmpeg-python
-opencv-python
+opencv-python<5
 groq
 google-genai
 python-dotenv
