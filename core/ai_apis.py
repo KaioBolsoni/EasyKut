@@ -65,16 +65,39 @@ def transcribe_audio_groq(
     if not path.exists():
         raise FileNotFoundError(f"Arquivo de áudio não encontrado: {audio_path}")
 
+    # Validação e tratamento do limite de 25 MB da API Groq Whisper
+    target_audio_path = path
+    if path.stat().st_size > 24 * 1024 * 1024:
+        logger.warning(
+            "Arquivo de áudio (%.2f MB) excede a margem de segurança de 24 MB da API Groq. "
+            "Recomprimindo com FFmpeg para caber no limite...",
+            path.stat().st_size / (1024 * 1024)
+        )
+        compressed = path.parent / f"{path.stem}_groq_opt.mp3"
+        try:
+            import subprocess
+            cmd = [
+                "ffmpeg", "-y", "-i", str(path),
+                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "24k",
+                str(compressed)
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+            if compressed.exists() and compressed.stat().st_size > 0:
+                target_audio_path = compressed
+                logger.info("Áudio recomprimido com sucesso para %.2f MB.", compressed.stat().st_size / (1024 * 1024))
+        except Exception as comp_err:
+            logger.warning("Falha ao recomprimir áudio: %s. Tentando envio do arquivo original.", comp_err)
+
     last_error: Optional[Exception] = None
 
     for attempt in range(max_retries):
         try:
             logger.info("Iniciando transcrição com Groq Whisper (%s) [Tentativa %d/%d]: %s",
-                        model, attempt + 1, max_retries, path.name)
+                        model, attempt + 1, max_retries, target_audio_path.name)
 
-            with open(path, "rb") as audio_file:
+            with open(target_audio_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
-                    file=(path.name, audio_file.read()),
+                    file=(target_audio_path.name, audio_file.read()),
                     model=model,
                     response_format="verbose_json",
                     language=language,

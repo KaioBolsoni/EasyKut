@@ -89,10 +89,13 @@ def download_audio(
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(target_dir / "%(id)s_audio.%(ext)s"),
+        "postprocessor_args": {
+            "FFmpegExtractAudio": ["-ac", "1", "-ar", "16000"]
+        },
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "64",
+            "preferredquality": "48",
         }],
         "quiet": True,
         "no_warnings": True,

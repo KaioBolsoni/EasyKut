@@ -189,8 +189,9 @@ with tab_novo:
         if not input_url or not is_valid_video_url(input_url):
             st.error("Por favor, insira uma URL de vídeo válida (YouTube).")
         elif not is_ready:
-            st.error("As configurações de ambiente não estão completas. Verifique suas chaves no .env e a presença do FFmpeg.")
+            st.error("As configurações mínimas de ambiente não estão completas. Verifique a GROQ_API_KEY no .env e a presença do FFmpeg.")
         else:
+            st.session_state["ultimos_cortes"] = []
             progress_bar = st.progress(0, text="Iniciando esteira de produção...")
             status_placeholder = st.empty()
 
@@ -233,7 +234,11 @@ with tab_novo:
                     st.warning("A IA não detectou segmentos com critérios de viralização suficientes para corte.")
                     update_video_status(video_id, status="completed_no_cuts")
                 else:
-                    st.success(f"🎯 IA identificou {len(cortes_detectados)} potenciais cortes virais!")
+                    # Ordena cortes pelo maior score de viralidade antes de fatiar
+                    cortes_detectados.sort(key=lambda x: float(x.get("virality_score", 0.0)), reverse=True)
+                    cortes_para_renderizar = cortes_detectados[:max_cuts_limit]
+
+                    st.success(f"🎯 IA identificou {len(cortes_detectados)} potenciais cortes virais! Priorizando os {len(cortes_para_renderizar)} de maior score.")
 
                     # 5. Download do Vídeo em Alta Definição
                     status_placeholder.info(f"🎥 [5/6] Baixando vídeo fonte em {max_resolution}p...")
@@ -242,12 +247,12 @@ with tab_novo:
                     update_video_status(video_id, status="cutting", file_path=video_file)
 
                     # 6. Renderização dos Cortes com FFmpeg
-                    status_placeholder.info(f"⚡ [6/6] Renderizando {min(len(cortes_detectados), max_cuts_limit)} cortes em formato 9:16 vertical...")
+                    status_placeholder.info(f"⚡ [6/6] Renderizando {len(cortes_para_renderizar)} cortes em formato 9:16 vertical...")
                     cortes_renderizados = []
 
-                    for idx, c in enumerate(cortes_detectados[:max_cuts_limit]):
-                        current_step = 75 + int(((idx + 1) / max_cuts_limit) * 23)
-                        progress_bar.progress(current_step, text=f"[6/6] Renderizando corte {idx+1}/{max_cuts_limit}: '{c['title']}'...")
+                    for idx, c in enumerate(cortes_para_renderizar):
+                        current_step = 75 + int(((idx + 1) / len(cortes_para_renderizar)) * 23)
+                        progress_bar.progress(current_step, text=f"[6/6] Renderizando corte {idx+1}/{len(cortes_para_renderizar)}: '{c['title']}'...")
 
                         # Salva registro no banco
                         corte_db_id = add_corte(
@@ -279,33 +284,12 @@ with tab_novo:
                     if auto_clean:
                         cleanup_temporary_files(remove_raw_downloads=False)
 
+                    # Salva no estado da sessão para persistir a galeria após cliques de download
+                    st.session_state["ultimos_cortes"] = cortes_renderizados
+                    st.session_state["ultimo_video_title"] = video_title
+
                     progress_bar.progress(100, text="✨ Todos os cortes foram renderizados com sucesso!")
                     status_placeholder.success("🎉 Processo concluído com êxito! Confira os cortes gerados abaixo:")
-
-                    # Exibição dos Cortes Gerados
-                    st.markdown("---")
-                    st.markdown("### 🎬 Galeria de Cortes Gerados (9:16)")
-
-                    cols = st.columns(min(3, max(1, len(cortes_renderizados))))
-                    for i, corte in enumerate(cortes_renderizados):
-                        with cols[i % len(cols)]:
-                            st.markdown(f"#### ✂️ {corte['title']}")
-                            st.markdown(f"⭐ **Viral Score:** `{corte['virality_score']}/10`")
-                            st.caption(f"⏱️ **Tempo:** {corte['start_time']}s até {corte['end_time']}s ({corte['end_time'] - corte['start_time']:.1f}s)")
-                            st.info(f"💡 *{corte['justification']}*")
-
-                            # Player de vídeo
-                            if os.path.exists(corte["output_path"]):
-                                st.video(corte["output_path"])
-                                with open(corte["output_path"], "rb") as vf:
-                                    st.download_button(
-                                        label=f"⬇️ Baixar Corte {i+1} (.mp4)",
-                                        data=vf.read(),
-                                        file_name=Path(corte["output_path"]).name,
-                                        mime="video/mp4",
-                                        key=f"dl_corte_{corte['corte_db_id']}_{i}",
-                                        use_container_width=True
-                                    )
 
             except Exception as e:
                 status_placeholder.empty()
@@ -313,6 +297,36 @@ with tab_novo:
                 st.error(f"Erro durante o processamento: {str(e)}")
                 if 'video_id' in locals():
                     update_video_status(video_id, status="failed")
+
+    # Exibição Persistente dos Cortes Recentes (fora de btn_processar para sobreviver a reruns)
+    if st.session_state.get("ultimos_cortes"):
+        st.markdown("---")
+        st.markdown(f"### 🎬 Galeria de Cortes Gerados (9:16) — {st.session_state.get('ultimo_video_title', 'Vídeo Recente')}")
+
+        cortes_exibir = st.session_state["ultimos_cortes"]
+        cols = st.columns(min(3, max(1, len(cortes_exibir))))
+        for i, corte in enumerate(cortes_exibir):
+            with cols[i % len(cols)]:
+                st.markdown(f"#### ✂️ {corte['title']}")
+                st.markdown(f"⭐ **Viral Score:** `{corte['virality_score']}/10`")
+                st.caption(f"⏱️ **Tempo:** {corte['start_time']}s até {corte['end_time']}s ({corte['end_time'] - corte['start_time']:.1f}s)")
+                st.info(f"💡 *{corte['justification']}*")
+
+                # Player de vídeo e download seguro
+                out_p = corte.get("output_path", "")
+                if out_p and os.path.exists(out_p):
+                    st.video(out_p)
+                    with open(out_p, "rb") as vf:
+                        st.download_button(
+                            label=f"⬇️ Baixar Corte {i+1} (.mp4)",
+                            data=vf.read(),
+                            file_name=Path(out_p).name,
+                            mime="video/mp4",
+                            key=f"dl_corte_recent_{corte.get('corte_db_id', i)}_{i}",
+                            use_container_width=True
+                        )
+                else:
+                    st.warning("Arquivo de vídeo não encontrado no disco.")
 
 # ------------------------------------------
 # ABA 2: HISTÓRICO & CORTES SALVOS
@@ -331,8 +345,8 @@ with tab_historico:
                     st.markdown(f"**URL:** [{vid['url']}]({vid['url']})")
                     st.markdown(f"**Duração:** {vid['duration']}s | **Criado em:** {vid['created_at']}")
                 with col_h2:
-                    if st.button("🗑️ Excluir Registro", key=f"del_vid_{vid['id']}", type="secondary"):
-                        delete_video(vid['id'])
+                    if st.button("🗑️ Excluir Registro e Arquivos", key=f"del_vid_{vid['id']}", type="secondary"):
+                        delete_video(vid['id'], delete_files=True)
                         st.rerun()
 
                 # Cortes associados a este vídeo

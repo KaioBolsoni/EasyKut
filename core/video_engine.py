@@ -363,6 +363,7 @@ def detect_smooth_face_crop_x(
             return None
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_step = max(1, int(fps * sample_rate_sec))
         cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
 
         history_x: deque = deque(maxlen=window_size)
@@ -403,10 +404,11 @@ def detect_smooth_face_crop_x(
                 moving_avg = sum(history_x) / len(history_x)
                 smoothed_x_list.append(moving_avg)
 
-            # Salta para o próximo intervalo de amostragem
+            # Salta frames intermediários com grab rápido (otimização de decodificação sequencial)
+            for _ in range(frame_step - 1):
+                if not cap.grab():
+                    break
             current_sec += sample_rate_sec
-            current_frame_pos = int(current_sec * fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
 
         cap.release()
 
@@ -443,6 +445,9 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
         drive = clean_path[0]
         rest = clean_path[2:]
         clean_path = f"{drive}\\:{rest}"
+
+    # Escapa apóstrofos e colchetes no caminho para o parser do FFmpeg
+    clean_path = clean_path.replace("'", "'\\''").replace("[", "\\[").replace("]", "\\]")
 
     if is_vertical:
         # Estilo para Shorts/Reels/TikTok: texto centralizado, destaque em caixa ou borda nítida

@@ -48,13 +48,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 def validate_config() -> Tuple[bool, Dict[str, bool]]:
     """
-    Verifica a presença das chaves de API necessárias para o funcionamento do sistema.
-    Retorna uma tupla (todas_validas, status_detalhado).
+    Verifica a presença das chaves de API e binários necessários para o funcionamento.
+    O sistema é considerado apto para execução se o FFmpeg e a GROQ_API_KEY
+    estiverem configurados (a Groq atende tanto transcrição quanto curadoria por LLM).
+    Retorna uma tupla (sistema_pronto, status_detalhado).
     """
+    has_groq = bool(GROQ_API_KEY and not GROQ_API_KEY.startswith("sua_chave"))
+    has_gemini = bool(GEMINI_API_KEY and not GEMINI_API_KEY.startswith("sua_chave"))
+    has_ffmpeg = FFMPEG_AVAILABLE
+
     status = {
-        "GROQ_API_KEY": bool(GROQ_API_KEY and not GROQ_API_KEY.startswith("sua_chave")),
-        "GEMINI_API_KEY": bool(GEMINI_API_KEY and not GEMINI_API_KEY.startswith("sua_chave")),
-        "FFMPEG": FFMPEG_AVAILABLE,
+        "GROQ_API_KEY": has_groq,
+        "GEMINI_API_KEY": has_gemini,
+        "FFMPEG": has_ffmpeg,
     }
-    all_valid = all(status.values())
-    return all_valid, status
+    is_ready = has_ffmpeg and has_groq
+    return is_ready, status

@@ -155,12 +155,39 @@ def list_videos(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
         return [dict(row) for row in cursor.fetchall()]
 
 
-def delete_video(video_id: int, db_path: Optional[Path] = None) -> bool:
+def delete_video(video_id: int, delete_files: bool = True, db_path: Optional[Path] = None) -> bool:
     """
-    Remove um vídeo e seus cortes associados (via cascade).
+    Remove um vídeo e seus cortes associados (via cascade no SQLite).
+    Se delete_files=True, remove também os arquivos físicos do disco (vídeos, áudios e cortes).
     """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
+
+        if delete_files:
+            # Coleta caminhos de mídias brutas associadas
+            cursor.execute("SELECT file_path, audio_path FROM videos WHERE id = ?", (video_id,))
+            vid_row = cursor.fetchone()
+            files_to_delete = []
+            if vid_row:
+                if vid_row["file_path"]:
+                    files_to_delete.append(Path(vid_row["file_path"]))
+                if vid_row["audio_path"]:
+                    files_to_delete.append(Path(vid_row["audio_path"]))
+
+            # Coleta caminhos de cortes renderizados
+            cursor.execute("SELECT output_path FROM cortes WHERE video_id = ?", (video_id,))
+            for c_row in cursor.fetchall():
+                if c_row["output_path"]:
+                    files_to_delete.append(Path(c_row["output_path"]))
+
+            # Exclui arquivos físicos com segurança
+            for f in files_to_delete:
+                try:
+                    if f.exists() and f.is_file():
+                        f.unlink()
+                except Exception:
+                    pass
+
         cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         conn.commit()
         return cursor.rowcount > 0
