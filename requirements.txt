@@ -1,0 +1,7 @@
+﻿streamlit
+yt-dlp
+ffmpeg-python
+opencv-python
+groq
+google-genai
+python-dotenv
