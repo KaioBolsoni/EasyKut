@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 TEMP_DIR = DATA_DIR / "temp"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+MODELS_DIR = DATA_DIR / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+YUNET_MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_PATH = MODELS_DIR / YUNET_MODEL_NAME
+YUNET_DOWNLOAD_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
 
 
 def check_ffmpeg() -> None:
@@ -152,6 +160,179 @@ def generate_srt_for_segment(
     return str(dest_srt.resolve())
 
 
+def _ensure_yunet_model() -> Optional[Path]:
+    """
+    Localiza ou tenta baixar o modelo ONNX YuNet para cv2.FaceDetectorYN.
+    Retorna o Path para o modelo caso disponível, ou None em caso de falha.
+    """
+    if YUNET_MODEL_PATH.exists() and YUNET_MODEL_PATH.stat().st_size > 5000:
+        return YUNET_MODEL_PATH
+
+    alt_paths = [
+        Path(__file__).resolve().parent / "models" / YUNET_MODEL_NAME,
+        Path(__file__).resolve().parent.parent / "models" / YUNET_MODEL_NAME,
+    ]
+    for p in alt_paths:
+        if p.exists() and p.stat().st_size > 5000:
+            return p
+
+    try:
+        import urllib.request
+        logger.info("Baixando modelo facial YuNet do OpenCV Zoo para %s...", YUNET_MODEL_PATH)
+        req = urllib.request.Request(
+            YUNET_DOWNLOAD_URL,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            content = response.read()
+            if len(content) > 5000:
+                YUNET_MODEL_PATH.write_bytes(content)
+                logger.info("Modelo YuNet baixado com sucesso (%d bytes).", len(content))
+                return YUNET_MODEL_PATH
+    except Exception as exc:
+        logger.warning("Não foi possível baixar o modelo YuNet automaticamente: %s", exc)
+
+    return None
+
+
+class _FaceDetectorWrapper:
+    """
+    Detector facial unificado compatível com OpenCV 4.x e OpenCV 5.x.
+    - Se cv2.CascadeClassifier existir (OpenCV 4.x), utiliza Haar Cascade.
+    - Se não existir (OpenCV 5.x), utiliza cv2.FaceDetectorYN (YuNet) ou cv2.dnn.
+    - Mantém a priorização do maior rosto e Média Móvel.
+    - Garante fallback seguro caso nenhum modelo ou detector esteja disponível.
+    """
+    def __init__(self, target_size: Tuple[int, int] = (640, 360)):
+        self.detector_type = "none"
+        self.backend = None
+        self.target_size = target_size
+
+        # 1. Verifica dinamicamente se cv2.CascadeClassifier existe antes de usá-lo (OpenCV 4.x)
+        if hasattr(cv2, "CascadeClassifier"):
+            try:
+                cascade_dir = getattr(cv2.data, "haarcascades", "") if hasattr(cv2, "data") else ""
+                cascade_path = Path(cascade_dir) / "haarcascade_frontalface_default.xml"
+                if cascade_path.exists():
+                    cc = cv2.CascadeClassifier(str(cascade_path))
+                    if not cc.empty():
+                        self.backend = cc
+                        self.detector_type = "cascade"
+                        logger.info("Detector facial ativo: cv2.CascadeClassifier (Haar Cascade).")
+            except Exception as exc:
+                logger.debug("CascadeClassifier falhou ao inicializar: %s", exc)
+
+        # 2. Se CascadeClassifier não existir ou não carregou (OpenCV 5.x), utiliza FaceDetectorYN
+        if self.detector_type == "none" and hasattr(cv2, "FaceDetectorYN"):
+            model_path = _ensure_yunet_model()
+            if model_path:
+                try:
+                    self.backend = cv2.FaceDetectorYN.create(
+                        model=str(model_path),
+                        config="",
+                        input_size=self.target_size,
+                        score_threshold=0.6,
+                        nms_threshold=0.3,
+                        top_k=5000
+                    )
+                    self.detector_type = "facedetectoryn"
+                    logger.info("Detector facial ativo: cv2.FaceDetectorYN (YuNet ONNX).")
+                except Exception as exc:
+                    logger.warning("Falha ao inicializar cv2.FaceDetectorYN: %s", exc)
+
+        # 3. Fallback adicional para cv2.dnn
+        if self.detector_type == "none" and hasattr(cv2, "dnn"):
+            caffe_proto = MODELS_DIR / "deploy.prototxt"
+            caffe_model = MODELS_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+            if caffe_proto.exists() and caffe_model.exists():
+                try:
+                    self.backend = cv2.dnn.readNetFromCaffe(str(caffe_proto), str(caffe_model))
+                    self.detector_type = "dnn_caffe"
+                    logger.info("Detector facial ativo: cv2.dnn (Caffe SSD).")
+                except Exception as exc:
+                    logger.warning("Falha ao inicializar modelo Caffe no cv2.dnn: %s", exc)
+
+        if self.detector_type == "none":
+            logger.warning(
+                "Nenhum detector facial compatível/modelo disponível no OpenCV %s. "
+                "Enquadramento 9:16 utilizará fallback seguro para Center Crop.",
+                getattr(cv2, "__version__", "desconhecido")
+            )
+
+    def is_available(self) -> bool:
+        return self.detector_type != "none" and self.backend is not None
+
+    def detect_largest_face(self, frame: np.ndarray, scale_factor: float = 0.5) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Detecta o maior rosto no frame (priorização por maior área / falante em primeiro plano).
+        Retorna (fx, fy, fw, fh) na resolução original do frame, ou None se nenhum rosto for encontrado.
+        """
+        if not self.is_available():
+            return None
+
+        h, w = frame.shape[:2]
+        small_w = max(1, int(w * scale_factor))
+        small_h = max(1, int(h * scale_factor))
+        small_frame = cv2.resize(frame, (small_w, small_h))
+
+        try:
+            if self.detector_type == "cascade":
+                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                faces = self.backend.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=4,
+                    minSize=(int(40 * scale_factor), int(40 * scale_factor))
+                )
+                if len(faces) > 0:
+                    largest = max(faces, key=lambda f: f[2] * f[3])
+                    return (
+                        int(largest[0] / scale_factor),
+                        int(largest[1] / scale_factor),
+                        int(largest[2] / scale_factor),
+                        int(largest[3] / scale_factor),
+                    )
+
+            elif self.detector_type == "facedetectoryn":
+                self.backend.setInputSize((small_w, small_h))
+                _, faces = self.backend.detect(small_frame)
+                if faces is not None and len(faces) > 0:
+                    largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+                    return (
+                        int(float(largest[0]) / scale_factor),
+                        int(float(largest[1]) / scale_factor),
+                        int(float(largest[2]) / scale_factor),
+                        int(float(largest[3]) / scale_factor),
+                    )
+
+            elif self.detector_type == "dnn_caffe":
+                blob = cv2.dnn.blobFromImage(
+                    cv2.resize(small_frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0)
+                )
+                self.backend.setInput(blob)
+                detections = self.backend.forward()
+                best_face = None
+                max_area = 0.0
+                for i in range(detections.shape2 if hasattr(detections, "shape2") else detections.shape[2]):
+                    confidence = float(detections[0, 0, i, 2])
+                    if confidence > 0.6:
+                        box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                        bx1, by1, bx2, by2 = box.astype("int")
+                        bw = bx2 - bx1
+                        bh = by2 - by1
+                        area = bw * bh
+                        if area > max_area and bw > 20 and bh > 20:
+                            max_area = area
+                            best_face = (bx1, by1, bw, bh)
+                return best_face
+
+        except Exception as exc:
+            logger.debug("Erro na detecção de rosto: %s", exc)
+            return None
+
+        return None
+
+
 def detect_smooth_face_crop_x(
     video_path: str,
     start_time: float,
@@ -163,97 +344,90 @@ def detect_smooth_face_crop_x(
     window_size: int = 10
 ) -> Optional[int]:
     """
-    Detecta rostos nos frames do trecho utilizando OpenCV Haar Cascade.
+    Detecta rostos nos frames do trecho utilizando OpenCV (FaceDetectorYN / CascadeClassifier / dnn).
     Calcula a coordenada X com Média Móvel (Moving Average nos últimos 10 frames)
     para estabilizar o enquadramento 9:16 e evitar tremor visual (jitter).
-    Retorna a coordenada X suavizada ou None caso nenhum rosto seja detectado (fallback para center crop).
+    Prioriza o maior rosto em caso de múltiplos interlocutores.
+    Retorna a coordenada X suavizada ou None caso nenhum detector/modelo esteja disponível
+    ou nenhum rosto seja detectado (fallback seguro para center crop sem quebrar a execução).
     """
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    if face_cascade.empty():
-        logger.warning("Classificador facial Haar Cascade não carregou. Fallback para center crop.")
-        return None
+    try:
+        detector = _FaceDetectorWrapper(target_size=(int(orig_w * 0.5), int(orig_h * 0.5)))
+        if not detector.is_available():
+            logger.info("Detector facial não disponível. Fallback para center crop.")
+            return None
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        logger.warning("Não foi possível abrir o vídeo para detecção facial: %s", video_path)
-        return None
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("Não foi possível abrir o vídeo para detecção facial: %s", video_path)
+            return None
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_step = max(1, int(fps * sample_rate_sec))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
 
-    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
+        history_x: deque = deque(maxlen=window_size)
+        smoothed_x_list: List[float] = []
 
-    history_x: deque = deque(maxlen=window_size)
-    smoothed_x_list: List[float] = []
-
-    current_sec = start_time
-    max_crop_x = max(0, orig_w - crop_w)
-
-    while current_sec < end_time:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Reduz resolução para aceleração da detecção facial
+        current_sec = start_time
+        max_crop_x = max(0, orig_w - crop_w)
         scale_factor = 0.5
-        small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
-        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
 
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(int(40 * scale_factor), int(40 * scale_factor))
-        )
+        while current_sec < end_time:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if len(faces) > 0:
-            # Prioriza o rosto de maior área (falante em primeiro plano mais próximo da câmera)
-            largest_face = max(faces, key=lambda f: f[2] * f[3])
-            fx, fy, fw, fh = [int(v / scale_factor) for v in largest_face]
-            face_center_x = fx + (fw / 2.0)
+            face = detector.detect_largest_face(frame, scale_factor=scale_factor)
 
-            # Posição X da janela 9:16 para centralizar o rosto
-            target_x = face_center_x - (crop_w / 2.0)
-            target_x = max(0.0, min(float(max_crop_x), target_x))
+            if face is not None:
+                fx, fy, fw, fh = face
+                face_center_x = fx + (fw / 2.0)
 
-            # Estabilidade em múltiplos rostos: se houver salto brusco entre falantes,
-            # limita o passo máximo por amostra para garantir transição suave (damping)
-            if history_x:
-                last_pos = history_x[-1]
-                max_step = float(crop_w * 0.25)
-                if abs(target_x - last_pos) > max_step:
-                    if target_x > last_pos:
-                        target_x = last_pos + max_step
-                    else:
-                        target_x = last_pos - max_step
+                # Posição X da janela 9:16 para centralizar o rosto
+                target_x = face_center_x - (crop_w / 2.0)
+                target_x = max(0.0, min(float(max_crop_x), target_x))
 
-            # Atualiza Média Móvel nos últimos 10 frames
-            history_x.append(target_x)
-            moving_avg = sum(history_x) / len(history_x)
-            smoothed_x_list.append(moving_avg)
+                # Estabilidade em múltiplos rostos: se houver salto brusco entre falantes,
+                # limita o passo máximo por amostra para garantir transição suave (damping)
+                if history_x:
+                    last_pos = history_x[-1]
+                    max_step = float(crop_w * 0.25)
+                    if abs(target_x - last_pos) > max_step:
+                        if target_x > last_pos:
+                            target_x = last_pos + max_step
+                        else:
+                            target_x = last_pos - max_step
 
-        # Salta para o próximo intervalo de amostragem
-        current_sec += sample_rate_sec
-        current_frame_pos = int(current_sec * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
+                # Atualiza Média Móvel nos últimos 10 frames
+                history_x.append(target_x)
+                moving_avg = sum(history_x) / len(history_x)
+                smoothed_x_list.append(moving_avg)
 
-    cap.release()
+            # Salta para o próximo intervalo de amostragem
+            current_sec += sample_rate_sec
+            current_frame_pos = int(current_sec * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_pos)
 
-    if not smoothed_x_list:
-        logger.info("Nenhum rosto detectado no trecho %.2fs -> %.2fs. Fallback para center crop.", start_time, end_time)
+        cap.release()
+
+        if not smoothed_x_list:
+            logger.info("Nenhum rosto detectado no trecho %.2fs -> %.2fs. Fallback para center crop.", start_time, end_time)
+            return None
+
+        # Mediana das posições médias suavizadas para máxima estabilidade no corte
+        final_x = int(round(float(np.median(smoothed_x_list))))
+        final_x = max(0, min(max_crop_x, final_x))
+
+        # Garante número par para compatibilidade com FFmpeg libx264
+        if final_x % 2 != 0:
+            final_x = max(0, final_x - 1)
+
+        logger.info("Face tracking OpenCV definiu X=%d suavizado (Janela: %dx%d em %dx%d).", final_x, crop_w, orig_h, orig_w, orig_h)
+        return final_x
+
+    except Exception as exc:
+        logger.warning("Falha durante o face tracking: %s. Fallback seguro para center crop.", exc)
         return None
-
-    # Mediana das posições médias suavizadas para máxima estabilidade no corte
-    final_x = int(round(float(np.median(smoothed_x_list))))
-    final_x = max(0, min(max_crop_x, final_x))
-
-    # Garante número par para compatibilidade com FFmpeg libx264
-    if final_x % 2 != 0:
-        final_x = max(0, final_x - 1)
-
-    logger.info("Face tracking OpenCV definiu X=%d suavizado (Janela: %dx%d em %dx%d).", final_x, crop_w, orig_h, orig_w, orig_h)
-    return final_x
 
 
 def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> str:
@@ -366,21 +540,27 @@ def cut_video(
         if crop_w % 2 != 0:
             crop_w -= 1
 
-        # Tenta calcular a posição com OpenCV
-        face_x = detect_smooth_face_crop_x(
-            video_path=str(src),
-            start_time=start_time,
-            end_time=end_time,
-            orig_w=orig_w,
-            orig_h=orig_h,
-            crop_w=crop_w
-        )
+        # Tenta calcular a posição com OpenCV (com fallback resiliente)
+        face_x = None
+        try:
+            face_x = detect_smooth_face_crop_x(
+                video_path=str(src),
+                start_time=start_time,
+                end_time=end_time,
+                orig_w=orig_w,
+                orig_h=orig_h,
+                crop_w=crop_w
+            )
+        except Exception as exc:
+            logger.warning("Falha durante o face tracking: %s. Aplicando fallback seguro para center crop.", exc)
+            face_x = None
 
-        # Fallback para center crop caso não detecte rosto
+        # Fallback para center crop caso não detecte rosto ou nenhum detector esteja disponível
         if face_x is None:
             face_x = max(0, (orig_w - crop_w) // 2)
             if face_x % 2 != 0:
                 face_x -= 1
+            logger.info("Face tracking: aplicando center crop em X=%d (fallback seguro 9:16).", face_x)
 
         video_filter = f"crop={crop_w}:{orig_h}:{face_x}:0,scale={target_width}:{target_height}"
         if srt_file_path:

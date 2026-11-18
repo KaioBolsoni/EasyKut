@@ -15,6 +15,7 @@ EasyKut/
     ├── .env.example                  # Modelo de variáveis de ambiente sem chaves reais
     ├── .gitignore                    # Regras de exclusão do Git
     ├── app.py                        # Interface Web Streamlit completa
+    ├── iniciar_easykut.bat           # Inicializador de 1 clique (porta 8502 e isolamento de venv)
     ├── requirements.txt              # Dependências Python do projeto
     ├── test_db.py                    # Teste automatizado do banco SQLite
     ├── test_fase2.py                 # Teste CLI da esteira da Fase 2 (IA e curadoria)
@@ -106,7 +107,7 @@ EasyKut/
   - Recalcula os tempos de cada legenda para iniciarem em `00:00:00,000` relativo ao início do clipe.
   - Queima automática com tipografia e posicionamento adaptados para mobile ou widescreen via filtro FFmpeg `subtitles`.
 - **Modos de Renderização:**
-  - `face_tracking_9_16` / `vertical_face`: Detecção facial com OpenCV Haar Cascade, estabilização temporal da coordenada X com Média Móvel (Moving Average nos últimos 10 frames) para eliminar solavancos, e fallback automático para corte central caso nenhum rosto seja detectado.
+  - `face_tracking_9_16` / `vertical_face`: Detecção facial compatível com OpenCV 5.x (`cv2.FaceDetectorYN` com modelo YuNet ONNX ou `cv2.dnn`) e OpenCV 4.x (`cv2.CascadeClassifier`), estabilização temporal da coordenada X com Média Móvel (Moving Average nos últimos 10 frames) e priorização do maior rosto em primeiro plano, com fallback seguro para Center Crop 9:16.
   - `horizontal_16_9` / `long_16_9`: Mantém a proporção horizontal 16:9 original para vídeos longos e highlights (7+ min).
   - `blur_background`: Fundo 9:16 (1080x1920) ampliado com desfoque gaussiano (`boxblur=25:10`) e o vídeo original centralizado nítido.
   - `crop_center`: Recorte central direto em 9:16 (`crop=ih*(9/16):ih,scale=1080:1920`).
@@ -133,4 +134,10 @@ EasyKut/
 | **Fase 3** | **Motor de Vídeo Avançado** | ✅ Concluída | Geração de legendas `.srt` sincronizadas (00:00:00,000), cortes horizontais 16:9, Face Tracking OpenCV com Média Móvel 9:16 e `test_fase3.py`. |
 | **Fase 4** | **Interface Web Interativa** | ✅ Concluída | Dashboard Streamlit completo, esteira visual com barra de progresso, galeria de cortes e histórico persistido. |
 | **Fase 5** | **Resiliência & Limpeza** | ✅ Concluída | Retentativas automáticas com backoff exponencial (3x) contra 429/timeouts, sanitização avançada de JSON, priorização de maior rosto em múltiplos interlocutores e rotina de limpeza de temporários. |
+
+---
+
+## 7. Diretrizes de Desenvolvimento e Versionamento
+
+- **Fluxo Git:** Trabalhar sempre direto na branch `main` (não criar branches de feature).
 
