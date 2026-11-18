@@ -1,0 +1,260 @@
+"""
+Módulo de Integração com APIs de Inteligência Artificial (EasyKut)
+Gerencia a transcrição de áudio via Groq Whisper e a curadoria inteligente
+de cortes virais utilizando Google Gemini e Groq LLMs.
+"""
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from groq import Groq
+from google import genai
+from google.genai import types
+
+from core.config import GROQ_API_KEY, GEMINI_API_KEY, PROMPTS_DIR
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+PROMPT_FILE = PROMPTS_DIR / "diretor_cortes.txt"
+
+
+def get_groq_client() -> Groq:
+    """Retorna instância autenticada do cliente Groq."""
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY não configurada no arquivo .env")
+    return Groq(api_key=GROQ_API_KEY)
+
+
+def get_gemini_client() -> genai.Client:
+    """Retorna instância autenticada do cliente Google GenAI."""
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY não configurada no arquivo .env")
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def load_director_prompt() -> str:
+    """Carrega o prompt do sistema para análise de cortes virais."""
+    if PROMPT_FILE.exists():
+        return PROMPT_FILE.read_text(encoding="utf-8")
+    return (
+        "Você é um diretor de vídeos virais. Analise a transcrição com timestamps e "
+        "retorne um JSON com a chave 'cortes' contendo title, start_time, end_time, virality_score e justification."
+    )
+
+
+def transcribe_audio_groq(
+    audio_path: str,
+    model: str = "whisper-large-v3-turbo",
+    language: Optional[str] = "pt"
+) -> Dict[str, Any]:
+    """
+    Transcreve um arquivo de áudio utilizando a API da Groq (Whisper).
+    Retorna a transcrição completa e os segmentos com timestamps de início e fim.
+    """
+    client = get_groq_client()
+    path = Path(audio_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo de áudio não encontrado: {audio_path}")
+
+    logger.info("Iniciando transcrição com Groq Whisper (%s): %s", model, path.name)
+
+    with open(path, "rb") as audio_file:
+        transcription = client.audio.transcriptions.create(
+            file=(path.name, audio_file.read()),
+            model=model,
+            response_format="verbose_json",
+            language=language,
+            temperature=0.0
+        )
+
+    # Processa os segmentos de tempo
+    segments = []
+    raw_segments = getattr(transcription, "segments", []) or []
+    for seg in raw_segments:
+        if isinstance(seg, dict):
+            segments.append({
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": seg.get("text", "").strip()
+            })
+        else:
+            segments.append({
+                "start": float(getattr(seg, "start", 0.0)),
+                "end": float(getattr(seg, "end", 0.0)),
+                "text": getattr(seg, "text", "").strip()
+            })
+
+    full_text = getattr(transcription, "text", "") or ""
+    logger.info("Transcrição concluída. Total de segmentos: %d", len(segments))
+
+    return {
+        "text": full_text,
+        "segments": segments
+    }
+
+
+def format_transcript_with_timestamps(transcript_data: Dict[str, Any]) -> str:
+    """
+    Formata os segmentos da transcrição em blocos de texto legíveis com marcas temporais.
+    Exemplo: [00:15 - 00:32] Texto falado pelo autor...
+    """
+    segments = transcript_data.get("segments", [])
+    if not segments:
+        return transcript_data.get("text", "")
+
+    lines = []
+    for seg in segments:
+        start_sec = seg["start"]
+        end_sec = seg["end"]
+        start_min, start_s = divmod(int(start_sec), 60)
+        end_min, end_s = divmod(int(end_sec), 60)
+        timestamp_str = f"[{start_min:02d}:{start_s:02d} - {end_min:02d}:{end_s:02d} ({start_sec:.1f}s -> {end_sec:.1f}s)]"
+        lines.append(f"{timestamp_str} {seg['text']}")
+
+    return "\n".join(lines)
+
+
+def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
+    """
+    Sanitiza e faz o parse do JSON retornado pelo modelo LLM.
+    Suporta saídas com blocos markdown ```json ... ``` ou texto adicional.
+    """
+    cleaned = raw_text.strip()
+    if "```json" in cleaned:
+        match = re.search(r"```json\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(1).strip()
+    elif "```" in cleaned:
+        match = re.search(r"```\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(1).strip()
+
+    data = json.loads(cleaned)
+
+    cortes = []
+    if isinstance(data, dict):
+        cortes = data.get("cortes", []) or data.get("cuts", [])
+    elif isinstance(data, list):
+        cortes = data
+
+    sanitized = []
+    for c in cortes:
+        try:
+            start = float(c.get("start_time", 0.0))
+            end = float(c.get("end_time", 0.0))
+            if end > start and (end - start) >= 5.0:
+                sanitized.append({
+                    "title": str(c.get("title", "Corte Sem Título")),
+                    "start_time": round(start, 2),
+                    "end_time": round(end, 2),
+                    "virality_score": float(c.get("virality_score", 5.0)),
+                    "justification": str(c.get("justification", ""))
+                })
+        except (ValueError, TypeError):
+            continue
+
+    return sanitized
+
+
+def analyze_viral_cuts_gemini(
+    transcript_text: str,
+    model_name: str = "gemini-3.1-flash-lite"
+) -> List[Dict[str, Any]]:
+    """
+    Analisa a transcrição com Google Gemini e extrai os melhores cortes.
+    """
+    client = get_gemini_client()
+    system_instruction = load_director_prompt()
+
+    logger.info("Enviando transcrição para análise no Gemini (%s)...", model_name)
+
+    prompt = (
+        f"{system_instruction}\n\n"
+        "--- TRANSCRIÇÃO COM TIMESTAMPS DO VÍDEO ---\n"
+        f"{transcript_text}\n\n"
+        "Analise cuidadosamente a transcrição acima e selecione os melhores cortes virais."
+    )
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.3
+        )
+    )
+
+    return _clean_and_parse_json(response.text)
+
+
+def analyze_viral_cuts_groq(
+    transcript_text: str,
+    model_name: str = "openai/gpt-oss-120b"
+) -> List[Dict[str, Any]]:
+    """
+    Analisa a transcrição utilizando modelos LLM da Groq.
+    """
+    client = get_groq_client()
+    system_instruction = load_director_prompt()
+
+    logger.info("Enviando transcrição para análise na Groq (%s)...", model_name)
+
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {
+            "role": "user",
+            "content": f"Transcrição com timestamps:\n{transcript_text}\n\nSelecione os melhores cortes virais."
+        }
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3
+        )
+    except Exception as exc:
+        logger.warning("Falha com %s (%s). Tentando fallback com qwen/qwen3.8-27b...", model_name, exc)
+        response = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3
+        )
+
+    content = response.choices[0].message.content or "{}"
+    return _clean_and_parse_json(content)
+
+
+def detect_viral_moments(
+    transcript_data: Dict[str, Any],
+    provider: str = "gemini"
+) -> List[Dict[str, Any]]:
+    """
+    Função unificada de curadoria de cortes.
+    Recebe os dados da transcrição e direciona para Gemini ou Groq,
+    com fallback automático entre provedores se houver indisponibilidade.
+    """
+    formatted_text = format_transcript_with_timestamps(transcript_data)
+    if not formatted_text.strip():
+        logger.warning("Transcrição vazia. Nenhum corte pode ser detectado.")
+        return []
+
+    if provider.lower() == "gemini":
+        try:
+            return analyze_viral_cuts_gemini(formatted_text)
+        except Exception as exc:
+            logger.error("Erro no provedor Gemini: %s. Tentando fallback para Groq...", exc)
+            return analyze_viral_cuts_groq(formatted_text)
+    else:
+        try:
+            return analyze_viral_cuts_groq(formatted_text)
+        except Exception as exc:
+            logger.error("Erro no provedor Groq: %s. Tentando fallback para Gemini...", exc)
+            return analyze_viral_cuts_gemini(formatted_text)
