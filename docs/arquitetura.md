@@ -98,13 +98,18 @@ EasyKut/
 
 ---
 
-## 4. Motor Audiovisual (`core/video_engine.py`)
+## 4. Motor Audiovisual Avançado — Fase 3 (`core/video_engine.py`)
 
 - **Binários:** Auto-detecção de `ffmpeg.exe` e `ffprobe.exe` (ex: `C:\ffmpeg\bin` injetado no PATH do processo).
-- **Formatos de Renderização:**
+- **Gerador de Legendas Sincronizadas (`generate_srt_for_segment`):**
+  - Converte segmentos do Whisper para `.srt` temporário em `data/temp/`.
+  - Recalcula os tempos de cada legenda para iniciarem em `00:00:00,000` relativo ao início do clipe.
+  - Queima automática com tipografia e posicionamento adaptados para mobile ou widescreen via filtro FFmpeg `subtitles`.
+- **Modos de Renderização:**
+  - `face_tracking_9_16` / `vertical_face`: Detecção facial com OpenCV Haar Cascade, estabilização temporal da coordenada X com Média Móvel (Moving Average nos últimos 10 frames) para eliminar solavancos, e fallback automático para corte central caso nenhum rosto seja detectado.
+  - `horizontal_16_9` / `long_16_9`: Mantém a proporção horizontal 16:9 original para vídeos longos e highlights (7+ min).
   - `blur_background`: Fundo 9:16 (1080x1920) ampliado com desfoque gaussiano (`boxblur=25:10`) e o vídeo original centralizado nítido.
   - `crop_center`: Recorte central direto em 9:16 (`crop=ih*(9/16):ih,scale=1080:1920`).
-  - `original`: Mantém resolução original com redimensionamento proporcional.
 - **Preview:** Extração estática de posters em JPEG (`extract_frame_thumbnail`).
 
 ---
@@ -115,3 +120,17 @@ EasyKut/
 - Contém duas abas principais:
   1. **Processar Novo Vídeo:** Formulário de URL com feedback em barra de progresso (metadados ➔ download áudio ➔ transcrição ➔ IA ➔ download vídeo ➔ renderização 9:16 ➔ galeria com player e botões de download).
   2. **Histórico & Cortes Salvos:** Consulta do banco SQLite com listagem e reprodução de vídeos processados anteriormente.
+- **Gestão de Armazenamento:** Opção de limpeza automática pós-corte e botão manual para exclusão de arquivos temporários pesados.
+
+---
+
+## 6. Status do Projeto — 5 Fases Concluídas
+
+| Fase | Título | Status | Principais Entregas |
+| :---: | :--- | :---: | :--- |
+| **Fase 1** | **Arquitetura & Persistência** | ✅ Concluída | SQLite com WAL mode, tabelas `videos` e `cortes`, CRUD completo e `test_db.py`. |
+| **Fase 2** | **Inteligência Artificial & Prompts** | ✅ Concluída | Groq Whisper (`whisper-large-v3-turbo`), Gemini (`gemini-3.1-flash-lite`), prompt `diretor_cortes.txt` e `test_fase2.py`. |
+| **Fase 3** | **Motor de Vídeo Avançado** | ✅ Concluída | Geração de legendas `.srt` sincronizadas (00:00:00,000), cortes horizontais 16:9, Face Tracking OpenCV com Média Móvel 9:16 e `test_fase3.py`. |
+| **Fase 4** | **Interface Web Interativa** | ✅ Concluída | Dashboard Streamlit completo, esteira visual com barra de progresso, galeria de cortes e histórico persistido. |
+| **Fase 5** | **Resiliência & Limpeza** | ✅ Concluída | Retentativas automáticas com backoff exponencial (3x) contra 429/timeouts, sanitização avançada de JSON, priorização de maior rosto em múltiplos interlocutores e rotina de limpeza de temporários. |
+

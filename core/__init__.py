@@ -25,8 +25,11 @@ from core.downloader import (
 from core.video_engine import (
     check_ffmpeg,
     get_video_metadata,
+    generate_srt_for_segment,
+    detect_smooth_face_crop_x,
     cut_video,
     extract_frame_thumbnail,
+    cleanup_temporary_files,
 )
 
 __all__ = [
@@ -50,6 +53,9 @@ __all__ = [
     "download_video",
     "check_ffmpeg",
     "get_video_metadata",
+    "generate_srt_for_segment",
+    "detect_smooth_face_crop_x",
     "cut_video",
     "extract_frame_thumbnail",
+    "cleanup_temporary_files",
 ]

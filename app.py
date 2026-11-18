@@ -17,7 +17,7 @@ import streamlit as st
 from core.config import validate_config, FFMPEG_AVAILABLE, GROQ_API_KEY, GEMINI_API_KEY
 from core.downloader import is_valid_video_url, extract_video_info, download_audio, download_video
 from core.ai_apis import transcribe_audio_groq, detect_viral_moments
-from core.video_engine import cut_video, get_video_metadata
+from core.video_engine import cut_video, get_video_metadata, cleanup_temporary_files
 from database.db_manager import (
     init_db,
     add_video,
@@ -115,13 +115,20 @@ with st.sidebar:
 
     crop_mode = st.selectbox(
         "Formato e Enquadramento:",
-        options=["blur_background", "crop_center", "original"],
+        options=["face_tracking_9_16", "blur_background", "crop_center", "horizontal_16_9"],
         format_func=lambda x: {
-            "blur_background": "Fundo Desfocado 9:16 (Reels/TikTok/Shorts)",
-            "crop_center": "Recorte Centralizado 9:16",
-            "original": "Manter Resolução Original"
+            "face_tracking_9_16": "Vertical 9:16 com Face Tracking Suave (Shorts/TikTok)",
+            "blur_background": "Vertical 9:16 com Fundo Desfocado (Blur)",
+            "crop_center": "Vertical 9:16 com Recorte Central",
+            "horizontal_16_9": "Horizontal 16:9 (Vídeos Longos 7+ min)"
         }[x],
-        help="Padrão de aspecto do vídeo final renderizado."
+        help="Padrão de aspecto e enquadramento do vídeo final renderizado."
+    )
+
+    burn_subs = st.checkbox(
+        "🔥 Queimar legendas automáticas sincronizadas (.srt)",
+        value=True,
+        help="Gera e queima legendas com tipografia profissional ajustadas para começarem em 00:00:00,000."
     )
 
     max_resolution = st.select_slider(
@@ -138,6 +145,18 @@ with st.sidebar:
         value=3,
         help="Quantidade de cortes que o motor FFmpeg irá renderizar após a seleção da IA."
     )
+
+    st.markdown("---")
+    st.markdown("### 🧹 Gestão de Armazenamento")
+    auto_clean = st.checkbox(
+        "Limpeza automática pós-processamento",
+        value=True,
+        help="Remove arquivos temporários (.srt, áudio intermediário) em data/temp/ preservando os clipes finais."
+    )
+
+    if st.button("🗑️ Limpar Arquivos Temporários", use_container_width=True):
+        clean_res = cleanup_temporary_files(remove_raw_downloads=False)
+        st.success(f"Limpeza concluída! {clean_res['deleted_count']} arquivo(s) removido(s) ({clean_res['freed_mb']} MB liberados).")
 
     st.markdown("---")
     st.caption("EasyKut v1.0 • Desenvolvido com Streamlit, yt-dlp, FFmpeg e IA Generativa")
@@ -241,12 +260,14 @@ with tab_novo:
                             status="rendering"
                         )
 
-                        # Renderiza no FFmpeg
+                        # Renderiza no FFmpeg com suporte a legendas e enquadramento dinâmico
                         output_clip = cut_video(
                             input_path=video_file,
                             start_time=c["start_time"],
                             end_time=c["end_time"],
-                            mode=crop_mode
+                            mode=crop_mode,
+                            segments=transcript_data.get("segments", []),
+                            burn_subtitles=burn_subs
                         )
 
                         update_corte_status(corte_db_id, status="completed", output_path=output_clip)
@@ -255,6 +276,9 @@ with tab_novo:
                         cortes_renderizados.append(c)
 
                     update_video_status(video_id, status="completed")
+                    if auto_clean:
+                        cleanup_temporary_files(remove_raw_downloads=False)
+
                     progress_bar.progress(100, text="✨ Todos os cortes foram renderizados com sucesso!")
                     status_placeholder.success("🎉 Processo concluído com êxito! Confira os cortes gerados abaixo:")
 
