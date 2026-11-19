@@ -69,6 +69,49 @@ def extract_video_info(url: str) -> Dict[str, Any]:
             raise
 
 
+def get_direct_stream_url(url: str, max_resolution: int = 1080) -> str:
+    """
+    Obtém a URL HTTP direta do stream de vídeo via yt-dlp sem baixar o arquivo.
+    Permite ao FFmpeg extrair frames remotos diretamente em segundos via streaming.
+    """
+    if not is_valid_video_url(url):
+        raise ValueError(f"URL de vídeo inválida: {url}")
+
+    ydl_opts = {
+        "format": f"bestvideo[ext=mp4][height<={max_resolution}]/best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        stream_url = info.get("url")
+        if not stream_url:
+            formats = info.get("formats", []) or []
+            for f in reversed(formats):
+                if f.get("url") and f.get("vcodec") != "none":
+                    stream_url = f.get("url")
+                    break
+
+        if not stream_url:
+            raise ValueError(f"Não foi possível obter a URL direta do stream para: {url}")
+
+        return stream_url
+
+
+def extract_preview_frame(
+    source: str,
+    timestamp_sec: float = 1.0,
+    output_path: Optional[str] = None
+) -> str:
+    """
+    Fachada para extração de 1 único frame (.jpg) a partir de arquivo local ou URL do YouTube.
+    """
+    from core.video_engine import extract_preview_frame as _extract
+    return _extract(source=source, timestamp_sec=timestamp_sec, output_path=output_path)
+
+
 def download_audio(
     url: str,
     output_dir: Optional[Path] = None,

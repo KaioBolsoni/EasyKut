@@ -166,10 +166,10 @@ def list_videos(
         return [dict(row) for row in cursor.fetchall()]
 
 
-def delete_video(video_id: int, delete_files: bool = True, db_path: Optional[Path] = None) -> bool:
+def delete_video(video_id: int, delete_files: bool = False, db_path: Optional[Path] = None) -> bool:
     """
     Remove um vídeo e seus cortes associados (via cascade no SQLite).
-    Se delete_files=True, remove também os arquivos físicos do disco (vídeos, áudios e cortes).
+    Se delete_files=True, remove também os arquivos físicos do disco (vídeos, áudios e cortes em data/cortes/ e data/downloads/).
     """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()

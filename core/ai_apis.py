@@ -44,7 +44,7 @@ def load_director_prompt() -> str:
         return PROMPT_FILE.read_text(encoding="utf-8")
     return (
         "Você é um diretor de vídeos virais. Analise a transcrição com timestamps e "
-        "retorne um JSON com a chave 'cortes' contendo title, start_time, end_time, virality_score e justification."
+        "retorne um JSON com a chave 'cortes' contendo title, start_time, end_time, virality_score (0 a 100), tipo ('short' ou 'longo') e justification."
     )
 
 
@@ -221,12 +221,23 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
         try:
             start = float(c.get("start_time", 0.0))
             end = float(c.get("end_time", 0.0))
-            if end > start and (end - start) >= 5.0:
+            dur = end - start
+            if end > start and dur >= 5.0:
+                raw_score = float(c.get("virality_score", c.get("score", 85.0)))
+                # Se o modelo retornar na escala 0-10 legada, converte suavemente para 0-100
+                if 0.0 < raw_score <= 10.0:
+                    raw_score = raw_score * 10.0
+
+                tipo_val = str(c.get("tipo", "short" if dur <= 180.0 else "longo")).strip().lower()
+                if tipo_val not in ("short", "longo"):
+                    tipo_val = "short" if dur <= 180.0 else "longo"
+
                 sanitized.append({
                     "title": str(c.get("title", "Corte Viral")),
                     "start_time": round(start, 2),
                     "end_time": round(end, 2),
-                    "virality_score": float(c.get("virality_score", 5.0)),
+                    "virality_score": round(raw_score, 1),
+                    "tipo": tipo_val,
                     "justification": str(c.get("justification", ""))
                 })
         except (ValueError, TypeError):

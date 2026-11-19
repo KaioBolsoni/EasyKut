@@ -1,6 +1,6 @@
-# Documentação Técnica — EasyKut (v1.0)
+# Documentação Técnica — EasyKut (v2.0)
 
-Este documento descreve de forma exata a arquitetura, os módulos, o fluxo de dados ponta a ponta, o esquema do banco de dados SQLite, os mecanismos de resiliência e as regras de ambiente atualmente implementados na versão **1.0** do **EasyKut**.
+Este documento descreve de forma exata a arquitetura, os módulos, o fluxo de dados ponta a ponta, o esquema do banco de dados SQLite, os mecanismos de resiliência e as regras de ambiente atualmente implementados na versão **2.0** do **EasyKut**.
 
 ---
 
@@ -46,97 +46,125 @@ cortador_automatico/
 
 | Módulo / Arquivo | Responsabilidade Técnica |
 | :--- | :--- |
-| `app.py` | Ponto de entrada da interface gráfica em Streamlit. Implementa o fluxo em **2 Passos** com revisão **Human-in-the-Loop** antes de renderizar: Passo 1 (download apenas de áudio, transcrição Whisper, análise IA ordenada por `virality_score` decrescente e persistência em `st.session_state`), Tela de Revisão (ajuste fino de início, fim, título e seleção dos cortes), Passo 2 (download do vídeo HD e renderização via FFmpeg/OpenCV apenas dos clipes selecionados com feedback rico via `st.status`), Galeria Persistente pós-rerun e Aba de Histórico com busca por título, nota mínima, exclusão de arquivos físicos e botão para abrir pasta no Explorador. |
+| `app.py` | Ponto de entrada da interface gráfica em Streamlit. Implementa a arquitetura **V2.0** com fluxo em 2 passos e **Passo 1.5 — Estúdio de Enquadramento em Tempo Real**: Passo 1 (download apenas de áudio, transcrição Whisper, análise IA ordenada por `virality_score` decrescente de 0 a 100, e extração automática de frames reais de prévia via `extract_preview_frame`), Passo 1.5 (Estúdio interativo por corte com seletor de 4 modos de layout, sliders ao vivo de enquadramento com prévia visual renderizada por `draw_framing_preview`, ajuste de tempo/títulos e botão de atualização de frame), Passo 2 (download do vídeo HD e renderização FFmpeg com `layout_mode` e `layout_params` dedicados), Galeria Persistente pós-rerun (em `st.session_state`) e Aba de Histórico com busca, filtro de score (0–100), exclusão física opcional (`delete_files=True`), abertura rápida de pasta (`os.startfile`) e downloads otimizados via streaming para economia de RAM. |
 | `core/config.py` | Injeta automaticamente diretórios conhecidos do FFmpeg (`C:\ffmpeg\bin`, `C:\Ghost Toolbox\wget\Youtube-DLP`, `C:\ProgramData\chocolatey\bin`) na variável `os.environ["PATH"]`. Define e cria as pastas `DATA_DIR`, `DOWNLOADS_DIR`, `CUTS_DIR` e `PROMPTS_DIR`. Carrega o arquivo `.env` de forma determinística e disponibiliza `validate_config(provider)` com validação flexível (exigindo `GROQ_API_KEY` + `FFMPEG` como base, e `GEMINI_API_KEY` apenas se Gemini for selecionado). |
-| `core/downloader.py` | Valida URLs com regex (`is_valid_video_url`), sanitiza nomes de arquivos (`sanitize_filename`), consulta metadados sem baixar mídia (`extract_video_info`), baixa áudio comprimido em MP3 64kbps via pós-processador `FFmpegExtractAudio` (`download_audio`) e baixa o vídeo em MP4 limitado à altura máxima escolhida (`download_video`). |
-| `core/ai_apis.py` | Gerencia clientes autenticados da Groq (`get_groq_client`) e Google GenAI (`get_gemini_client`). Executa a transcrição com timestamps via `transcribe_audio_groq` (`whisper-large-v3-turbo`), formata a transcrição em linhas `[MM:SS - MM:SS (start -> end)] texto` (`format_transcript_with_timestamps`), realiza a curadoria viral via Gemini (`analyze_viral_cuts_gemini`) ou Groq (`analyze_viral_cuts_groq`) sob orientação de `prompts/diretor_cortes.txt`, orquestra o chaveamento automático entre provedores (`detect_viral_moments`) e sanitiza o JSON retornado (`_clean_and_parse_json`). |
-| `core/video_engine.py` | Valida binários (`check_ffmpeg`), extrai metadados técnicos via `ffprobe` (`get_video_metadata`), converte segundos em timestamp SRT (`format_srt_time`), gera legendas `.srt` ajustadas para `00:00:00,000` (`generate_srt_for_segment`), executa rastreamento facial compatível com OpenCV 4 e 5 (`_FaceDetectorWrapper` e `detect_smooth_face_crop_x`), monta e executa a linha de comando FFmpeg para os 4 modos de corte (`cut_video`), gera thumbnails JPEG (`extract_frame_thumbnail`) e remove arquivos temporários (`cleanup_temporary_files`). |
-| `database/db_manager.py` | Gerencia conexões SQLite (`get_connection`) com `timeout=15.0`, `check_same_thread=False`, `PRAGMA foreign_keys = ON` e `PRAGMA journal_mode = WAL`. Cria as tabelas `videos` e `cortes` (`init_db`) e implementa todas as operações CRUD (`add_video`, `get_video`, `update_video_status`, `list_videos`, `delete_video`, `add_corte`, `list_cortes`, `update_corte_status`, `save_analysis`). |
-| `prompts/diretor_cortes.txt` | Define as regras de negócio de curadoria: gancho forte nos primeiros 3–5 segundos, contexto autossuficiente, duração alvo de 20 a 90 segundos (ideal 30–60s), eliminação de vácuos, avaliação de `virality_score` (1 a 10) e saída obrigatória em JSON puro com a chave `"cortes"`. |
+| `core/downloader.py` | Valida URLs com regex (`is_valid_video_url`), sanitiza nomes de arquivos (`sanitize_filename`), consulta metadados sem baixar mídia (`extract_video_info`), obtém URLs diretas de stream HTTP sem download prévio via yt-dlp (`get_direct_stream_url`), extrai frames rápidos remotos/locais (`extract_preview_frame`), baixa áudio comprimido em MP3 48kbps via pós-processador `FFmpegExtractAudio` (`download_audio`) e baixa o vídeo em MP4 limitado à resolução escolhida (`download_video`). |
+| `core/ai_apis.py` | Gerencia clientes autenticados da Groq (`get_groq_client`) e Google GenAI (`get_gemini_client`). Executa a transcrição com timestamps via `transcribe_audio_groq` (`whisper-large-v3-turbo`), formata a transcrição em linhas `[MM:SS - MM:SS (start -> end)] texto` (`format_transcript_with_timestamps`), realiza a curadoria viral via Gemini (`analyze_viral_cuts_gemini`) ou Groq (`analyze_viral_cuts_groq`) sob orientação de `prompts/diretor_cortes.txt`, orquestra o chaveamento automático entre provedores (`detect_viral_moments`) e sanitiza o JSON retornado (`_clean_and_parse_json`), normalizando scores (0–100) e tipo (`short` / `longo`). |
+| `core/video_engine.py` | Valida binários (`check_ffmpeg`), extrai metadados técnicos via `ffprobe` (`get_video_metadata`), converte segundos em timestamp SRT (`format_srt_time`), gera legendas `.srt` ajustadas para `00:00:00,000` (`generate_srt_for_segment`) com escape estrito de caracteres especiais (`:, ', [, ], ,`), extrai frames únicos com fast seek (`extract_preview_frame`), gera prévias visuais de enquadramento com OpenCV/Pillow (`draw_framing_preview`), executa rastreamento facial compatível com OpenCV 4 e 5 (`_FaceDetectorWrapper` e `detect_smooth_face_crop_x`), gerencia os 4 modos de layout e renderização FFmpeg (`cut_video`), gera thumbnails JPEG (`extract_frame_thumbnail`) e remove arquivos temporários (`cleanup_temporary_files`). |
+| `database/db_manager.py` | Gerencia conexões SQLite (`get_connection`) com `timeout=15.0`, `check_same_thread=False`, `PRAGMA foreign_keys = ON` e `PRAGMA journal_mode = WAL`. Cria as tabelas `videos` e `cortes` (`init_db`) e implementa todas as operações CRUD (`add_video`, `get_video`, `update_video_status`, `list_videos`, `delete_video` com exclusão opcional de arquivos físicos via `delete_files=False`, `add_corte`, `list_cortes`, `update_corte_status`, `save_analysis`). |
+| `prompts/diretor_cortes.txt` | Define as regras de curadoria viral: gancho magnético nos primeiros 3–5 segundos, contexto autossuficiente, eliminação de vácuos, pontuação estrita de `virality_score` de 0 a 100, classificação de `tipo` ("short" até 3 min ou "longo" 7+ min) e saída em JSON puro compatível com `core/ai_apis.py`. |
 | `iniciar_easykut.bat` | Script Batch Windows que posiciona o diretório de trabalho em `%~dp0`, encerra processos existentes na porta `8502` via PowerShell (`Get-NetTCPConnection` + `Stop-Process`), valida a existência de `venv\Scripts\python.exe` e executa o Streamlit isolado na porta `8502`. |
 
 ---
 
-## 2. Fluxo de Dados Ponta a Ponta (Fluxo em 2 Passos com Revisão Interativa)
+## 2. Fluxo de Dados Ponta a Ponta (Fluxo em 2 Passos com Estúdio de Enquadramento)
 
 ```mermaid
 flowchart TD
-    subgraph Passo1["Passo 1: Ingestão e Curadoria com IA"]
+    subgraph Passo1["Passo 1: Ingestão, Curadoria de IA e Captura de Prévias"]
         A["URL do YouTube"] --> B["yt-dlp: extract_video_info() & add_video()"]
         B --> C["yt-dlp: download_audio() -> MP3 48kbps mono 16kHz"]
         C --> D["Groq Whisper: transcribe_audio_groq()"]
         D --> E["IA Generativa: detect_viral_moments() (Gemini / Groq)"]
-        E --> F["Ordenação por virality_score decrescente"]
-        F --> G["Persistência em st.session_state['analise_atual'] & save_analysis()"]
+        E --> F["Ordenação por virality_score decrescente (0–100)"]
+        F --> G["yt-dlp + FFmpeg: extract_preview_frame() para cada corte"]
+        G --> H["Persistência em st.session_state['analise_atual'] & save_analysis()"]
     end
 
-    subgraph Revisao["Tela de Revisão (Human-in-the-Loop)"]
-        G --> H["Exibição dos cartões de corte editáveis"]
-        H --> I["Usuário: marca/desmarca cortes, edita títulos, ajusta start_time e end_time"]
+    subgraph Estudio["Passo 1.5: Estúdio de Enquadramento em Tempo Real"]
+        H --> I["Expander individual por corte com Score e Duração"]
+        I --> J["Seleção de Modo: Vertical Blur, Horizontal 16:9, Manual 9:16, Split-Screen ou Face Tracking"]
+        J --> K["Sliders interativos (Zoom, Posição X/Y %, Caixas Topo e Base)"]
+        K --> L["draw_framing_preview() gera prévia visual renderizada ao vivo"]
+        L --> M["Botão 'Atualizar Frame' sincronizado com novos tempos de início/fim"]
     end
 
     subgraph Passo2["Passo 2: Renderização dos Cortes Selecionados"]
-        I --> J["Botão: Renderizar Cortes Selecionados"]
-        J --> K["yt-dlp: download_video() em 720p/1080p (apenas sob demanda)"]
-        K --> L["Loop sobre cortes marcados (selected=True)"]
-        L --> M["Geração SRT (generate_srt_for_segment)"]
-        M --> N["Face Tracking OpenCV (cap.grab acelerado)"]
-        N --> O["FFmpeg: renderização do corte 9:16 vertical"]
-        O --> P["Atualiza SQLite (update_corte_status) e salva em st.session_state['ultimos_cortes']"]
+        M --> N["Botão: Renderizar Cortes Selecionados"]
+        N --> O["yt-dlp: download_video() em 720p/1080p (apenas sob demanda)"]
+        O --> P["Loop sobre cortes marcados (selected=True)"]
+        P --> Q["Geração SRT ajustada para 00:00:00,000 (generate_srt_for_segment)"]
+        Q --> R["FFmpeg: renderização com layout_mode e layout_params específicos"]
+        R --> S["Atualiza SQLite (update_corte_status) e salva em st.session_state['ultimos_cortes']"]
     end
 
     subgraph Galeria["Galeria Persistente"]
-        P --> Q["Renderização fora de blocos condicionais: player de vídeo e download seguro"]
+        S --> T["Renderização fora de blocos condicionais: player e download seguro sem recarga vazia"]
     end
 ```
 
 ### Detalhamento das Etapas do Pipeline
 
-1. **Passo 1 — Ingestão e Curadoria Inicial:**
-   - O usuário insere a URL do YouTube e clica em **"🔍 Analisar Vídeo & Detectar Cortes"**.
+1. **Passo 1 — Ingestão, Curadoria e Prévias Iniciais:**
+   - O usuário insere a URL do YouTube e clica em **"🔍 Analisar Vídeo & Extrair Prévias"**.
    - O `yt-dlp` coleta metadados (`extract_video_info`) e registra o vídeo no SQLite com `status="processing"`.
-   - Baixa exclusivamente a faixa de áudio leve (`download_audio`) em mono 16kHz (48kbps), otimizando o envio e reduzindo a latência.
-   - `transcribe_audio_groq` transcreve o áudio com `whisper-large-v3-turbo` na Groq Cloud.
-   - `detect_viral_moments` analisa os ganchos e momentos de retenção com o provedor escolhido (**Gemini** ou **Groq LLM**).
-   - Os cortes retornados são ordenados de forma estrita pelo maior `virality_score` e salvos em `st.session_state["analise_atual"]`.
-   - O feedback visual de cada etapa e seu tempo de execução são exibidos em tempo real via `st.status(..., expanded=True)`.
+   - Baixa exclusivamente a faixa de áudio leve (`download_audio`) em mono 16kHz (48kbps), minimizando tempo e payload.
+   - `transcribe_audio_groq` transcreve o áudio com `whisper-large-v3-turbo` na nuvem Groq.
+   - `detect_viral_moments` analisa os momentos magnéticos e ganchos com **Gemini** ou **Groq LLM**.
+   - Os cortes são calibrados na escala `0–100`, classificados como `"short"` ou `"longo"` e ordenados de forma decrescente pelo `virality_score`.
+   - Para cada corte sugerido, `extract_preview_frame()` obtém a URL direta de streaming via `yt-dlp` e captura 1 frame real no timestamp do corte em ~1.5s, armazenando-o para alimentar o Estúdio.
+   - Todos os dados são consolidados em `st.session_state["analise_atual"]` e registrados no banco SQLite.
+   - O feedback em tempo real é fornecido via `st.status(..., expanded=True)`.
 
-2. **Tela de Revisão Interativa (Human-in-the-Loop):**
-   - Apresenta os metadados do vídeo (thumbnail, título, duração e canal) e cartões para cada corte sugerido.
-   - O usuário pode marcar ou desmarcar quais cortes deseja renderizar, editar o título gerado e ajustar com precisão milimétrica os segundos de `Início` e `Fim`.
-   - Isso evita o download desnecessário de vídeos de horas inteiras caso o usuário queira descartar ou ajustar trechos antes da renderização.
+2. **Passo 1.5 — Estúdio de Enquadramento & Revisão Interativa:**
+   - Cada corte sugerido é renderizado em um card expansível (`st.expander`), exibindo badge de score, tipo, duração e campos editáveis de título e tempos (`start_time` e `end_time`).
+   - Se o usuário alterar os segundos de início/fim, o botão **"🔄 Atualizar Frame"** re-extrai o frame exato no novo ponto temporal.
+   - O usuário seleciona o formato de saída desejado:
+     - **Vertical Sem Zoom (Blur 9:16):** Permite aproximar levemente o vídeo centralizado via slider de aproximação suave (1.0x a 1.3x) enquanto o fundo desfocado preenche o canvas 1080x1920.
+     - **Seleção Manual (Caixa 9:16):** Sliders de Posição Horizontal (X %), Posição Vertical (Y %) e Tamanho (%) posicionam milimetricamente o recorte vertical 9:16 sobre o frame real com máscara atenuada ao redor.
+     - **Split-Screen (2 Caixas — 1080x1920):** Controles independentes para Caixa Topo (Falante 1) e Caixa Base (Falante 2) com proporção 1.125 cada (1080x960), exibidas em Ciano e Laranja/Amarelo.
+     - **Horizontal Natural (16:9):** Preserva 100% da resolução widescreen original sem cortes laterais (padrão para conteúdos longos).
+     - **Face Tracking Inteligente (9:16):** Preset opcional que executa a detecção facial dinâmica via OpenCV no momento do corte.
+   - A função `draw_framing_preview()` renderiza a prévia visual em tempo real lado a lado com os controles.
 
-3. **Passo 2 — Renderização Sob Demanda:**
-   - Ao clicar em **"🎬 Renderizar Cortes Selecionados"**, o sistema baixa o vídeo fonte em alta definição (`download_video`, 720p ou 1080p).
-   - O motor FFmpeg/OpenCV renderiza apenas os clipes que foram marcados com `selected=True`, aplicando legendas sincronizadas (`00:00:00,000`), Face Tracking suave e o modo de enquadramento escolhido.
-   - Os clipes prontos são salvos em `st.session_state["ultimos_cortes"]`.
+3. **Passo 2 — Renderização Sob Demanda via FFmpeg:**
+   - Ao acionar **"🎬 Renderizar Cortes Selecionados"**, o sistema baixa o vídeo fonte em alta definição (`download_video`, 720p ou 1080p) apenas se ainda não existir localmente.
+   - Itera exclusivamente pelos cortes marcados (`selected=True`), acionando `cut_video()` com o `layout_mode` e `layout_params` definidos pelo usuário no Estúdio.
+   - Quando as legendas estão ativadas, gera legendas sincronizadas (`00:00:00,000`) e aplica o filtro de queima com escape estrito de caracteres especiais (`:, ', [, ], ,`).
+   - Atualiza o status de cada corte no SQLite para `completed` e salva os registros em `st.session_state["ultimos_cortes"]`.
 
-4. **Galeria Persistente:**
-   - A galeria é exibida fora de condicionais de botões. Clicar em qualquer botão de download gera o download do arquivo sem fazer a tela recarregar vazia.
+4. **Galeria Persistente pós-rerun:**
+   - A galeria de vídeos renderizados é renderizada no fluxo principal fora de blocos condicionais de botões.
+   - O botão de download utiliza descritores de arquivos diretos, permitindo baixar múltiplos clipes sem que o rerun do Streamlit faça a galeria desaparecer.
 
-4. **Face Tracking e Estabilização (`core/video_engine.py`):**
-   - Após o download do vídeo em alta resolução (`download_video()`), se o modo selecionado for `face_tracking_9_16`, `cut_video()` calcula a largura do recorte 9:16 proporcional à altura original (`crop_w = int(orig_h * (9.0 / 16.0))`, ajustado para número par) e aciona `detect_smooth_face_crop_x()`.
+5. **Aba de Histórico Aprimorada:**
+   - **Abertura Rápida de Pasta:** Botão *"📂 Abrir Pasta de Cortes"* que invoca `os.startfile(CUTS_DIR)` no Windows (ou `explorer` como fallback), abrindo `data/cortes/` no Explorador de Arquivos com 1 clique.
+   - **Busca e Filtragem:** Campo de busca textual por título/URL e slider de nota mínima de 0 a 100 com normalização automática para cortes legados.
+   - **Exclusão com Limpeza Física:** Opção *"Apagar também os arquivos .mp4 do disco"* conectada a `delete_video(video_id, delete_files=True)` para remover os arquivos de vídeo e áudio do disco e do SQLite simultaneamente.
+   - **Otimização de RAM:** O download de clipes históricos transmite diretamente o descritor de arquivo aberto (`typing.BinaryIO`), eliminando o consumo excessivo de memória RAM por alocação de bytes inteiros (`.read()`).
+
+6. **Prévia de Frame Real e Enquadramento (`core/video_engine.py` e `core/downloader.py`):**
+   - `extract_preview_frame(source, timestamp_sec)`: Extrai 1 único frame JPEG no timestamp informado. Para links do YouTube, `get_direct_stream_url` obtém a URL direta de stream HTTP via `yt-dlp` (`download=False`), permitindo ao FFmpeg buscar e salvar o frame em ~1.5s sem baixar o vídeo previamente.
+   - `draw_framing_preview(frame_path, mode, params)`: Gera a renderização visual do enquadramento sobre o frame:
+     - `manual_crop`: desenha o retângulo 9:16 com máscara atenuada ao redor (área externa escurecida a 45%).
+     - `split_screen`: desenha duas caixas de seleção independentes (Topo: Ciano/Azul claro e Base: Laranja/Amarelo), cada uma com aspecto 1.125 para 1080x960.
+     - `vertical_blur`: gera o canvas 9:16 (1080x1920) com fundo desfocado (`GaussianBlur 51x51`), levemente escurecido (`brightness=-0.15`) e vídeo nítido centralizado em proporção nativa (com `zoom_factor` de 1.0 a 1.3).
+     - `horizontal_16_9`: retorna o frame widescreen 16:9 original em alta definição.
+
+7. **Face Tracking e Estabilização (`core/video_engine.py`):**
+   - Disponível como preset opcional de recorte. Quando acionado, `detect_smooth_face_crop_x()` calcula a largura do recorte 9:16 proporcional à altura original (`crop_w = int(orig_h * (9.0 / 16.0))`, ajustado para número par).
    - O vídeo é amostrado a cada `0.25s` (`sample_rate_sec=0.25`) no intervalo `[start_time, end_time]`.
    - Cada frame lido é reduzido pela metade (`scale_factor=0.5`) para acelerar a inferência no `_FaceDetectorWrapper`.
    - **Priorização do Maior Rosto:** Quando múltiplos rostos são detectados no mesmo frame, o algoritmo seleciona o rosto de maior área (`w * h`), priorizando o falante em primeiro plano.
    - **Amortecimento (Damping) e Média Móvel:** Para impedir saltos bruscos de câmera quando há troca de interlocutor, o deslocamento máximo por amostra é limitado a 25% da largura do corte (`max_step = crop_w * 0.25`). A coordenada `target_x` resultante alimenta uma fila `deque(maxlen=10)` (Média Móvel de 10 frames).
    - Ao final do trecho, calcula-se a **mediana** (`np.median`) de todas as médias móveis coletadas, garantindo uma coordenada `final_x` par e estável para o filtro `crop` do FFmpeg.
 
-5. **Legenda Sincronizada (`core/video_engine.py`):**
+8. **Legenda Sincronizada com Escape Estrito (`core/video_engine.py`):**
    - Quando `burn_subtitles=True`, `generate_srt_for_segment()` filtra todos os segmentos do Whisper que intersectam o intervalo `[start_time, end_time]`.
    - Os tempos são deslocados para o referencial do corte (`rel_start = max(0.0, seg_start - start_time)` e `rel_end = min(end_time - start_time, seg_end - start_time)`), fazendo a legenda começar exatamente a partir de `00:00:00,000`.
    - O arquivo é salvo em `data/temp/sub_{int(start_time)}_{int(end_time)}.srt`.
-   - `_format_ffmpeg_subtitles_filter()` escapa o caminho do Windows (`C\:/caminho/...`) e aplica `force_style` com `FontName=Arial,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2`, variando `FontSize=16,MarginV=55` (vertical 9:16) ou `FontSize=18,MarginV=25` (horizontal 16:9).
+   - `_format_ffmpeg_subtitles_filter()` escapa caracteres especiais que quebram o parser do FFmpeg (`:`, `'`, `[`, `]`, `,`) e formata caminhos no padrão Windows (`C\:/...`), aplicando `force_style` com `FontName=Arial,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2`, variando `FontSize=16,MarginV=55` (vertical 9:16) ou `FontSize=18,MarginV=25` (horizontal 16:9).
 
-6. **Renderização (`core/video_engine.py`):**
-   - `cut_video()` executa o `ffmpeg` via `subprocess.run` com corte rápido na entrada (`-ss` e `-t`) e aplica o filtro correspondente ao modo:
-     - `face_tracking_9_16`: `-vf crop={crop_w}:{orig_h}:{face_x}:0,scale=1080:1920[,subtitles=...]`
-     - `crop_center`: `-vf crop=ih*(9/16):ih,scale=1080:1920[,subtitles=...]`
-     - `blur_background`: `-filter_complex [0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:10[bg];[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]...`
-     - `horizontal_16_9`: `-vf scale={min(orig_w, 1920)}:-2[,subtitles=...]`
-   - A saída é codificada com `-c:v libx264 -preset fast -crf 22 -c:a aac -b:a 128k -pix_fmt yuv420p -movflags +faststart` e salva em `data/cortes/`.
+9. **4 Modos de Renderização no FFmpeg (`core/video_engine.py`):**
+   - `cut_video(..., layout_mode, layout_params)` aplica filtros especializados e garante dimensões estritamente pares em todas as ramificações:
+     - `horizontal_16_9`: Mantém o vídeo widescreen 16:9 original sem qualquer crop ou distorção. Se não houver legendas queimadas, utiliza **Stream Copy** (`-c copy`) instantâneo; se houver legendas, codifica com `libx264` garantindo dimensões pares (`scale=trunc(iw/2)*2:trunc(ih/2)*2`).
+     - `vertical_blur` (Vertical sem Zoom): Cria um canvas 1080x1920, preenche o fundo com o próprio vídeo ampliado + `boxblur=20:5` + leve escurecimento (`eq=brightness=-0.15`), e sobrepõe o vídeo original perfeitamente centralizado preservando 100% da proporção (com `zoom_factor` de 1.0 a 1.3 ajustável).
+     - `manual_crop` (Seleção Manual): Aplica `crop=w:h:x:y` exatamente nas coordenadas escolhidas pelo usuário sobre a resolução real do vídeo, seguido de escala limpa para 1080x1920.
+     - `split_screen` (2 Regiões Customizadas): Recorta de forma independente o topo (`box_top`) e a base (`box_bottom`), redimensiona cada um para 1080x960 e os empilha perfeitamente sem distorção com `[vtop][vbot]vstack=inputs=2[v]`.
+     - `face_tracking_9_16`: Modo legado/preset inteligente que aplica a coordenada calculada pela mediana da média móvel facial.
+   - A saída codificada utiliza `-c:v libx264 -preset fast -crf 22 -c:a aac -b:a 128k -pix_fmt yuv420p -movflags +faststart` e é salva em `data/cortes/`.
 
-7. **Limpeza (`core/video_engine.py`):**
+10. **Limpeza (`core/video_engine.py`):**
    - Ao concluir a esteira (ou via botão manual na barra lateral), `cleanup_temporary_files()` varre `data/temp/` (e opcionalmente `data/downloads/` se `remove_raw_downloads=True`), excluindo arquivos temporários (exceto `.gitkeep`) e retornando a contagem de arquivos removidos e megabytes liberados.
 
 ---

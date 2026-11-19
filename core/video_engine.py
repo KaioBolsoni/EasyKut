@@ -8,6 +8,7 @@ from collections import deque
 import json
 import logging
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
@@ -436,6 +437,8 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
     """
     Formata e escapa o caminho do arquivo .srt para o filtro subtitles do FFmpeg no Windows/Linux,
     aplicando tipografia profissional para Shorts (9:16) ou formato horizontal (16:9).
+    Escapa adequadamente caracteres especiais (:, ', [, ], ,) para garantir que o filtro FFmpeg
+    não falhe com caminhos de diretório complexos.
     """
     p = Path(srt_path).resolve()
     clean_path = str(p).replace("\\", "/")
@@ -446,8 +449,13 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
         rest = clean_path[2:]
         clean_path = f"{drive}\\:{rest}"
 
-    # Escapa apóstrofos e colchetes no caminho para o parser do FFmpeg
-    clean_path = clean_path.replace("'", "'\\''").replace("[", "\\[").replace("]", "\\]")
+    # Escapa caracteres especiais do parser de filtros do FFmpeg: :, ', [, ], ,
+    clean_path = (
+        clean_path.replace("'", "'\\''")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(",", "\\,")
+    )
 
     if is_vertical:
         # Estilo para Shorts/Reels/TikTok: texto centralizado, destaque em caixa ou borda nítida
@@ -467,28 +475,248 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
     return f"subtitles='{clean_path}':force_style='{style}'"
 
 
+def extract_preview_frame(
+    source: str,
+    timestamp_sec: float = 1.0,
+    output_path: Optional[str] = None
+) -> str:
+    """
+    Extrai 1 único frame (.jpg) no tempo informado usando FFmpeg.
+    Se source for uma URL do YouTube/web, obtém a URL direta do stream via yt-dlp
+    (extract_info download=False) para capturar o frame em segundos sem precisar
+    baixar o vídeo inteiro antes da aprovação.
+    Se source for um arquivo local existente, extrai o frame localmente com fast seek.
+    Retorna o caminho absoluto do arquivo .jpg gerado.
+    """
+    check_ffmpeg()
+    src_str = str(source).strip()
+
+    if output_path:
+        dest = Path(output_path)
+    else:
+        clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(src_str).stem)[:25]
+        dest = TEMP_DIR / f"frame_{clean_id}_{int(timestamp_sec * 1000)}.jpg"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    is_remote = src_str.startswith("http://") or src_str.startswith("https://")
+    input_target = src_str
+
+    if is_remote:
+        try:
+            from core.downloader import get_direct_stream_url
+            input_target = get_direct_stream_url(src_str)
+            logger.info("Stream URL direto obtido para extração de frame: %s...", input_target[:60])
+        except Exception as exc:
+            logger.warning("Falha ao obter stream URL direto com yt-dlp: %s. Tentando URL original.", exc)
+            input_target = src_str
+    else:
+        local_p = Path(src_str)
+        if not local_p.exists():
+            raise FileNotFoundError(f"Arquivo fonte não encontrado: {src_str}")
+        input_target = str(local_p.resolve())
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(max(0.0, timestamp_sec)),
+        "-i", input_target,
+        "-vframes", "1",
+        "-q:v", "2",
+        str(dest)
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        logger.error("Falha ao extrair frame no FFmpeg: %s", proc.stderr[:300])
+        raise RuntimeError(f"Erro ao extrair frame de preview: {proc.stderr[:200]}")
+
+    logger.info("Frame de preview extraído com sucesso: %s", dest)
+    return str(dest.resolve())
+
+
+def draw_framing_preview(
+    frame_path: str,
+    mode: str = "manual_crop",
+    params: Optional[Dict[str, Any]] = None,
+    output_path: Optional[str] = None
+) -> str:
+    """
+    Gera uma imagem de prévia visual mostrando exatamente como o corte ficará no enquadramento.
+    Suporta:
+    - manual_crop: desenha o retângulo da área selecionada (9:16) sobre o frame original com destaque visual.
+    - split_screen: desenha os dois retângulos (Topo: Azul/Verde e Base: Laranja/Amarelo) sobre o frame.
+    - vertical_blur: gera o canvas 9:16 completo com fundo desfocado + escurecido e vídeo nítido centralizado.
+    - horizontal_16_9: devolve o frame original em formato widescreen.
+    Retorna o caminho absoluto da imagem JPG resultante.
+    """
+    p = Path(frame_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Frame não encontrado para preview: {frame_path}")
+
+    img = cv2.imread(str(p.resolve()))
+    if img is None:
+        raise ValueError(f"Não foi possível decodificar o arquivo de imagem: {frame_path}")
+
+    H, W = img.shape[:2]
+    cfg = params or {}
+
+    if output_path:
+        dest = Path(output_path)
+    else:
+        dest = TEMP_DIR / f"framing_{p.stem}_{mode}.jpg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    mode_clean = str(mode).lower().strip()
+
+    if mode_clean in ("manual_crop", "crop_center", "crop", "face_tracking_9_16", "face_tracking"):
+        # 1. Modo manual_crop: Desenha o retângulo da área 9:16 selecionada
+        crop_w = int(cfg.get("crop_w", cfg.get("w", int(H * (9.0 / 16.0)))))
+        crop_h = int(cfg.get("crop_h", cfg.get("h", H)))
+        crop_x = int(cfg.get("crop_x", cfg.get("x", (W - crop_w) // 2)))
+        crop_y = int(cfg.get("crop_y", cfg.get("y", 0)))
+
+        # Garante limites e números pares
+        crop_x = max(0, min(W - 2, crop_x))
+        crop_y = max(0, min(H - 2, crop_y))
+        crop_w = max(2, min(W - crop_x, crop_w))
+        crop_h = max(2, min(H - crop_y, crop_h))
+
+        # Cria máscara para escurecer suavemente a área fora do corte (destaque visual)
+        overlay = (img.copy() * 0.45).astype(np.uint8)
+        overlay[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w] = img[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+
+        # Desenha retângulo verde/esmeralda ao redor da área de corte
+        border_color = (0, 255, 128)  # BGR
+        cv2.rectangle(overlay, (crop_x, crop_y), (crop_x + crop_w, crop_y + crop_h), border_color, 4)
+
+        # Rótulo de identificação
+        label = f"Corte 9:16 ({crop_w}x{crop_h})"
+        cv2.putText(overlay, label, (crop_x + 10, max(30, crop_y + 35)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, border_color, 2, cv2.LINE_AA)
+
+        result_img = overlay
+
+    elif mode_clean in ("split_screen", "split"):
+        # 2. Modo split_screen: Desenha 2 retângulos (Topo - Azul/Verde e Base - Laranja/Amarelo)
+        box_top = cfg.get("box_top") or {}
+        box_bottom = cfg.get("box_bottom") or {}
+
+        # Aspecto para cada metade: 1080 / 960 = 1.125
+        target_ar = 1080.0 / 960.0
+
+        # Região Topo (padrão: lado esquerdo ou falante 1)
+        tw = int(box_top.get("w", min(W // 2, int(H * target_ar))))
+        th = int(box_top.get("h", int(tw / target_ar)))
+        tx = int(box_top.get("x", max(0, (W // 4) - (tw // 2))))
+        ty = int(box_top.get("y", max(0, (H - th) // 2)))
+
+        # Região Base (padrão: lado direito ou falante 2)
+        bw = int(box_bottom.get("w", min(W // 2, int(H * target_ar))))
+        bh = int(box_bottom.get("h", int(bw / target_ar)))
+        bx = int(box_bottom.get("x", min(W - bw, (3 * W // 4) - (bw // 2))))
+        by = int(box_bottom.get("y", max(0, (H - bh) // 2)))
+
+        # Ajustes de limites
+        tx, ty = max(0, min(W - 2, tx)), max(0, min(H - 2, ty))
+        tw, th = max(2, min(W - tx, tw)), max(2, min(H - ty, th))
+        bx, by = max(0, min(W - 2, bx)), max(0, min(H - 2, by))
+        bw, bh = max(2, min(W - bx, bw)), max(2, min(H - by, bh))
+
+        overlay = (img.copy() * 0.45).astype(np.uint8)
+        overlay[ty:ty+th, tx:tx+tw] = img[ty:ty+th, tx:tx+tw]
+        overlay[by:by+bh, bx:bx+bw] = img[by:by+bh, bx:bx+bw]
+
+        # Topo: Ciano/Azul claro (255, 230, 0 em BGR)
+        color_top = (255, 230, 0)
+        cv2.rectangle(overlay, (tx, ty), (tx + tw, ty + th), color_top, 4)
+        cv2.putText(overlay, "TOPO (1080x960)", (tx + 10, max(30, ty + 35)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_top, 2, cv2.LINE_AA)
+
+        # Base: Laranja/Amarelo (0, 165, 255 em BGR)
+        color_bot = (0, 165, 255)
+        cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), color_bot, 4)
+        cv2.putText(overlay, "BASE (1080x960)", (bx + 10, max(30, by + 35)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bot, 2, cv2.LINE_AA)
+
+        result_img = overlay
+
+    elif mode_clean in ("vertical_blur", "blur_background", "blur"):
+        # 3. Modo vertical_blur: Gera miniatura 9:16 com vídeo encaixado no centro e fundo desfocado
+        canvas_w, canvas_h = 1080, 1920
+        bg_scale = max(canvas_w / W, canvas_h / H)
+        bg_w = int(round(W * bg_scale))
+        bg_h = int(round(H * bg_scale))
+        bg_resized = cv2.resize(img, (bg_w, bg_h))
+        bg_crop_x = (bg_w - canvas_w) // 2
+        bg_crop_y = (bg_h - canvas_h) // 2
+        bg = bg_resized[bg_crop_y:bg_crop_y+canvas_h, bg_crop_x:bg_crop_x+canvas_w]
+
+        # Desfoque + escurecimento leve (eq=brightness=-0.15)
+        bg_blurred = cv2.GaussianBlur(bg, (51, 51), 0)
+        bg_darkened = np.clip(bg_blurred.astype(np.float32) * 0.82 - 15.0, 0, 255).astype(np.uint8)
+
+        # Primeiro plano com proporção original (zoom_factor opcional de 1.0 a 1.3)
+        zoom_factor = float(cfg.get("zoom_factor", 1.0))
+        zoom_factor = max(1.0, min(1.3, zoom_factor))
+
+        fg_scale = (canvas_w / W) * zoom_factor
+        fg_w = int(round(W * fg_scale))
+        fg_h = int(round(H * fg_scale))
+        fg_resized = cv2.resize(img, (fg_w, fg_h))
+
+        if fg_w > canvas_w:
+            x_off = (fg_w - canvas_w) // 2
+            fg_resized = fg_resized[:, x_off:x_off+canvas_w]
+            fg_w = canvas_w
+
+        pos_y = (canvas_h - fg_h) // 2
+        pos_x = (canvas_w - fg_w) // 2
+
+        if pos_y < 0:
+            y_crop = abs(pos_y)
+            fg_resized = fg_resized[y_crop:y_crop+canvas_h, :]
+            pos_y = 0
+
+        bg_darkened[pos_y:pos_y+fg_resized.shape[0], pos_x:pos_x+fg_resized.shape[1]] = fg_resized
+        result_img = bg_darkened
+
+    else:
+        # horizontal_16_9 ou modo original sem crop
+        result_img = img
+
+    cv2.imwrite(str(dest.resolve()), result_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    logger.info("Prévia de enquadramento '%s' gerada em: %s", mode, dest)
+    return str(dest.resolve())
+
+
 def cut_video(
     input_path: str,
     start_time: float,
     end_time: float,
     output_path: Optional[str] = None,
-    mode: str = "blur_background",
+    mode: str = "vertical_blur",
     target_width: int = 1080,
     target_height: int = 1920,
     segments: Optional[List[Dict[str, Any]]] = None,
     burn_subtitles: bool = False,
     face_tracking: bool = False,
+    layout_mode: Optional[str] = None,
+    layout_params: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Recorta um trecho do vídeo e formata de acordo com a proporção desejada.
+    Recorta um trecho do vídeo e formata de acordo com o modo de enquadramento selecionado.
 
-    Modos disponíveis:
-    - 'face_tracking_9_16' / 'vertical_face': Corte vertical 9:16 com Face Tracking OpenCV e média móvel.
-    - 'blur_background': Fundo ampliado e desfocado com vídeo original nítido ao centro (Padrão viral 9:16).
-    - 'crop_center': Recorte direto das bordas laterais focado no centro (9:16).
-    - 'horizontal_16_9' / 'long_16_9' / 'original': Mantém proporção horizontal 16:9 para vídeos longos.
+    4 Modos de Renderização Suportados (V2.0):
+    - 'horizontal_16_9': Mantém proporção horizontal 16:9 original (usa stream copy quando sem legendas).
+    - 'vertical_blur': Canvas 1080x1920 com fundo ampliado + boxblur=20:5 + leve escurecimento,
+                       e vídeo original centralizado sem distorção (suporta zoom_factor de 1.0 a 1.3).
+    - 'manual_crop': Aplica crop=w:h:x:y nas coordenadas exatas escolhidas pelo usuário, escalando para 1080x1920.
+    - 'split_screen': Recorta duas regiões (box_top e box_bottom), ajusta cada uma para 1080x960 sem distorcer
+                      e empilha verticalmente (vstack=inputs=2) gerando 1080x1920.
 
-    Suporta queima automática de legendas (.srt sincronizadas a partir de 00:00:00,000).
+    Face Tracking automático continua disponível como preset/sugestão opcional (face_tracking=True).
+    Garante sempre dimensões pares no FFmpeg e escape estrito no filtro de legendas.
     """
     check_ffmpeg()
     src = Path(input_path)
@@ -509,17 +737,43 @@ def cut_video(
 
     # 1. Metadados do vídeo de entrada
     meta = get_video_metadata(str(src))
-    orig_w = meta["width"]
-    orig_h = meta["height"]
+    orig_w = int(meta["width"])
+    orig_h = int(meta["height"])
 
-    is_horizontal_mode = mode in ("horizontal_16_9", "long_16_9", "original")
+    # 2. Normalização do layout_mode e layout_params
+    effective_mode = (layout_mode or mode).lower().strip()
+    cfg = layout_params or {}
 
-    # 2. Geração da legenda temporária (.srt) se solicitado
+    # Mapeamento de compatibilidade
+    if effective_mode in ("blur_background", "blur"):
+        effective_mode = "vertical_blur"
+    elif effective_mode in ("crop_center", "crop"):
+        effective_mode = "manual_crop"
+    elif effective_mode in ("long_16_9", "original"):
+        effective_mode = "horizontal_16_9"
+    elif effective_mode in ("face_tracking_9_16", "vertical_face"):
+        effective_mode = "manual_crop"
+        face_tracking = True
+
+    # Garante target_width e target_height pares
+    if target_width % 2 != 0:
+        target_width -= 1
+    if target_height % 2 != 0:
+        target_height -= 1
+
+    # 3. Geração da legenda temporária (.srt) se solicitado
     srt_file_path = None
     if burn_subtitles and segments:
         srt_file_path = generate_srt_for_segment(segments, start_time, end_time)
 
-    # 3. Construção dos filtros de vídeo
+    # 4. Construção da chamada FFmpeg
+    is_vertical_format = effective_mode != "horizontal_16_9"
+    sub_filter = (
+        _format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=is_vertical_format)
+        if srt_file_path
+        else None
+    )
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -528,76 +782,191 @@ def cut_video(
         "-t", str(round(duration, 2)),
     ]
 
-    # Flags e filtros
-    use_face_tracking = face_tracking or mode in ("face_tracking_9_16", "vertical_face")
+    # ----------------------------------------------------
+    # MODO 1: horizontal_16_9 (Vídeo original sem crop/zoom)
+    # ----------------------------------------------------
+    if effective_mode == "horizontal_16_9":
+        if not sub_filter:
+            # Stream copy ultra-rápido quando não há legenda queimada
+            cmd.extend([
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(dest)
+            ])
+            logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                logger.error("Falha no FFmpeg stream copy: %s", proc.stderr)
+                raise RuntimeError(f"Erro ao processar corte horizontal: {proc.stderr[:350]}")
+            return str(dest.resolve())
+        else:
+            # Reencode limpo apenas para queimar a legenda
+            video_filter = f"scale=trunc(iw/2)*2:trunc(ih/2)*2,{sub_filter}"
+            cmd.extend(["-vf", video_filter])
 
-    if is_horizontal_mode:
-        # Modo Horizontal 16:9 (Vídeos longos)
-        video_filter = f"scale={min(orig_w, 1920)}:-2"
-        if srt_file_path:
-            sub_filter = _format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=False)
-            video_filter = f"{video_filter},{sub_filter}"
-        cmd.extend(["-vf", video_filter])
+    # ----------------------------------------------------
+    # MODO 2: vertical_blur (Vertical 9:16 sem zoom forçado)
+    # ----------------------------------------------------
+    elif effective_mode == "vertical_blur":
+        zoom_factor = float(cfg.get("zoom_factor", 1.0))
+        zoom_factor = max(1.0, min(1.3, zoom_factor))
+        fg_w = int(round(target_width * zoom_factor))
+        if fg_w % 2 != 0:
+            fg_w += 1
 
-    elif use_face_tracking:
-        # Modo Vertical 9:16 com Face Tracking e Suavização
-        crop_w = int(orig_h * (9.0 / 16.0))
-        if crop_w % 2 != 0:
-            crop_w -= 1
-
-        # Tenta calcular a posição com OpenCV (com fallback resiliente)
-        face_x = None
-        try:
-            face_x = detect_smooth_face_crop_x(
-                video_path=str(src),
-                start_time=start_time,
-                end_time=end_time,
-                orig_w=orig_w,
-                orig_h=orig_h,
-                crop_w=crop_w
-            )
-        except Exception as exc:
-            logger.warning("Falha durante o face tracking: %s. Aplicando fallback seguro para center crop.", exc)
-            face_x = None
-
-        # Fallback para center crop caso não detecte rosto ou nenhum detector esteja disponível
-        if face_x is None:
-            face_x = max(0, (orig_w - crop_w) // 2)
-            if face_x % 2 != 0:
-                face_x -= 1
-            logger.info("Face tracking: aplicando center crop em X=%d (fallback seguro 9:16).", face_x)
-
-        video_filter = f"crop={crop_w}:{orig_h}:{face_x}:0,scale={target_width}:{target_height}"
-        if srt_file_path:
-            sub_filter = _format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=True)
-            video_filter = f"{video_filter},{sub_filter}"
-        cmd.extend(["-vf", video_filter])
-
-    elif mode == "crop_center":
-        # Recorte 9:16 central direto
-        video_filter = f"crop=ih*(9/16):ih,scale={target_width}:{target_height}"
-        if srt_file_path:
-            sub_filter = _format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=True)
-            video_filter = f"{video_filter},{sub_filter}"
-        cmd.extend(["-vf", video_filter])
-
-    else:
-        # Modo Padrão: blur_background 9:16
-        filter_complex = (
+        bg_filter = (
             f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
-            f"crop={target_width}:{target_height},boxblur=25:10[bg];"
-            f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
+            f"crop={target_width}:{target_height},boxblur=20:5,eq=brightness=-0.15[bg]"
         )
-        if srt_file_path:
-            sub_filter = _format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=True)
+
+        if zoom_factor <= 1.0:
+            fg_filter = f"[0:v]scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
+        else:
+            fg_filter = (
+                f"[0:v]scale={fg_w}:-2:force_original_aspect_ratio=decrease,"
+                f"crop=min({target_width},iw):min({target_height},ih)[fg]"
+            )
+
+        filter_complex = f"{bg_filter};{fg_filter};[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
+        if sub_filter:
             filter_complex += f";[merged]{sub_filter}[outv]"
             cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
         else:
-            filter_complex += f"[merged]"
             cmd.extend(["-filter_complex", filter_complex, "-map", "[merged]", "-map", "0:a?"])
 
-    # 4. Codecs otimizados para compatibilidade web/mobile
+    # ----------------------------------------------------
+    # MODO 3: manual_crop (Seleção manual de coordenadas 9:16)
+    # ----------------------------------------------------
+    elif effective_mode in ("manual_crop", "crop"):
+        # Largura padrão 9:16 sobre a altura original
+        def_crop_w = int(orig_h * (9.0 / 16.0))
+        if def_crop_w % 2 != 0:
+            def_crop_w -= 1
+
+        # Preset opcional de Face Tracking se solicitado
+        if face_tracking:
+            face_x = None
+            try:
+                face_x = detect_smooth_face_crop_x(
+                    video_path=str(src),
+                    start_time=start_time,
+                    end_time=end_time,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                    crop_w=def_crop_w
+                )
+            except Exception as exc:
+                logger.warning("Preset Face Tracking falhou: %s. Utilizando fallback central.", exc)
+                face_x = None
+
+            if face_x is None:
+                face_x = max(0, (orig_w - def_crop_w) // 2)
+                if face_x % 2 != 0:
+                    face_x -= 1
+            crop_x = face_x
+            crop_y = 0
+            crop_w = def_crop_w
+            crop_h = orig_h
+        else:
+            # Coordenadas personalizadas do usuário ou centro
+            crop_w = int(cfg.get("crop_w", cfg.get("w", def_crop_w)))
+            crop_h = int(cfg.get("crop_h", cfg.get("h", orig_h)))
+            crop_x = int(cfg.get("crop_x", cfg.get("x", (orig_w - crop_w) // 2)))
+            crop_y = int(cfg.get("crop_y", cfg.get("y", 0)))
+
+        # Normaliza limites e números pares
+        crop_x = max(0, min(orig_w - 2, crop_x))
+        crop_y = max(0, min(orig_h - 2, crop_y))
+        crop_w = max(2, min(orig_w - crop_x, crop_w))
+        crop_h = max(2, min(orig_h - crop_y, crop_h))
+
+        if crop_x % 2 != 0:
+            crop_x -= 1
+        if crop_y % 2 != 0:
+            crop_y -= 1
+        if crop_w % 2 != 0:
+            crop_w -= 1
+        if crop_h % 2 != 0:
+            crop_h -= 1
+
+        video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={target_width}:{target_height}"
+        if sub_filter:
+            video_filter += f",{sub_filter}"
+        cmd.extend(["-vf", video_filter])
+
+    # ----------------------------------------------------
+    # MODO 4: split_screen (2 regiões empilhadas 1080x960)
+    # ----------------------------------------------------
+    elif effective_mode in ("split_screen", "split"):
+        half_h = target_height // 2  # 960
+        target_ar = target_width / half_h  # 1.125 (9:8)
+
+        box_top = cfg.get("box_top") or {}
+        box_bottom = cfg.get("box_bottom") or {}
+
+        def_box_w = min(orig_w // 2, int(orig_h * target_ar))
+        def_box_h = int(def_box_w / target_ar)
+
+        top_x = int(box_top.get("x", max(0, (orig_w // 4) - (def_box_w // 2))))
+        top_y = int(box_top.get("y", max(0, (orig_h - def_box_h) // 2)))
+        top_w = int(box_top.get("w", def_box_w))
+        top_h = int(box_top.get("h", def_box_h))
+
+        bot_x = int(box_bottom.get("x", min(orig_w - def_box_w, (3 * orig_w // 4) - (def_box_w // 2))))
+        bot_y = int(box_bottom.get("y", max(0, (orig_h - def_box_h) // 2)))
+        bot_w = int(box_bottom.get("w", def_box_w))
+        bot_h = int(box_bottom.get("h", def_box_h))
+
+        # Ajuste de limites e garantia de pares
+        top_x, top_y = max(0, min(orig_w - 2, top_x)), max(0, min(orig_h - 2, top_y))
+        top_w, top_h = max(2, min(orig_w - top_x, top_w)), max(2, min(orig_h - top_y, top_h))
+        bot_x, bot_y = max(0, min(orig_w - 2, bot_x)), max(0, min(orig_h - 2, bot_y))
+        bot_w, bot_h = max(2, min(orig_w - bot_x, bot_w)), max(2, min(orig_h - bot_y, bot_h))
+
+        if top_x % 2 != 0:
+            top_x -= 1
+        if top_y % 2 != 0:
+            top_y -= 1
+        if top_w % 2 != 0:
+            top_w -= 1
+        if top_h % 2 != 0:
+            top_h -= 1
+
+        if bot_x % 2 != 0:
+            bot_x -= 1
+        if bot_y % 2 != 0:
+            bot_y -= 1
+        if bot_w % 2 != 0:
+            bot_w -= 1
+        if bot_h % 2 != 0:
+            bot_h -= 1
+
+        filter_complex = (
+            f"[0:v]crop={top_w}:{top_h}:{top_x}:{top_y},scale={target_width}:{half_h}[top];"
+            f"[0:v]crop={bot_w}:{bot_h}:{bot_x}:{bot_y},scale={target_width}:{half_h}[bot];"
+            f"[top][bot]vstack=inputs=2[stacked]"
+        )
+        if sub_filter:
+            filter_complex += f";[stacked]{sub_filter}[outv]"
+            cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
+        else:
+            cmd.extend(["-filter_complex", filter_complex, "-map", "[stacked]", "-map", "0:a?"])
+
+    else:
+        # Fallback genérico: vertical_blur
+        bg_filter = (
+            f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+            f"crop={target_width}:{target_height},boxblur=20:5,eq=brightness=-0.15[bg]"
+        )
+        fg_filter = f"[0:v]scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
+        filter_complex = f"{bg_filter};{fg_filter};[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
+        if sub_filter:
+            filter_complex += f";[merged]{sub_filter}[outv]"
+            cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
+        else:
+            cmd.extend(["-filter_complex", filter_complex, "-map", "[merged]", "-map", "0:a?"])
+
+    # 5. Codecs e flags de exportação
     cmd.extend([
         "-c:v", "libx264",
         "-preset", "fast",
@@ -609,8 +978,8 @@ def cut_video(
         str(dest)
     ])
 
-    logger.info("Executando corte FFmpeg (%s -> %ss, modo: %s, legendas: %s): %s",
-                start_time, end_time, mode, bool(srt_file_path), dest.name)
+    logger.info("Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
+                start_time, end_time, effective_mode, bool(srt_file_path), dest.name)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -623,24 +992,9 @@ def cut_video(
 
 def extract_frame_thumbnail(video_path: str, timestamp: float = 1.0, output_path: Optional[str] = None) -> str:
     """
-    Extrai um frame estático de preview do vídeo como imagem JPEG.
+    Extrai um frame estático de preview do vídeo como imagem JPEG (retrocompatibilidade).
     """
-    check_ffmpeg()
-    src = Path(video_path)
-    dest = Path(output_path) if output_path else src.with_suffix(".jpg")
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss", str(max(0.0, timestamp)),
-        "-i", str(src),
-        "-vframes", "1",
-        "-q:v", "2",
-        str(dest)
-    ]
-
-    subprocess.run(cmd, capture_output=True, check=True)
-    return str(dest.resolve())
+    return extract_preview_frame(source=video_path, timestamp_sec=timestamp, output_path=output_path)
 
 
 def cleanup_temporary_files(

@@ -21,6 +21,7 @@ from core.downloader import (
     extract_video_info,
     download_audio,
     download_video,
+    get_direct_stream_url,
 )
 from core.video_engine import (
     check_ffmpeg,
@@ -29,6 +30,8 @@ from core.video_engine import (
     detect_smooth_face_crop_x,
     cut_video,
     extract_frame_thumbnail,
+    extract_preview_frame,
+    draw_framing_preview,
     cleanup_temporary_files,
 )
 
@@ -51,11 +54,14 @@ __all__ = [
     "extract_video_info",
     "download_audio",
     "download_video",
+    "get_direct_stream_url",
     "check_ffmpeg",
     "get_video_metadata",
     "generate_srt_for_segment",
     "detect_smooth_face_crop_x",
     "cut_video",
     "extract_frame_thumbnail",
+    "extract_preview_frame",
+    "draw_framing_preview",
     "cleanup_temporary_files",
 ]

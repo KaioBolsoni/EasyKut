@@ -1,22 +1,23 @@
-# ✂️ EasyKut — Criador Automático de Cortes Virais (v1.0)
+# ✂️ EasyKut — Criador Automático de Cortes Virais (v2.0)
 
-O **EasyKut** é uma aplicação local em Python e Streamlit que automatiza a criação de cortes virais a partir de vídeos do YouTube. Ele combina download otimizado via **yt-dlp**, transcrição de alta velocidade via **Groq Whisper**, curadoria inteligente com **Google Gemini / Groq LLMs**, rastreamento facial (**OpenCV Face Tracking**) e renderização com legendas queimadas via **FFmpeg**.
+O **EasyKut** é uma aplicação local em Python e Streamlit que automatiza a criação de cortes virais a partir de vídeos do YouTube. Ele combina download otimizado via **yt-dlp**, transcrição de alta velocidade via **Groq Whisper**, curadoria inteligente com **Google Gemini / Groq LLMs**, **Estúdio de Enquadramento em Tempo Real** (com prévias dinâmicas OpenCV) e renderização profissional com legendas queimadas via **FFmpeg**.
 
 ---
 
-## ✨ Funcionalidades Implementadas (v1.0)
+## ✨ Funcionalidades Implementadas (v2.0)
 
-- **Ingestão Inteligente (`yt-dlp`):** Extração de metadados, download de áudio leve (MP3 64kbps) para transcrição rápida e download do vídeo fonte em MP4 (720p ou 1080p).
+- **Ingestão Inteligente (`yt-dlp`):** Extração de metadados, download de áudio leve (MP3 48kbps mono) para transcrição ultrarrápida e download do vídeo fonte em MP4 (720p ou 1080p) apenas sob demanda.
 - **Transcrição com Timestamps (`Groq Whisper`):** Uso do modelo `whisper-large-v3-turbo` gerando segmentos temporais precisos frase a frase.
-- **Curadoria de Momentos Virais com IA:** Seleção automática dos melhores ganchos (20s a 90s), geração de títulos chamativos, nota de viralidade (`virality_score` de 0 a 10) e justificativa usando **Google Gemini** (`gemini-3.1-flash-lite`) ou **Groq LLM** (`openai/gpt-oss-120b` / `qwen/qwen3.8-27b`) com fallback automático entre provedores.
-- **4 Modos de Enquadramento e Renderização (`FFmpeg` + `OpenCV`):**
-  1. `face_tracking_9_16`: Corte vertical 9:16 com detecção facial OpenCV (compatível com OpenCV 4.x e 5.x), priorização do maior rosto em cena, suavização por Média Móvel (10 frames) e fallback automático para corte central.
-  2. `blur_background`: Corte vertical 9:16 (1080x1920) com fundo ampliado e desfocado (`boxblur`) e vídeo original centralizado.
-  3. `crop_center`: Recorte vertical 9:16 direto no centro da imagem.
-  4. `horizontal_16_9`: Mantém a proporção horizontal original 16:9.
-- **Legendas Sincronizadas Queimadas (`.srt`):** Geração automática de arquivos `.srt` recalculados a partir do marco `00:00:00,000` de cada corte e queimados no vídeo com tipografia adaptada para formatos verticais ou horizontais.
-- **Histórico Persistente (`SQLite WAL`):** Banco de dados local (`data/cortador.db`) que armazena vídeos processados e seus respectivos cortes para visualização, download ou exclusão a qualquer momento.
-- **Gestão de Armazenamento:** Limpeza automática ou manual dos arquivos temporários (`data/temp/`), preservando os cortes finais em `data/cortes/`.
+- **Curadoria Viral com IA:** Seleção automática dos melhores ganchos (duração inteligente de 20s a 90s para shorts e 7+ min para vídeos longos), geração de títulos magnéticos, nota de viralidade (`virality_score` de 0 a 100) e justificativa usando **Google Gemini** ou **Groq LLM** com chaveamento e fallback automático.
+- **Estúdio de Enquadramento em Tempo Real (4 Modos de Layout):**
+  1. `vertical_blur`: Vertical 9:16 (1080x1920) com vídeo original centralizado sem distorção sobre fundo ampliado + `boxblur=20:5` + leve escurecimento (`eq=brightness=-0.15`), com aproximação suave ajustável (zoom de 1.0x a 1.3x).
+  2. `horizontal_16_9`: Mantém a proporção horizontal 16:9 original widescreen sem cortes laterais (Stream Copy instantâneo quando sem legendas).
+  3. `manual_crop`: Seleção milimétrica da caixa de corte 9:16 com sliders de Posição Horizontal (X %), Posição Vertical (Y %) e Tamanho (%) com prévia ao vivo sobre o frame real.
+  4. `split_screen`: Dois recortes verticais empilhados (1080x960 cada) para podcasts e entrevistas, com controles independentes para Caixa Topo (Ciano) e Caixa Base (Laranja/Amarelo).
+  5. `face_tracking_9_16`: Preset opcional com rastreamento facial dinâmico OpenCV (compatível com OpenCV 4.x e 5.x) e amortecimento por Média Móvel.
+- **Prévia de Frame Real Instantânea:** Extração automática de frame por corte direto via streaming (`get_direct_stream_url`) com atualização instantânea ao alterar os tempos de início/fim.
+- **Legendas Sincronizadas Queimadas (`.srt`):** Recálculo automático dos tempos iniciando em `00:00:00,000` com escape estrito de caracteres especiais (`:, ', [, ], ,`).
+- **Histórico Persistente (`SQLite WAL`):** Abertura de pasta no Windows Explorer com 1 clique (`os.startfile`), busca por título, filtro por nota mínima (0–100), exclusão física opcional e download otimizado via file streams.
 
 ---
 
@@ -64,21 +65,19 @@ Para abrir o EasyKut no Windows sem precisar digitar comandos no terminal:
 
 ## 🖥️ Fluxo de Uso na Interface
 
-1. **Painel Lateral (Configurações):**
-   - Verifique no bloco **Diagnóstico do Sistema** se `Groq`, `Gemini` e `FFmpeg` estão com status verde (`Conectado` / `Pronto`).
+1. **Painel Lateral (Configurações Globais):**
+   - Verifique no bloco **Diagnóstico do Sistema** se `Groq`, `Gemini` e `FFmpeg` estão com status verde (`OK` / `Pronto`).
    - Escolha o **Modelo de IA para Curadoria** (Google Gemini ou Groq LLM).
-   - Selecione o **Formato e Enquadramento** desejado (Face Tracking 9:16, Fundo Desfocado 9:16, Recorte Central 9:16 ou Horizontal 16:9).
-   - Marque ou desmarque a opção **Queimar legendas automáticas sincronizadas (.srt)**.
-   - Defina a **Qualidade Máxima de Download** (`720p` ou `1080p`) e o **Limite Máximo de Cortes a Renderizar** (1 a 6).
-2. **Aba `🚀 Processar Novo Vídeo` (Fluxo em 2 Passos):**
-   - **Passo 1 (Analisar Vídeo):** Cole a URL do YouTube e clique em **🔍 Analisar Vídeo & Detectar Cortes**. O app baixa apenas o áudio leve, transcreve com Whisper e analisa com IA, exibindo os tempos em tempo real com `st.status`.
-   - **Revisão Interativa (Human-in-the-Loop):** Ajuste os títulos, refine os segundos de início e fim e marque quais cortes deseja renderizar.
-   - **Passo 2 (Renderizar Cortes Selecionados):** Clique em **🎬 Renderizar Cortes Selecionados**. O app baixa o vídeo em HD sob demanda e renderiza apenas os trechos aprovados.
-   - Assista aos clipes prontos na galeria persistente e baixe os arquivos `.mp4` com 1 clique.
+   - Defina o **Enquadramento Padrão Inicial**, a ativação de **Legendas Queimadas**, a **Qualidade Máxima** (`720p` ou `1080p`) e o número de cortes pré-marcados.
+2. **Aba `🚀 Processar Novo Vídeo & Estúdio`:**
+   - **Passo 1 (Analisar Vídeo & Extrair Prévias):** Cole a URL do YouTube e inicie a esteira. O app baixa o áudio leve, transcreve com Whisper, detecta momentos virais com IA e extrai automaticamente frames reais de prévia de cada corte com feedback em tempo real via `st.status`.
+   - **Passo 1.5 (Estúdio de Enquadramento em Tempo Real):** Abra o card expansível de cada corte para ajustar títulos, tempos de início/fim, atualizar frame no instante exato e selecionar entre os 4 modos de layout (`Vertical Blur`, `Horizontal 16:9`, `Manual 9:16`, `Split-Screen` ou `Face Tracking`). Visualize a prévia gerada em tempo real com sliders interativos de posição, zoom e caixas de enquadramento.
+   - **Passo 2 (Renderizar Cortes Selecionados):** Clique em **🎬 Renderizar Cortes Selecionados**. O app baixa o vídeo HD sob demanda e processa no FFmpeg com as dimensões e parâmetros exatos configurados no Estúdio.
+   - Os clipes finalizados são exibidos na galeria persistente com reprodução e download seguro (sem apagar a tela no rerun).
 3. **Aba `📂 Histórico & Cortes Salvos`:**
-   - Botão **📂 Abrir Pasta de Cortes** para acessar `data/cortes/` direto no Explorador de Arquivos do Windows.
-   - Filtros de **busca por título/URL** e **nota mínima de viralidade**.
-   - Reproduza cortes antigos, baixe clipes e exclua registros com opção de apagar também os arquivos físicos do disco.
+   - Botão **📂 Abrir Pasta de Cortes** para abrir `data/cortes/` diretamente no Explorador de Arquivos do Windows via `os.startfile`.
+   - Filtros dinâmicos de **busca por título/URL** e **nota mínima de viralidade (0 a 100)**.
+   - Reprodução dos clipes, download em streaming leve (sem sobrecarregar a memória RAM) e exclusão de vídeos com opção de apagar também os arquivos físicos do disco.
 
 ---
 
