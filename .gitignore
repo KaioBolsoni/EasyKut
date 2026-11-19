@@ -1,5 +1,6 @@
-﻿venv/
+venv/
 .env
+cookies.txt
 data/
 __pycache__/
 *.pyc

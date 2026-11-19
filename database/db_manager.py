@@ -3,9 +3,10 @@ Módulo de Gerenciamento do Banco de Dados SQLite (EasyKut)
 Responsável pela inicialização das tabelas e operações CRUD de vídeos e cortes.
 """
 
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 # Diretório base do projeto e pasta de dados
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -13,22 +14,27 @@ DATA_DIR = BASE_DIR / "data"
 DEFAULT_DB_PATH = DATA_DIR / "cortador.db"
 
 
-def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+@contextmanager
+def get_connection(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     """
-    Cria e retorna uma conexão com o banco de dados SQLite.
-    Habilita suporte a chaves estrangeiras, WAL mode para melhor concorrência no Streamlit,
-    e define sqlite3.Row como fábrica de linhas para acesso por chave.
+    Context manager para conexão SQLite com fechamento explícito garantido no Windows,
+    evitando vazamento de handles e bloqueios 'database is locked'.
     """
     path = db_path or DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(path), timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-
-    # Configurações de concorrência e integridade referencial
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA busy_timeout = 15000;")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db(db_path: Optional[Path] = None) -> None:
@@ -36,6 +42,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
     Inicializa o banco de dados criando as tabelas necessárias caso não existam.
     """
     with get_connection(db_path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL;")
         cursor = conn.cursor()
 
         # Tabela de vídeos principais

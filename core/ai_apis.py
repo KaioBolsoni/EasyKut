@@ -77,11 +77,11 @@ def transcribe_audio_groq(
         try:
             import subprocess
             cmd = [
-                "ffmpeg", "-y", "-i", str(path),
+                "ffmpeg", "-nostdin", "-y", "-i", str(path),
                 "-vn", "-ac", "1", "-ar", "16000", "-b:a", "24k",
                 str(compressed)
             ]
-            subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(cmd, capture_output=True, check=True, timeout=120)
             if compressed.exists() and compressed.stat().st_size > 0:
                 target_audio_path = compressed
                 logger.info("Áudio recomprimido com sucesso para %.2f MB.", compressed.stat().st_size / (1024 * 1024))
@@ -180,12 +180,21 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
         if match:
             cleaned = match.group(1).strip()
 
-    # Tenta decodificar JSON direto
+    # Tenta decodificar JSON direto ou extraindo o bloco delimitador externo
+    data = None
     try:
         data = json.loads(cleaned)
-    except json.JSONDecodeError as err:
-        logger.warning("JSON padrão inválido (%s). Tentando recuperação estruturada via regex...", err)
-        data = None
+    except json.JSONDecodeError:
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                data = json.loads(cleaned[first_brace:last_brace + 1])
+            except json.JSONDecodeError:
+                data = None
+
+    if data is None:
+        logger.warning("JSON padrão inválido. Tentando recuperação estruturada via regex...")
 
         # Tentativa de extração via regex de cada bloco de corte
         item_matches = re.findall(
@@ -200,7 +209,7 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
                     "title": m[0],
                     "start_time": float(m[1]),
                     "end_time": float(m[2]),
-                    "virality_score": float(m[3]) if m[3] else 8.0,
+                    "virality_score": float(m[3]) if m[3] else 80.0,
                     "justification": m[4] if m[4] else ""
                 })
             data = {"cortes": cortes_regex}
@@ -248,12 +257,13 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
 
 def analyze_viral_cuts_gemini(
     transcript_text: str,
-    model_name: str = "gemini-3.1-flash-lite",
-    max_retries: int = 3,
+    model_name: str = "gemini-2.5-flash",
+    max_retries: int = 2,
     base_delay: float = 2.0
 ) -> List[Dict[str, Any]]:
     """
-    Analisa a transcrição com Google Gemini aplicando retry automático e backoff exponencial.
+    Analisa a transcrição com Google Gemini utilizando cadeia de fallback de modelos estáveis
+    e retry automático com backoff exponencial.
     """
     client = get_gemini_client()
     system_instruction = load_director_prompt()
@@ -265,42 +275,53 @@ def analyze_viral_cuts_gemini(
         "Analise cuidadosamente a transcrição acima e selecione os melhores cortes virais."
     )
 
+    model_candidates = []
+    for m in (model_name, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"):
+        if m and m not in model_candidates:
+            model_candidates.append(m)
+
     last_error: Optional[Exception] = None
 
-    for attempt in range(max_retries):
-        try:
-            logger.info("Enviando transcrição para o Gemini (%s) [Tentativa %d/%d]...",
-                        model_name, attempt + 1, max_retries)
+    for current_model in model_candidates:
+        for attempt in range(max_retries):
+            try:
+                logger.info("Enviando transcrição para o Gemini (%s) [Tentativa %d/%d]...",
+                            current_model, attempt + 1, max_retries)
 
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.3
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3
+                    )
                 )
-            )
 
-            return _clean_and_parse_json(response.text)
+                return _clean_and_parse_json(response.text)
 
-        except Exception as exc:
-            last_error = exc
-            wait_time = base_delay * (2 ** attempt)
-            logger.warning("Erro na chamada Gemini (%s). Aguardando %.1fs para retry...", exc, wait_time)
-            if attempt < max_retries - 1:
-                time.sleep(wait_time)
+            except Exception as exc:
+                last_error = exc
+                err_str = str(exc)
+                # Se o modelo não existir/não estiver habilitado (404), pula imediatamente para o próximo
+                if "404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower():
+                    logger.warning("Modelo Gemini %s indisponível (404). Testando próximo modelo...", current_model)
+                    break
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning("Erro na chamada Gemini (%s): %s. Aguardando %.1fs para retry...", current_model, exc, wait_time)
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
 
-    raise RuntimeError(f"Gemini indisponível após {max_retries} tentativas: {last_error}")
+    raise RuntimeError(f"Gemini indisponível após tentar modelos {model_candidates}: {last_error}")
 
 
 def analyze_viral_cuts_groq(
     transcript_text: str,
-    model_name: str = "openai/gpt-oss-120b",
-    max_retries: int = 3,
+    model_name: str = "llama-3.3-70b-versatile",
+    max_retries: int = 2,
     base_delay: float = 2.0
 ) -> List[Dict[str, Any]]:
     """
-    Analisa a transcrição utilizando modelos LLM da Groq com retry automático e backoff exponencial.
+    Analisa a transcrição utilizando modelos LLM oficiais da Groq com fallback e retry automático.
     """
     client = get_groq_client()
     system_instruction = load_director_prompt()
@@ -313,40 +334,41 @@ def analyze_viral_cuts_groq(
         }
     ]
 
+    model_candidates = []
+    for m in (model_name, "llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"):
+        if m and m not in model_candidates:
+            model_candidates.append(m)
+
     last_error: Optional[Exception] = None
 
-    for attempt in range(max_retries):
-        try:
-            logger.info("Enviando transcrição para a Groq (%s) [Tentativa %d/%d]...",
-                        model_name, attempt + 1, max_retries)
-
+    for current_model in model_candidates:
+        for attempt in range(max_retries):
             try:
+                logger.info("Enviando transcrição para a Groq (%s) [Tentativa %d/%d]...",
+                            current_model, attempt + 1, max_retries)
+
                 response = client.chat.completions.create(
-                    model=model_name,
+                    model=current_model,
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=0.3
                 )
+
+                content = response.choices[0].message.content or "{}"
+                return _clean_and_parse_json(content)
+
             except Exception as exc:
-                logger.warning("Falha com %s (%s). Tentando alternativa qwen/qwen3.8-27b...", model_name, exc)
-                response = client.chat.completions.create(
-                    model="qwen/qwen3.8-27b",
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    temperature=0.3
-                )
+                last_error = exc
+                err_str = str(exc)
+                if "404" in err_str or "model_not_found" in err_str or "decommissioned" in err_str.lower():
+                    logger.warning("Modelo Groq %s indisponível. Testando próximo modelo...", current_model)
+                    break
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning("Erro na chamada Groq (%s): %s. Aguardando %.1fs para retry...", current_model, exc, wait_time)
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
 
-            content = response.choices[0].message.content or "{}"
-            return _clean_and_parse_json(content)
-
-        except Exception as exc:
-            last_error = exc
-            wait_time = base_delay * (2 ** attempt)
-            logger.warning("Erro na chamada Groq (%s). Aguardando %.1fs para retry...", exc, wait_time)
-            if attempt < max_retries - 1:
-                time.sleep(wait_time)
-
-    raise RuntimeError(f"Groq indisponível após {max_retries} tentativas: {last_error}")
+    raise RuntimeError(f"Groq indisponível após tentar modelos {model_candidates}: {last_error}")
 
 
 def detect_viral_moments(
@@ -356,8 +378,7 @@ def detect_viral_moments(
     """
     Função unificada e resiliente de curadoria de cortes.
     Recebe os dados da transcrição e direciona para Gemini ou Groq com retry automático.
-    Se o provedor primário falhar após todas as retentativas, chaveia automaticamente
-    para o provedor secundário garantindo 100% de disponibilidade.
+    Se o provedor primário falhar, chaveia para o secundário. Se ambos falharem, propaga o erro real.
     """
     formatted_text = format_transcript_with_timestamps(transcript_data)
     if not formatted_text.strip():
@@ -368,19 +389,23 @@ def detect_viral_moments(
         try:
             return analyze_viral_cuts_gemini(formatted_text)
         except Exception as exc:
-            logger.error("Provedor Gemini esgotou retentativas: %s. Chaveando para Groq como fallback...", exc)
+            logger.error("Provedor Gemini falhou: %s. Chaveando para Groq como fallback...", exc)
             try:
                 return analyze_viral_cuts_groq(formatted_text)
             except Exception as fallback_exc:
                 logger.error("Provedor Groq também falhou no fallback: %s", fallback_exc)
-                return []
+                raise RuntimeError(
+                    f"Falha na análise de IA — Gemini: {exc} | Groq fallback: {fallback_exc}"
+                ) from fallback_exc
     else:
         try:
             return analyze_viral_cuts_groq(formatted_text)
         except Exception as exc:
-            logger.error("Provedor Groq esgotou retentativas: %s. Chaveando para Gemini como fallback...", exc)
+            logger.error("Provedor Groq falhou: %s. Chaveando para Gemini como fallback...", exc)
             try:
                 return analyze_viral_cuts_gemini(formatted_text)
             except Exception as fallback_exc:
                 logger.error("Provedor Gemini também falhou no fallback: %s", fallback_exc)
-                return []
+                raise RuntimeError(
+                    f"Falha na análise de IA — Groq: {exc} | Gemini fallback: {fallback_exc}"
+                ) from fallback_exc

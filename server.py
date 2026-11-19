@@ -33,6 +33,7 @@ from core.config import (
 )
 from core.downloader import (
     download_audio,
+    download_audio_with_metadata,
     download_video,
     extract_video_info,
     get_direct_stream_url,
@@ -87,10 +88,19 @@ app = FastAPI(
     description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais."
 )
 
-# Habilita CORS para desenvolvimento e acesso local irrestrito
+# Habilita CORS para origens locais e acesso direto
+origins = [
+    "http://127.0.0.1:8502",
+    "http://localhost:8502",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://127.0.0.1",
+    "http://localhost",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -176,7 +186,7 @@ class RenderRequest(BaseModel):
 def get_config():
     """
     Retorna o status de conexão das chaves de API (Groq, Gemini),
-    disponibilidade do FFmpeg no sistema e o provedor padrão recomendado.
+    disponibilidade do FFmpeg, presença de cookies.txt e provedor padrão recomendado.
     """
     is_ready, details = validate_config()
     return {
@@ -185,6 +195,7 @@ def get_config():
             "GROQ_API_KEY": bool(details.get("GROQ_API_KEY")),
             "GEMINI_API_KEY": bool(details.get("GEMINI_API_KEY")),
             "FFMPEG_AVAILABLE": bool(details.get("FFMPEG")),
+            "COOKIES_TXT": bool(details.get("COOKIES_TXT")),
         },
         "default_provider": "gemini" if details.get("GEMINI_API_KEY") else "groq",
         "status_details": details,
@@ -192,11 +203,15 @@ def get_config():
 
 
 def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> None:
-    """Thread de execução em background da esteira de ingestão e curadoria IA."""
+    """Thread de execução em background da esteira de ingestão e curadoria IA (1 única chamada yt-dlp)."""
     try:
-        # 1. Metadados do vídeo
-        update_job(job_id, step="[1/5] Extraindo metadados do vídeo via yt-dlp...", progress=10)
-        info = extract_video_info(url)
+        # 1. Ingestão unificada: Metadados + Download de Áudio + Stream URL em 1 única chamada yt-dlp
+        update_job(job_id, step="[1/4] Extraindo metadados e baixando áudio leve (1 chamada yt-dlp)...", progress=15)
+        ingest = download_audio_with_metadata(url)
+        info = ingest["info"]
+        audio_file = ingest["audio_path"]
+        direct_stream_url = ingest.get("direct_stream_url")
+
         video_title = info.get("title", "Vídeo Sem Título")
         video_duration = float(info.get("duration", 0.0))
         video_thumbnail = info.get("thumbnail", "")
@@ -206,16 +221,12 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             url=url,
             title=video_title,
             duration=video_duration,
-            status="processing"
+            audio_path=audio_file,
+            status="transcribing"
         )
 
-        # 2. Download do áudio leve (mono 16kHz)
-        update_job(job_id, step="[2/5] Baixando faixa de áudio leve (MP3 mono)...", progress=30)
-        audio_file = download_audio(url)
-        update_video_status(video_id, status="transcribing", audio_path=audio_file)
-
-        # 3. Transcrição com Groq Whisper
-        update_job(job_id, step="[3/5] Transcrevendo áudio com Groq Whisper-large-v3...", progress=50)
+        # 2. Transcrição com Groq Whisper
+        update_job(job_id, step="[2/4] Transcrevendo áudio com Groq Whisper-large-v3...", progress=45)
         transcript_data = transcribe_audio_groq(audio_file)
 
         # Salva cache de transcrição em disco para reutilização na renderização
@@ -226,9 +237,9 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
         except Exception as exc_cache:
             logger.warning("Falha ao salvar cache de transcrição: %s", exc_cache)
 
-        # 4. Detecção de momentos virais com IA
+        # 3. Detecção de momentos virais com IA
         prov_clean = (provider or "gemini").lower().strip()
-        update_job(job_id, step=f"[4/5] Analisando momentos de retenção com {prov_clean.upper()}...", progress=70)
+        update_job(job_id, step=f"[3/4] Analisando momentos de retenção com {prov_clean.upper()}...", progress=70)
         cortes_detectados = detect_viral_moments(transcript_data, provider=prov_clean)
 
         if not cortes_detectados:
@@ -257,19 +268,8 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
 
         cortes_detectados.sort(key=_get_score, reverse=True)
 
-        # 5. Captura automática de frames de prévia para os cortes sugeridos
-        update_job(job_id, step=f"[5/5] Capturando frames reais de prévia para {len(cortes_detectados)} cortes...", progress=85)
-
-        # Reaproveita a mesma URL direta de streaming (obtida 1 única vez para todo o lote)
-        direct_stream_url = None
-        is_remote_url = url.startswith("http://") or url.startswith("https://")
-        if is_remote_url:
-            try:
-                from core.downloader import get_direct_stream_url
-                direct_stream_url = get_direct_stream_url(url)
-                logger.info("URL direta de streaming obtida com sucesso para o lote de frames.")
-            except Exception as e_stream:
-                logger.warning("Falha ao obter URL direta única de streaming para prévias: %s", e_stream)
+        # 4. Captura automática de frames de prévia reaproveitando o stream já obtido (zero novas chamadas yt-dlp)
+        update_job(job_id, step=f"[4/4] Capturando frames reais de prévia para {len(cortes_detectados)} cortes...", progress=85)
 
         cortes_formatados: List[Dict[str, Any]] = []
         for idx, c in enumerate(cortes_detectados):
@@ -284,25 +284,26 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             else:
                 modo_inicial = "vertical_blur"
 
-            # Extração de frame em ~1.5s via stream direto yt-dlp
+            # Só executa FFmpeg se já tivermos direct_stream_url ou arquivo local, evitando novas chamadas yt-dlp
             ts_frame = max(0.0, c_start + min(1.5, c_dur / 2.0))
             frame_path = ""
             frame_url = ""
-            try:
-                frame_path = extract_preview_frame(
-                    source=url,
-                    timestamp_sec=ts_frame,
-                    direct_stream_url=direct_stream_url
-                )
-                if frame_path and os.path.exists(frame_path):
-                    frame_url = f"/data/temp/{Path(frame_path).name}"
-                else:
+            if direct_stream_url or not (url.startswith("http://") or url.startswith("https://")):
+                try:
+                    frame_path = extract_preview_frame(
+                        source=url,
+                        timestamp_sec=ts_frame,
+                        direct_stream_url=direct_stream_url
+                    )
+                    if frame_path and os.path.exists(frame_path):
+                        frame_url = f"/data/temp/{Path(frame_path).name}"
+                    else:
+                        frame_path = ""
+                        frame_url = ""
+                except Exception as exc_frame:
+                    logger.warning("Falha ao extrair frame de preview do corte %d: %s", idx, exc_frame)
                     frame_path = ""
                     frame_url = ""
-            except Exception as exc_frame:
-                logger.warning("Falha ao extrair frame de preview do corte %d: %s", idx, exc_frame)
-                frame_path = ""
-                frame_url = ""
 
             raw_sc = float(c.get("virality_score", 80.0) or 80.0)
             norm_sc = raw_sc * 10.0 if (0.0 < raw_sc <= 10.0) else raw_sc
@@ -324,10 +325,13 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
                 "frame_url": frame_url,
             })
 
-        # Salva análise no banco SQLite
-        save_analysis(video_id=video_id, transcript=transcript_data, analysis_data=cortes_detectados)
+        # Salva análise no banco SQLite e vincula IDs primários aos cortes formatados
+        inserted_ids = save_analysis(video_id=video_id, transcript=transcript_data, analysis_data=cortes_detectados)
+        for idx, c_fmt in enumerate(cortes_formatados):
+            if idx < len(inserted_ids):
+                c_fmt["id"] = inserted_ids[idx]
 
-        # Cache em memória
+        # Cache em memória (inclui direct_stream_url para /api/frame sem novas chamadas ao yt-dlp)
         analyses_cache[video_id] = {
             "transcript_data": transcript_data,
             "url": url,
@@ -335,6 +339,7 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             "duration": video_duration,
             "thumbnail": video_thumbnail,
             "uploader": video_uploader,
+            "direct_stream_url": direct_stream_url,
         }
 
         # Conclui o job
@@ -375,7 +380,11 @@ def start_analyze(req: AnalyzeRequest):
     Inicia a esteira de análise assíncrona para uma URL de vídeo.
     Retorna imediatamente um job_id para acompanhamento pelo frontend.
     """
-    if not is_valid_video_url(req.url):
+    target_url = (req.url or "").strip()
+    if not target_url.startswith("http://") and not target_url.startswith("https://"):
+        target_url = "https://" + target_url
+
+    if not is_valid_video_url(target_url):
         raise HTTPException(status_code=400, detail="URL de vídeo inválida ou não suportada.")
 
     job_id = f"job_analyze_{uuid.uuid4().hex[:10]}"
@@ -394,7 +403,7 @@ def start_analyze(req: AnalyzeRequest):
 
     threading.Thread(
         target=_run_analyze_job,
-        args=(job_id, req.url.strip(), req.provider or "gemini", req.max_cuts or 5),
+        args=(job_id, target_url, req.provider or "gemini", req.max_cuts or 5),
         daemon=True
     ).start()
 
@@ -420,10 +429,20 @@ def get_job_status(job_id: str):
 def get_frame(req: FrameRequest):
     """
     Extrai 1 único frame JPEG (.jpg) no segundo especificado a partir de uma URL ou arquivo local.
-    Ideal para quando o usuário ajusta start_time ou end_time no Estúdio de Enquadramento.
+    Reaproveita a URL direta de stream já em cache para evitar chamadas redundantes ao yt-dlp.
     """
     try:
-        frame_path = extract_preview_frame(source=req.source, timestamp_sec=req.timestamp_sec)
+        cached_stream = None
+        for entry in analyses_cache.values():
+            if entry.get("url") == req.source and entry.get("direct_stream_url"):
+                cached_stream = entry["direct_stream_url"]
+                break
+
+        frame_path = extract_preview_frame(
+            source=req.source,
+            timestamp_sec=req.timestamp_sec,
+            direct_stream_url=cached_stream
+        )
         if not frame_path or not os.path.exists(frame_path):
             raise RuntimeError("Não foi possível gerar o frame de prévia para este timestamp.")
         frame_url = f"/data/temp/{Path(frame_path).name}"

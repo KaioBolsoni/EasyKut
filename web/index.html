@@ -68,14 +68,14 @@
 
           <div class="input-bar-wrapper">
             <svg style="margin-left: 0.5rem; color: var(--text-dim);" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-            <input type="text" id="input-yt-url" class="url-input" placeholder="Cole o link do YouTube aqui (ex: https://youtube.com/watch?v=...)">
+            <input type="text" id="input-yt-url" class="url-input" placeholder="Cole o link do YouTube aqui (ex: https://youtube.com/watch?v=...)" onkeydown="if(event.key==='Enter')startAnalysis()">
 
             <select id="select-hero-provider" class="provider-select">
               <option value="gemini">Google Gemini</option>
               <option value="groq">Groq (LLM 120B)</option>
             </select>
 
-            <button id="btn-analyze" class="btn-primary">
+            <button id="btn-analyze" class="btn-primary" onclick="startAnalysis()">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
               Analisar Vídeo
             </button>
@@ -290,12 +290,36 @@
               <span>Binários do FFmpeg:</span>
               <span id="cfg-status-ffmpeg" class="status-tag-off">Verificando...</span>
             </div>
+            <div class="status-row">
+              <span>YouTube Cookies (cookies.txt):</span>
+              <span id="cfg-status-cookies" class="status-tag-off">Verificando...</span>
+            </div>
           </div>
         </div>
       </div>
 
       <div class="modal-footer">
         <button id="modal-save-btn" class="btn-primary" style="padding: 0.5rem 1.25rem;">Salvar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL DE PROGRESSO DA RENDERIZAÇÃO (FFMPEG)
+       ========================================================= -->
+  <div id="render-progress-overlay" class="modal-backdrop" style="display: none; z-index: 200;">
+    <div class="modal-dialog" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Renderizando Cortes no Estúdio</h3>
+      </div>
+      <div class="modal-body" style="padding: 1.5rem;">
+        <div class="progress-line-track" style="margin-bottom: 1rem;">
+          <div id="render-progress-fill" class="progress-line-fill" style="width: 5%;"></div>
+        </div>
+        <div class="progress-meta">
+          <span id="render-progress-step">Preparando renderização com FFmpeg...</span>
+          <span id="render-progress-pct">5%</span>
+        </div>
       </div>
     </div>
   </div>

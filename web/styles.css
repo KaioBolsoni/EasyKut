@@ -349,6 +349,12 @@ body {
   transform: scale(0.98);
 }
 
+.btn-primary:disabled {
+  opacity: 0.55 !important;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+
 /* STEP PROGRESS BOX */
 .progress-card {
   margin-top: 2rem;

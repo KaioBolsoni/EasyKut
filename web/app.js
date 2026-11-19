@@ -171,6 +171,7 @@ function updateConfigModalUI(data) {
   const gTag = document.getElementById('cfg-status-groq');
   const mTag = document.getElementById('cfg-status-gemini');
   const fTag = document.getElementById('cfg-status-ffmpeg');
+  const cTag = document.getElementById('cfg-status-cookies');
 
   if (data.keys.GROQ_API_KEY) {
     gTag.className = 'status-tag-ok'; gTag.textContent = 'Conectado';
@@ -188,6 +189,14 @@ function updateConfigModalUI(data) {
     fTag.className = 'status-tag-ok'; fTag.textContent = 'Pronto';
   } else {
     fTag.className = 'status-tag-off'; fTag.textContent = 'Ausente';
+  }
+
+  if (cTag) {
+    if (data.keys.COOKIES_TXT) {
+      cTag.className = 'status-tag-ok'; cTag.textContent = 'Carregado';
+    } else {
+      cTag.className = 'status-tag-off'; cTag.textContent = 'Opcional (Não detectado)';
+    }
   }
 }
 
@@ -223,6 +232,7 @@ function switchTab(tabName) {
 }
 
 function openSettingsModal() {
+  fetchConfig();
   document.getElementById('modal-provider-select').value = state.defaultProvider;
   document.getElementById('modal-maxcuts-input').value = state.maxCuts;
   document.getElementById('settings-modal').style.display = 'flex';
@@ -244,20 +254,45 @@ function saveSettingsModal() {
 // ESTEIRA DE ANÁLISE (HERO / INPUT)
 // =========================================================
 async function startAnalysis() {
+  if (state.isAnalyzing) {
+    return; // Impede pedidos duplicados em paralelo
+  }
+
   const urlInput = document.getElementById('input-yt-url');
-  const url = urlInput.value.trim();
-  const provider = document.getElementById('select-hero-provider').value;
+  let url = urlInput ? urlInput.value.trim() : '';
+  const provider = document.getElementById('select-hero-provider')?.value || 'gemini';
 
   if (!url) {
     alert('Por favor, cole a URL de um vídeo do YouTube.');
     return;
   }
 
-  state.isAnalyzing = true;
-  document.getElementById('btn-analyze').disabled = true;
-  document.getElementById('progress-card').style.display = 'block';
+  // Previne erros caso a URL venha sem http(s)://
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = 'https://' + url;
+    if (urlInput) urlInput.value = url;
+  }
 
-  updateStepTracker(1, 'Extraindo áudio e metadados...', 15);
+  // Desativa imediatamente o botão para impedir envios simultâneos
+  state.isAnalyzing = true;
+  const btnAnalyze = document.getElementById('btn-analyze');
+  if (btnAnalyze) {
+    btnAnalyze.disabled = true;
+    btnAnalyze.style.opacity = '0.55';
+    btnAnalyze.style.cursor = 'not-allowed';
+  }
+
+  const progressCard = document.getElementById('progress-card');
+  if (progressCard) progressCard.style.display = 'block';
+
+  const stepText = document.getElementById('progress-step-text');
+  if (stepText) stepText.textContent = 'Enviando link para o estúdio...';
+  const pctText = document.getElementById('progress-pct-text');
+  if (pctText) pctText.textContent = '5%';
+  const lineFill = document.getElementById('progress-line-fill');
+  if (lineFill) lineFill.style.width = '5%';
+
+  updateStepTracker(1);
 
   try {
     const res = await fetch('/api/analyze', {
@@ -271,7 +306,7 @@ async function startAnalysis() {
       state.activeJobId = data.job_id;
       pollJob(data.job_id, onAnalysisSuccess, onAnalysisError);
     } else {
-      throw new Error(data.detail || 'Falha ao iniciar análise.');
+      throw new Error(data.detail || 'Falha ao iniciar análise no servidor.');
     }
   } catch (err) {
     alert('Erro ao analisar vídeo: ' + err.message);
@@ -290,13 +325,23 @@ function pollJob(jobId, onSuccess, onError) {
       }
       const job = await res.json();
 
-      // Exibe na barra de progresso o texto real de job.step retornado pelo backend
-      if (job.step) {
-        document.getElementById('progress-step-text').textContent = job.step;
-      }
+      // Exibe na barra de progresso (Análise e Renderização) o texto real de job.step retornado pelo backend
+      const stepLabel = job.step || 'Processando...';
       const pct = typeof job.progress === 'number' ? job.progress : 0;
-      document.getElementById('progress-pct-text').textContent = `${pct}%`;
-      document.getElementById('progress-line-fill').style.width = `${pct}%`;
+
+      const heroStep = document.getElementById('progress-step-text');
+      const heroPct = document.getElementById('progress-pct-text');
+      const heroFill = document.getElementById('progress-line-fill');
+      if (heroStep) heroStep.textContent = stepLabel;
+      if (heroPct) heroPct.textContent = `${pct}%`;
+      if (heroFill) heroFill.style.width = `${pct}%`;
+
+      const renderStep = document.getElementById('render-progress-step');
+      const renderPct = document.getElementById('render-progress-pct');
+      const renderFill = document.getElementById('render-progress-fill');
+      if (renderStep) renderStep.textContent = stepLabel;
+      if (renderPct) renderPct.textContent = `${pct}%`;
+      if (renderFill) renderFill.style.width = `${pct}%`;
 
       // Atualiza passos visuais
       if (pct < 30) updateStepTracker(1);
@@ -337,6 +382,16 @@ function onAnalysisSuccess(result) {
   state.activeCutIndex = 0;
   state.isAnalyzing = false;
 
+  // Reativa o botão para futuras análises caso o usuário volte
+  const btnAnalyze = document.getElementById('btn-analyze');
+  if (btnAnalyze) {
+    btnAnalyze.disabled = false;
+    btnAnalyze.style.opacity = '1';
+    btnAnalyze.style.cursor = 'pointer';
+  }
+  const progressCard = document.getElementById('progress-card');
+  if (progressCard) progressCard.style.display = 'none';
+
   // Transição suave para o Workspace Master-Detail
   document.getElementById('hero-section').style.display = 'none';
   document.getElementById('workspace-section').style.display = 'grid';
@@ -351,8 +406,14 @@ function onAnalysisError(errorMsg) {
 
 function resetHeroUI() {
   state.isAnalyzing = false;
-  document.getElementById('btn-analyze').disabled = false;
-  document.getElementById('progress-card').style.display = 'none';
+  const btnAnalyze = document.getElementById('btn-analyze');
+  if (btnAnalyze) {
+    btnAnalyze.disabled = false;
+    btnAnalyze.style.opacity = '1';
+    btnAnalyze.style.cursor = 'pointer';
+  }
+  const progressCard = document.getElementById('progress-card');
+  if (progressCard) progressCard.style.display = 'none';
 }
 
 function resetToHero() {
@@ -599,6 +660,13 @@ async function refreshCutFrame() {
   const c = getActiveCut();
   if (!c || !state.currentVideo) return;
 
+  const btnToolbar = document.getElementById('btn-refresh-frame');
+  const btnOverlay = document.getElementById('btn-load-frame-placeholder');
+  if (btnToolbar && btnToolbar.disabled) return;
+
+  if (btnToolbar) btnToolbar.disabled = true;
+  if (btnOverlay) btnOverlay.disabled = true;
+
   showToast('Capturando frame no tempo exato...');
   const source = state.currentVideo.url;
   const ts = Math.max(0, c.start_time + 0.5);
@@ -610,16 +678,19 @@ async function refreshCutFrame() {
       body: JSON.stringify({ source, timestamp_sec: ts })
     });
     const data = await res.json();
-    if (data.success && data.frame_url) {
+    if (res.ok && data.success && data.frame_url) {
       c.frame_url = data.frame_url;
       c.frame_path = data.frame_path;
       loadCutFrame(c);
       showToast('Frame atualizado com sucesso!');
     } else {
-      showToast('Não foi possível capturar o frame. Tente novamente.');
+      showToast(data.detail || 'Não foi possível capturar o frame. Tente novamente.');
     }
   } catch (err) {
     alert('Erro ao atualizar frame: ' + err.message);
+  } finally {
+    if (btnToolbar) btnToolbar.disabled = false;
+    if (btnOverlay) btnOverlay.disabled = false;
   }
 }
 
@@ -628,6 +699,8 @@ function initCutGeometry(cut) {
   const H = canvasState.imgNaturalH || 1080;
 
   if (!cut.layout_params) cut.layout_params = {};
+  cut.layout_params.ref_w = W;
+  cut.layout_params.ref_h = H;
 
   // 1. Manual Crop: 9:16
   if (!cut.layout_params.crop_w || !cut.layout_params.crop_h) {
@@ -670,14 +743,13 @@ function renderAllCanvases() {
 // 1. PALCO PRINCIPAL (EDITOR)
 function renderEditorCanvas() {
   const ctx = canvasState.editorCtx;
-  const W = canvasState.editorCanvas.width || 1920;
-  const H = canvasState.editorCanvas.height || 1080;
   const cut = getActiveCut();
-
-  ctx.clearRect(0, 0, W, H);
 
   // Se o frame não estiver carregado, desenha placeholder limpo no Canvas
   if (!canvasState.imgLoaded || !canvasState.currentImg) {
+    const W = canvasState.editorCanvas.width || 1920;
+    const H = canvasState.editorCanvas.height || 1080;
+    ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = '#10141D';
     ctx.fillRect(0, 0, W, H);
     ctx.strokeStyle = '#232938';
@@ -697,9 +769,8 @@ function renderEditorCanvas() {
   }
 
   const img = canvasState.currentImg;
-  const W = canvasState.imgNaturalW;
-  const H = canvasState.imgNaturalH;
-  const cut = getActiveCut();
+  const W = canvasState.imgNaturalW || 1920;
+  const H = canvasState.imgNaturalH || 1080;
 
   ctx.clearRect(0, 0, W, H);
 
@@ -1138,18 +1209,32 @@ function isPointInsideBox(px, py, box) {
 // RENDERIZAÇÃO DE CORTES (POST /api/render)
 // =========================================================
 async function startRender() {
+  if (state.isRendering) return;
   const selecionados = state.cuts.filter(c => c.selected);
   if (selecionados.length === 0) {
     alert('Selecione pelo menos um corte para renderizar.');
     return;
   }
 
+  // Garante que cada corte leve a resolução de referência do canvas para reescala exata no FFmpeg
+  selecionados.forEach(c => {
+    if (!c.layout_params) c.layout_params = {};
+    if (!c.layout_params.ref_w) c.layout_params.ref_w = canvasState.imgNaturalW || 1920;
+    if (!c.layout_params.ref_h) c.layout_params.ref_h = canvasState.imgNaturalH || 1080;
+  });
+
   state.isRendering = true;
   updateRenderButtonState();
 
-  // Exibe barra de progresso no topo da tela
-  document.getElementById('progress-card').style.display = 'block';
-  document.getElementById('hero-section').style.display = 'none';
+  // Exibe o modal dedicado de progresso da renderização visível sobre o Workspace
+  const overlay = document.getElementById('render-progress-overlay');
+  if (overlay) overlay.style.display = 'flex';
+  const rStep = document.getElementById('render-progress-step');
+  const rPct = document.getElementById('render-progress-pct');
+  const rFill = document.getElementById('render-progress-fill');
+  if (rStep) rStep.textContent = 'Iniciando download e renderização com FFmpeg...';
+  if (rPct) rPct.textContent = '5%';
+  if (rFill) rFill.style.width = '5%';
 
   try {
     const res = await fetch('/api/render', {
@@ -1172,14 +1257,15 @@ async function startRender() {
     alert('Erro ao renderizar: ' + err.message);
     state.isRendering = false;
     updateRenderButtonState();
-    document.getElementById('progress-card').style.display = 'none';
+    if (overlay) overlay.style.display = 'none';
   }
 }
 
 function onRenderSuccess(result) {
   state.isRendering = false;
   updateRenderButtonState();
-  document.getElementById('progress-card').style.display = 'none';
+  const overlay = document.getElementById('render-progress-overlay');
+  if (overlay) overlay.style.display = 'none';
 
   showToast('Cortes renderizados com sucesso!');
   // Transfere o usuário diretamente para a Biblioteca para visualizar os clipes
@@ -1190,7 +1276,8 @@ function onRenderError(errorMsg) {
   alert('Erro durante a renderização: ' + errorMsg);
   state.isRendering = false;
   updateRenderButtonState();
-  document.getElementById('progress-card').style.display = 'none';
+  const overlay = document.getElementById('render-progress-overlay');
+  if (overlay) overlay.style.display = 'none';
 }
 
 // =========================================================
@@ -1283,7 +1370,8 @@ async function deleteVideoItem(videoId) {
 // HELPERS & UTILITÁRIOS
 // =========================================================
 function makeEven(val) {
-  return val % 2 === 0 ? val : val - 1;
+  const n = Math.round(val);
+  return n % 2 === 0 ? n : n - 1;
 }
 
 function clamp(val, min, max) {

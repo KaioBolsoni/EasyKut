@@ -6,7 +6,7 @@ Carrega e valida chaves de API e caminhos de diretórios do projeto.
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 
 # Configuração e descoberta automática do FFmpeg no sistema
@@ -44,6 +44,30 @@ else:
 # Chaves de API
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+YOUTUBE_COOKIES_ENV = os.getenv("YOUTUBE_COOKIES_PATH", "").strip()
+
+
+def get_cookies_file() -> Optional[Path]:
+    """
+    Localiza dinamicamente o arquivo cookies.txt (formato Netscape) para autenticação no yt-dlp.
+    Procura na variável de ambiente YOUTUBE_COOKIES_PATH, na raiz de cortador_automatico/,
+    em data/cookies.txt ou na pasta pai EasyKut/.
+    """
+    candidates = []
+    if YOUTUBE_COOKIES_ENV:
+        candidates.append(Path(YOUTUBE_COOKIES_ENV))
+    candidates.extend([
+        BASE_DIR / "cookies.txt",
+        DATA_DIR / "cookies.txt",
+        BASE_DIR.parent / "cookies.txt",
+    ])
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
+                return cand.resolve()
+        except Exception:
+            continue
+    return None
 
 
 def validate_config(provider: Optional[str] = None) -> Tuple[bool, Dict[str, bool]]:
@@ -56,11 +80,13 @@ def validate_config(provider: Optional[str] = None) -> Tuple[bool, Dict[str, boo
     has_groq = bool(GROQ_API_KEY and not GROQ_API_KEY.startswith("sua_chave"))
     has_gemini = bool(GEMINI_API_KEY and not GEMINI_API_KEY.startswith("sua_chave"))
     has_ffmpeg = FFMPEG_AVAILABLE
+    has_cookies = get_cookies_file() is not None
 
     status = {
         "GROQ_API_KEY": has_groq,
         "GEMINI_API_KEY": has_gemini,
         "FFMPEG": has_ffmpeg,
+        "COOKIES_TXT": has_cookies,
     }
 
     is_ready = has_ffmpeg and has_groq

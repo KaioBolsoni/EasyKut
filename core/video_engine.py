@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 import cv2
 import numpy as np
@@ -153,7 +154,7 @@ def generate_srt_for_segment(
     if output_srt_path:
         dest_srt = Path(output_srt_path)
     else:
-        dest_srt = TEMP_DIR / f"sub_{int(start_time)}_{int(end_time)}.srt"
+        dest_srt = TEMP_DIR / f"sub_{int(start_time)}_{int(end_time)}_{uuid.uuid4().hex[:6]}.srt"
 
     dest_srt.parent.mkdir(parents=True, exist_ok=True)
     dest_srt.write_text("\n".join(srt_entries), encoding="utf-8")
@@ -449,12 +450,13 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
         rest = clean_path[2:]
         clean_path = f"{drive}\\:{rest}"
 
-    # Escapa caracteres especiais do parser de filtros do FFmpeg: :, ', [, ], ,
+    # Escapa caracteres especiais do parser de filtros do FFmpeg: ', [, ], ,, ;
     clean_path = (
         clean_path.replace("'", "'\\''")
         .replace("[", "\\[")
         .replace("]", "\\]")
         .replace(",", "\\,")
+        .replace(";", "\\;")
     )
 
     if is_vertical:
@@ -893,26 +895,41 @@ def cut_video(
             crop_w = def_crop_w
             crop_h = orig_h
         else:
-            # Coordenadas personalizadas do usuário ou centro
-            crop_w = int(cfg.get("crop_w", cfg.get("w", def_crop_w)))
-            crop_h = int(cfg.get("crop_h", cfg.get("h", orig_h)))
-            crop_x = int(cfg.get("crop_x", cfg.get("x", (orig_w - crop_w) // 2)))
-            crop_y = int(cfg.get("crop_y", cfg.get("y", 0)))
+            # Coordenadas personalizadas do usuário ou centro (com reescala proporcional se o canvas tinha resolução diferente)
+            ref_w = float(cfg.get("ref_w", 0) or 0)
+            ref_h = float(cfg.get("ref_h", 0) or 0)
+            sx = (orig_w / ref_w) if ref_w > 0 else 1.0
+            sy = (orig_h / ref_h) if ref_h > 0 else 1.0
 
-        # Normaliza limites e números pares
-        crop_x = max(0, min(orig_w - 2, crop_x))
-        crop_y = max(0, min(orig_h - 2, crop_y))
-        crop_w = max(2, min(orig_w - crop_x, crop_w))
-        crop_h = max(2, min(orig_h - crop_y, crop_h))
+            raw_w = cfg.get("crop_w", cfg.get("w"))
+            raw_h = cfg.get("crop_h", cfg.get("h"))
+            raw_x = cfg.get("crop_x", cfg.get("x"))
+            raw_y = cfg.get("crop_y", cfg.get("y"))
 
-        if crop_x % 2 != 0:
-            crop_x -= 1
-        if crop_y % 2 != 0:
-            crop_y -= 1
-        if crop_w % 2 != 0:
-            crop_w -= 1
-        if crop_h % 2 != 0:
-            crop_h -= 1
+            crop_w = int(round(float(raw_w) * sx)) if raw_w is not None else def_crop_w
+            crop_h = int(round(float(raw_h) * sy)) if raw_h is not None else orig_h
+            crop_x = int(round(float(raw_x) * sx)) if raw_x is not None else (orig_w - crop_w) // 2
+            crop_y = int(round(float(raw_y) * sy)) if raw_y is not None else 0
+
+        # Normaliza limites preservando a proporção 9:16 e garantindo dimensões pares >= 2
+        target_ar = target_width / target_height  # 9/16 = 0.5625
+        crop_w = max(2, min(orig_w, crop_w))
+        crop_h = max(2, min(orig_h, crop_h))
+        # Ajusta proporcionalmente se a altura ou largura excedeu o limite do vídeo
+        if crop_w / crop_h > target_ar:
+            crop_w = int(round(crop_h * target_ar))
+        else:
+            crop_h = int(round(crop_w / target_ar))
+        crop_w = max(2, min(orig_w, crop_w))
+        crop_h = max(2, min(orig_h, crop_h))
+
+        crop_x = max(0, min(orig_w - crop_w, crop_x))
+        crop_y = max(0, min(orig_h - crop_h, crop_y))
+
+        crop_x = crop_x - (crop_x % 2)
+        crop_y = crop_y - (crop_y % 2)
+        crop_w = max(2, crop_w - (crop_w % 2))
+        crop_h = max(2, crop_h - (crop_h % 2))
 
         video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={target_width}:{target_height}"
         if sub_filter:
@@ -926,45 +943,45 @@ def cut_video(
         half_h = target_height // 2  # 960
         target_ar = target_width / half_h  # 1.125 (9:8)
 
+        ref_w = float(cfg.get("ref_w", 0) or 0)
+        ref_h = float(cfg.get("ref_h", 0) or 0)
+        sx = (orig_w / ref_w) if ref_w > 0 else 1.0
+        sy = (orig_h / ref_h) if ref_h > 0 else 1.0
+
         box_top = cfg.get("box_top") or {}
         box_bottom = cfg.get("box_bottom") or {}
 
         def_box_w = min(orig_w // 2, int(orig_h * target_ar))
         def_box_h = int(def_box_w / target_ar)
 
-        top_x = int(box_top.get("x", max(0, (orig_w // 4) - (def_box_w // 2))))
-        top_y = int(box_top.get("y", max(0, (orig_h - def_box_h) // 2)))
-        top_w = int(box_top.get("w", def_box_w))
-        top_h = int(box_top.get("h", def_box_h))
+        def _fit_split_box(b: Dict[str, Any], def_x: int, def_y: int) -> Tuple[int, int, int, int]:
+            bx = int(round(float(b["x"]) * sx)) if "x" in b else def_x
+            by = int(round(float(b["y"]) * sy)) if "y" in b else def_y
+            bw = int(round(float(b["w"]) * sx)) if "w" in b else def_box_w
+            bh = int(round(float(b["h"]) * sy)) if "h" in b else def_box_h
+            bw = max(2, min(orig_w, bw))
+            bh = max(2, min(orig_h, bh))
+            if bw / bh > target_ar:
+                bw = int(round(bh * target_ar))
+            else:
+                bh = int(round(bw / target_ar))
+            bw = max(2, min(orig_w, bw))
+            bh = max(2, min(orig_h, bh))
+            bx = max(0, min(orig_w - bw, bx))
+            by = max(0, min(orig_h - bh, by))
+            return (
+                bx - (bx % 2),
+                by - (by % 2),
+                max(2, bw - (bw % 2)),
+                max(2, bh - (bh % 2)),
+            )
 
-        bot_x = int(box_bottom.get("x", min(orig_w - def_box_w, (3 * orig_w // 4) - (def_box_w // 2))))
-        bot_y = int(box_bottom.get("y", max(0, (orig_h - def_box_h) // 2)))
-        bot_w = int(box_bottom.get("w", def_box_w))
-        bot_h = int(box_bottom.get("h", def_box_h))
-
-        # Ajuste de limites e garantia de pares
-        top_x, top_y = max(0, min(orig_w - 2, top_x)), max(0, min(orig_h - 2, top_y))
-        top_w, top_h = max(2, min(orig_w - top_x, top_w)), max(2, min(orig_h - top_y, top_h))
-        bot_x, bot_y = max(0, min(orig_w - 2, bot_x)), max(0, min(orig_h - 2, bot_y))
-        bot_w, bot_h = max(2, min(orig_w - bot_x, bot_w)), max(2, min(orig_h - bot_y, bot_h))
-
-        if top_x % 2 != 0:
-            top_x -= 1
-        if top_y % 2 != 0:
-            top_y -= 1
-        if top_w % 2 != 0:
-            top_w -= 1
-        if top_h % 2 != 0:
-            top_h -= 1
-
-        if bot_x % 2 != 0:
-            bot_x -= 1
-        if bot_y % 2 != 0:
-            bot_y -= 1
-        if bot_w % 2 != 0:
-            bot_w -= 1
-        if bot_h % 2 != 0:
-            bot_h -= 1
+        top_x, top_y, top_w, top_h = _fit_split_box(
+            box_top, max(0, (orig_w // 4) - (def_box_w // 2)), max(0, (orig_h - def_box_h) // 2)
+        )
+        bot_x, bot_y, bot_w, bot_h = _fit_split_box(
+            box_bottom, min(orig_w - def_box_w, (3 * orig_w // 4) - (def_box_w // 2)), max(0, (orig_h - def_box_h) // 2)
+        )
 
         filter_complex = (
             f"[0:v]crop={top_w}:{top_h}:{top_x}:{top_y},scale={target_width}:{half_h}[top];"
