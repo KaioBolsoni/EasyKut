@@ -23,6 +23,19 @@ logger = logging.getLogger(__name__)
 
 PROMPT_FILE = PROMPTS_DIR / "diretor_cortes.txt"
 
+# Modelos ativos recomendados para produção e fallback
+GEMINI_MODELS = [
+    "gemini-3.8-flash",       # Padrão atual para produção (tem tier gratuito)
+    "gemini-3.5-flash-lite",  # Mais rápido e barato, ideal para extração/curadoria
+    "gemini-3.1-flash-lite",  # Fallback mais econômico
+]
+
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",    # Modelo principal de alta capacidade
+    "openai/gpt-oss-20b",     # Alternativa rápida e eficiente
+    "qwen/qwen3.8-27b",       # Fallback de alta retenção
+]
+
 
 def get_groq_client() -> Groq:
     """Retorna instância autenticada do cliente Groq."""
@@ -257,13 +270,13 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
 
 def analyze_viral_cuts_gemini(
     transcript_text: str,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.8-flash",
     max_retries: int = 2,
     base_delay: float = 2.0
 ) -> List[Dict[str, Any]]:
     """
-    Analisa a transcrição com Google Gemini utilizando cadeia de fallback de modelos estáveis
-    e retry automático com backoff exponencial.
+    Analisa a transcrição com Google Gemini utilizando cadeia de fallback de modelos ativos
+    e retry automático com backoff exponencial. Registra e reporta erros individuais por modelo.
     """
     client = get_gemini_client()
     system_instruction = load_director_prompt()
@@ -276,11 +289,12 @@ def analyze_viral_cuts_gemini(
     )
 
     model_candidates = []
-    for m in (model_name, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"):
+    preferred = [model_name] if model_name else []
+    for m in preferred + GEMINI_MODELS:
         if m and m not in model_candidates:
             model_candidates.append(m)
 
-    last_error: Optional[Exception] = None
+    errors_by_model: Dict[str, str] = {}
 
     for current_model in model_candidates:
         for attempt in range(max_retries):
@@ -300,28 +314,33 @@ def analyze_viral_cuts_gemini(
                 return _clean_and_parse_json(response.text)
 
             except Exception as exc:
-                last_error = exc
                 err_str = str(exc)
-                # Se o modelo não existir/não estiver habilitado (404), pula imediatamente para o próximo
+                errors_by_model[current_model] = err_str
+                logger.warning("Falha no modelo Gemini %s [Tentativa %d/%d]: %s",
+                               current_model, attempt + 1, max_retries, exc)
+
+                # Se o modelo não existir/não estiver habilitado (404/NOT_FOUND), avança imediatamente para o próximo
                 if "404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower():
-                    logger.warning("Modelo Gemini %s indisponível (404). Testando próximo modelo...", current_model)
+                    logger.warning("Modelo Gemini %s indisponível (404). Testando próximo da lista...", current_model)
                     break
                 wait_time = base_delay * (2 ** attempt)
-                logger.warning("Erro na chamada Gemini (%s): %s. Aguardando %.1fs para retry...", current_model, exc, wait_time)
                 if attempt < max_retries - 1:
+                    logger.warning("Aguardando %.1fs para retry no modelo Gemini %s...", wait_time, current_model)
                     time.sleep(wait_time)
 
-    raise RuntimeError(f"Gemini indisponível após tentar modelos {model_candidates}: {last_error}")
+    errors_summary = " | ".join([f"[{m}: {err}]" for m, err in errors_by_model.items()])
+    raise RuntimeError(f"Gemini indisponível após tentar modelos {model_candidates}. Detalhes: {errors_summary}")
 
 
 def analyze_viral_cuts_groq(
     transcript_text: str,
-    model_name: str = "llama-3.3-70b-versatile",
+    model_name: str = "openai/gpt-oss-120b",
     max_retries: int = 2,
     base_delay: float = 2.0
 ) -> List[Dict[str, Any]]:
     """
     Analisa a transcrição utilizando modelos LLM oficiais da Groq com fallback e retry automático.
+    Registra e reporta erros individuais por modelo para diagnóstico transparente.
     """
     client = get_groq_client()
     system_instruction = load_director_prompt()
@@ -335,11 +354,12 @@ def analyze_viral_cuts_groq(
     ]
 
     model_candidates = []
-    for m in (model_name, "llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"):
+    preferred = [model_name] if model_name else []
+    for m in preferred + GROQ_MODELS:
         if m and m not in model_candidates:
             model_candidates.append(m)
 
-    last_error: Optional[Exception] = None
+    errors_by_model: Dict[str, str] = {}
 
     for current_model in model_candidates:
         for attempt in range(max_retries):
@@ -358,17 +378,21 @@ def analyze_viral_cuts_groq(
                 return _clean_and_parse_json(content)
 
             except Exception as exc:
-                last_error = exc
                 err_str = str(exc)
-                if "404" in err_str or "model_not_found" in err_str or "decommissioned" in err_str.lower():
-                    logger.warning("Modelo Groq %s indisponível. Testando próximo modelo...", current_model)
+                errors_by_model[current_model] = err_str
+                logger.warning("Falha no modelo Groq %s [Tentativa %d/%d]: %s",
+                               current_model, attempt + 1, max_retries, exc)
+
+                if "404" in err_str or "model_not_found" in err_str or "decommissioned" in err_str.lower() or "does not exist" in err_str.lower():
+                    logger.warning("Modelo Groq %s indisponível (404). Testando próximo da lista...", current_model)
                     break
                 wait_time = base_delay * (2 ** attempt)
-                logger.warning("Erro na chamada Groq (%s): %s. Aguardando %.1fs para retry...", current_model, exc, wait_time)
                 if attempt < max_retries - 1:
+                    logger.warning("Aguardando %.1fs para retry no modelo Groq %s...", wait_time, current_model)
                     time.sleep(wait_time)
 
-    raise RuntimeError(f"Groq indisponível após tentar modelos {model_candidates}: {last_error}")
+    errors_summary = " | ".join([f"[{m}: {err}]" for m, err in errors_by_model.items()])
+    raise RuntimeError(f"Groq indisponível após tentar modelos {model_candidates}. Detalhes: {errors_summary}")
 
 
 def detect_viral_moments(

@@ -128,7 +128,7 @@ def get_direct_stream_url(url: str, max_resolution: int = 1080) -> str:
         raise ValueError(f"URL de vídeo inválida: {url}")
 
     ydl_opts = _apply_common_ydl_opts({
-        "format": f"bestvideo[height<={max_resolution}]+bestaudio/best[height<={max_resolution}]/best",
+        "format": f"bestvideo[height<={max_resolution}]/best[height<={max_resolution}]/best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -141,12 +141,20 @@ def get_direct_stream_url(url: str, max_resolution: int = 1080) -> str:
             _raise_formatted_ytdlp_error(exc, url)
 
         stream_url = info.get("url")
+        if not stream_url and info.get("requested_formats"):
+            for rf in info["requested_formats"]:
+                if rf.get("vcodec") != "none" and rf.get("url"):
+                    stream_url = rf["url"]
+                    break
+
         if not stream_url:
             formats = info.get("formats", []) or []
-            for f in reversed(formats):
-                if f.get("url") and f.get("vcodec") != "none":
-                    stream_url = f.get("url")
-                    break
+            candidates = [
+                f for f in formats
+                if f.get("url") and f.get("vcodec") != "none" and (int(f.get("height") or 0) <= max_resolution)
+            ]
+            if candidates:
+                stream_url = candidates[-1]["url"]
 
         if not stream_url:
             raise ValueError(f"Não foi possível obter a URL direta do stream para: {url}")

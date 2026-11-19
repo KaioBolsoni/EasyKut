@@ -44,6 +44,7 @@ from core.video_engine import (
     cleanup_temporary_files,
     cut_video,
     draw_framing_preview,
+    extract_preview_clip,
     extract_preview_frame,
     get_video_metadata,
 )
@@ -151,6 +152,13 @@ class AnalyzeRequest(BaseModel):
 class FrameRequest(BaseModel):
     source: str
     timestamp_sec: float = 1.0
+
+
+class PreviewClipRequest(BaseModel):
+    video_id: Optional[int] = None
+    source: str
+    start_time: float = 0.0
+    end_time: float = 30.0
 
 
 class FramePreviewRequest(BaseModel):
@@ -284,29 +292,44 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             else:
                 modo_inicial = "vertical_blur"
 
-            # Só executa FFmpeg se já tivermos direct_stream_url ou arquivo local, evitando novas chamadas yt-dlp
+            # Captura frame real via FFmpeg; se falhar, utiliza thumbnail do YouTube como fallback visual garantido
             ts_frame = max(0.0, c_start + min(1.5, c_dur / 2.0))
             frame_path = ""
             frame_url = ""
-            if direct_stream_url or not (url.startswith("http://") or url.startswith("https://")):
-                try:
-                    frame_path = extract_preview_frame(
-                        source=url,
-                        timestamp_sec=ts_frame,
-                        direct_stream_url=direct_stream_url
-                    )
-                    if frame_path and os.path.exists(frame_path):
-                        frame_url = f"/data/temp/{Path(frame_path).name}"
-                    else:
-                        frame_path = ""
-                        frame_url = ""
-                except Exception as exc_frame:
-                    logger.warning("Falha ao extrair frame de preview do corte %d: %s", idx, exc_frame)
+            try:
+                frame_path = extract_preview_frame(
+                    source=url,
+                    timestamp_sec=ts_frame,
+                    direct_stream_url=direct_stream_url
+                )
+                if frame_path and os.path.exists(frame_path):
+                    frame_url = f"/data/temp/{Path(frame_path).name}"
+                else:
                     frame_path = ""
                     frame_url = ""
+            except Exception as exc_frame:
+                logger.warning("Falha ao extrair frame de preview do corte %d: %s", idx, exc_frame)
+                frame_path = ""
+                frame_url = ""
+
+            # Fallback resiliente: se a captura do frame falhar, usa a thumbnail oficial para manter a prévia ativa
+            if not frame_url and video_thumbnail:
+                frame_url = video_thumbnail
 
             raw_sc = float(c.get("virality_score", 80.0) or 80.0)
             norm_sc = raw_sc * 10.0 if (0.0 < raw_sc <= 10.0) else raw_sc
+
+            # Filtra segmentos da transcrição pertencentes a este corte para legenda ao vivo e prévia textual
+            all_segs = transcript_data.get("segments", []) or []
+            cut_segs = [
+                {
+                    "start": round(float(s.get("start", 0.0)), 2),
+                    "end": round(float(s.get("end", 0.0)), 2),
+                    "text": str(s.get("text", "")).strip(),
+                }
+                for s in all_segs
+                if float(s.get("end", 0.0)) > c_start and float(s.get("start", 0.0)) < c_end and str(s.get("text", "")).strip()
+            ]
 
             cortes_formatados.append({
                 "idx": idx,
@@ -323,6 +346,7 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
                 "burn_subtitles": True,
                 "frame_path": frame_path,
                 "frame_url": frame_url,
+                "segments": cut_segs,
             })
 
         # Salva análise no banco SQLite e vincula IDs primários aos cortes formatados
@@ -331,7 +355,7 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             if idx < len(inserted_ids):
                 c_fmt["id"] = inserted_ids[idx]
 
-        # Cache em memória (inclui direct_stream_url para /api/frame sem novas chamadas ao yt-dlp)
+        # Cache em memória (inclui direct_stream_url e audio_path para /api/frame e /api/preview-clip)
         analyses_cache[video_id] = {
             "transcript_data": transcript_data,
             "url": url,
@@ -340,6 +364,7 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             "thumbnail": video_thumbnail,
             "uploader": video_uploader,
             "direct_stream_url": direct_stream_url,
+            "audio_path": audio_file,
         }
 
         # Conclui o job
@@ -356,6 +381,7 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
                 "thumbnail": video_thumbnail,
                 "uploader": video_uploader,
                 "cortes": cortes_formatados,
+                "transcript_segments": transcript_data.get("segments", []) or [],
             }
         )
     except Exception as exc:
@@ -444,6 +470,15 @@ def get_frame(req: FrameRequest):
             direct_stream_url=cached_stream
         )
         if not frame_path or not os.path.exists(frame_path):
+            if cached_stream:
+                logger.info("Tentando extrair frame novamente sem o stream URL em cache...")
+                frame_path = extract_preview_frame(
+                    source=req.source,
+                    timestamp_sec=req.timestamp_sec,
+                    direct_stream_url=None
+                )
+
+        if not frame_path or not os.path.exists(frame_path):
             raise RuntimeError("Não foi possível gerar o frame de prévia para este timestamp.")
         frame_url = f"/data/temp/{Path(frame_path).name}"
         return {
@@ -455,6 +490,56 @@ def get_frame(req: FrameRequest):
     except Exception as exc:
         logger.error("Erro ao extrair frame no tempo %s: %s", req.timestamp_sec, exc)
         raise HTTPException(status_code=500, detail=f"Erro ao extrair frame: {exc}")
+
+
+@app.post("/api/preview-clip")
+def get_preview_clip(req: PreviewClipRequest):
+    """
+    Gera e retorna um clipe de vídeo leve (.mp4 com áudio) do intervalo [start_time, end_time]
+    para reprodução em tempo real a 60fps no Canvas do Estúdio e no Mockup 9:16 antes da renderização.
+    """
+    try:
+        cached_stream = None
+        local_audio = None
+
+        if req.video_id and req.video_id in analyses_cache:
+            entry = analyses_cache[req.video_id]
+            cached_stream = entry.get("direct_stream_url")
+            local_audio = entry.get("audio_path")
+
+        if not cached_stream or not local_audio:
+            for entry in analyses_cache.values():
+                if entry.get("url") == req.source:
+                    cached_stream = cached_stream or entry.get("direct_stream_url")
+                    local_audio = local_audio or entry.get("audio_path")
+                    break
+
+        if not local_audio and req.video_id:
+            video_row = get_video(req.video_id)
+            if video_row and video_row.get("audio_path"):
+                local_audio = video_row["audio_path"]
+
+        clip_path = extract_preview_clip(
+            source=req.source,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            direct_stream_url=cached_stream,
+            local_audio_path=local_audio
+        )
+        if not clip_path or not os.path.exists(clip_path):
+            raise RuntimeError("Não foi possível gerar o clipe de prévia em vídeo para este corte.")
+
+        clip_url = f"/data/temp/{Path(clip_path).name}"
+        return {
+            "success": True,
+            "clip_path": clip_path,
+            "clip_url": clip_url,
+            "start_time": req.start_time,
+            "end_time": req.end_time,
+        }
+    except Exception as exc:
+        logger.error("Erro ao gerar clipe de prévia (%ss -> %ss): %s", req.start_time, req.end_time, exc)
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar clipe de prévia: {exc}")
 
 
 @app.post("/api/frame/preview")

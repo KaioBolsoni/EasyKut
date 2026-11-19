@@ -34,6 +34,14 @@ const canvasState = {
   imgNaturalW: 1920,
   imgNaturalH: 1080,
 
+  // Player de Vídeo Ao Vivo Integrado ao Canvas 60fps
+  videoEl: null,
+  isVideoReady: false,
+  isVideoPlaying: false,
+  isLoadingClip: false,
+  animFrameId: null,
+  loadedClipKey: null,
+
   // Interação do Mouse
   isDragging: false,
   dragTarget: null,       // 'manual_box' | 'manual_handle' | 'top_box' | 'top_handle' | 'bot_box' | 'bot_handle'
@@ -86,8 +94,10 @@ function initDOM() {
     if (c) {
       c.start_time = Math.max(0, parseFloat(e.target.value) || 0);
       c.duration = Math.max(0.5, c.end_time - c.start_time);
+      stopAndResetClipPreview();
       updateActiveCutToolbar();
       updateCutsSidebarUI();
+      updateCutContextPanel(c);
     }
   });
 
@@ -96,8 +106,10 @@ function initDOM() {
     if (c) {
       c.end_time = Math.max(c.start_time + 0.5, parseFloat(e.target.value) || 0);
       c.duration = Math.max(0.5, c.end_time - c.start_time);
+      stopAndResetClipPreview();
       updateActiveCutToolbar();
       updateCutsSidebarUI();
+      updateCutContextPanel(c);
     }
   });
 
@@ -136,6 +148,42 @@ function initCanvas() {
   // Dimensões do Canvas do Mockup 9:16 (HD 1080x1920 nativo)
   canvasState.mockupCanvas.width = 1080;
   canvasState.mockupCanvas.height = 1920;
+
+  // Inicializa Elemento de Vídeo HTML5 para reprodução 60fps no Canvas
+  const vid = document.createElement('video');
+  vid.crossOrigin = 'anonymous';
+  vid.playsInline = true;
+  vid.preload = 'auto';
+  vid.loop = true;
+
+  vid.addEventListener('timeupdate', () => {
+    updateClipPlayerTimelineUI();
+    if (!canvasState.isVideoPlaying) {
+      renderAllCanvases();
+    }
+  });
+
+  vid.addEventListener('play', () => {
+    canvasState.isVideoPlaying = true;
+    updateClipPlayerButtonsUI();
+    startVideoCanvasLoop();
+  });
+
+  vid.addEventListener('pause', () => {
+    canvasState.isVideoPlaying = false;
+    updateClipPlayerButtonsUI();
+    stopVideoCanvasLoop();
+    renderAllCanvases();
+  });
+
+  vid.addEventListener('ended', () => {
+    canvasState.isVideoPlaying = false;
+    updateClipPlayerButtonsUI();
+    stopVideoCanvasLoop();
+    renderAllCanvases();
+  });
+
+  canvasState.videoEl = vid;
 
   // Eventos de Mouse no Editor Canvas
   const canvas = canvasState.editorCanvas;
@@ -217,6 +265,9 @@ async function openCutsFolder() {
 // =========================================================
 function switchTab(tabName) {
   state.activeTab = tabName;
+  if (tabName !== 'studio' && canvasState.videoEl && !canvasState.videoEl.paused) {
+    canvasState.videoEl.pause();
+  }
   
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
@@ -417,6 +468,7 @@ function resetHeroUI() {
 }
 
 function resetToHero() {
+  stopAndResetClipPreview();
   state.currentVideo = null;
   state.cuts = [];
   document.getElementById('input-yt-url').value = '';
@@ -460,7 +512,10 @@ function updateCutsSidebarUI() {
           <input type="checkbox" ${c.selected ? 'checked' : ''} onchange="toggleCutSelection(${idx}, this.checked)">
           <span>#${idx + 1}</span>
         </label>
-        <span class="${scoreBadgeClass}">⭐ ${score}</span>
+        <div style="display: flex; align-items: center; gap: 4px;">
+          <button class="cut-card-play-mini" onclick="event.stopPropagation(); selectAndPlayCut(${idx})" title="Assistir este corte no Estúdio">▶ Ver</button>
+          <span class="${scoreBadgeClass}">⭐ ${score}</span>
+        </div>
       </div>
       <div class="cut-title-text" title="${c.title}">${c.title}</div>
       <div class="cut-meta-text">
@@ -496,14 +551,26 @@ function selectCut(idx) {
   if (idx < 0 || idx >= state.cuts.length) return;
   state.activeCutIndex = idx;
 
+  stopAndResetClipPreview();
+
   // Atualiza classe ativa na sidebar
   const cards = document.querySelectorAll('.cut-item-card');
   cards.forEach((c, i) => {
     c.classList.toggle('active', i === idx);
   });
 
+  const activeCut = getActiveCut();
   updateActiveCutToolbar();
-  loadCutFrame(getActiveCut());
+  updateCutContextPanel(activeCut);
+  loadCutFrame(activeCut);
+}
+
+function selectAndPlayCut(idx) {
+  if (idx < 0 || idx >= state.cuts.length) return;
+  if (state.activeCutIndex !== idx) {
+    selectCut(idx);
+  }
+  togglePlayClipPreview();
 }
 
 function getActiveCut() {
@@ -606,17 +673,21 @@ function loadCutFrame(cut) {
 
   canvasState.imgLoaded = false;
 
-  // Se o frame_url for vazio ou nulo, não quebra o editor: exibe placeholder no canvas
+  // Se o frame_url for vazio ou nulo, utiliza thumbnail do vídeo como fallback antes de exibir placeholder
   if (!cut.frame_url) {
-    canvasState.currentImg = null;
-    canvasState.imgNaturalW = 1920;
-    canvasState.imgNaturalH = 1080;
-    canvasState.editorCanvas.width = 1920;
-    canvasState.editorCanvas.height = 1080;
-    initCutGeometry(cut);
-    updateCanvasPlaceholderUI(true);
-    renderAllCanvases();
-    return;
+    if (state.currentVideo && state.currentVideo.thumbnail) {
+      cut.frame_url = state.currentVideo.thumbnail;
+    } else {
+      canvasState.currentImg = null;
+      canvasState.imgNaturalW = 1920;
+      canvasState.imgNaturalH = 1080;
+      canvasState.editorCanvas.width = 1920;
+      canvasState.editorCanvas.height = 1080;
+      initCutGeometry(cut);
+      updateCanvasPlaceholderUI(true);
+      renderAllCanvases();
+      return;
+    }
   }
 
   updateCanvasPlaceholderUI(false);
@@ -699,6 +770,33 @@ function initCutGeometry(cut) {
   const H = canvasState.imgNaturalH || 1080;
 
   if (!cut.layout_params) cut.layout_params = {};
+
+  // Se já existia uma referência de resolução diferente (ex: placeholder 1920x1080 -> frame/vídeo 1280x720), reescala as caixas proporcionalmente
+  const prevW = cut.layout_params.ref_w;
+  const prevH = cut.layout_params.ref_h;
+  if (prevW && prevH && (prevW !== W || prevH !== H)) {
+    const sx = W / prevW;
+    const sy = H / prevH;
+    if (cut.layout_params.crop_w && cut.layout_params.crop_h) {
+      cut.layout_params.crop_h = makeEven(Math.min(H, Math.round(cut.layout_params.crop_h * sy)));
+      cut.layout_params.crop_w = makeEven(Math.min(W, Math.round(cut.layout_params.crop_h * (9 / 16))));
+      cut.layout_params.crop_x = makeEven(clamp(Math.round((cut.layout_params.crop_x || 0) * sx), 0, W - cut.layout_params.crop_w));
+      cut.layout_params.crop_y = makeEven(clamp(Math.round((cut.layout_params.crop_y || 0) * sy), 0, H - cut.layout_params.crop_h));
+    }
+    if (cut.layout_params.box_top && cut.layout_params.box_bottom) {
+      const target_ar = 1080 / 960;
+      ['box_top', 'box_bottom'].forEach((k) => {
+        const b = cut.layout_params[k];
+        const nh = makeEven(Math.min(H, Math.round(b.h * sy)));
+        const nw = makeEven(Math.min(W, Math.round(nh * target_ar)));
+        b.w = nw;
+        b.h = nh;
+        b.x = makeEven(clamp(Math.round(b.x * sx), 0, W - nw));
+        b.y = makeEven(clamp(Math.round(b.y * sy), 0, H - nh));
+      });
+    }
+  }
+
   cut.layout_params.ref_w = W;
   cut.layout_params.ref_h = H;
 
@@ -733,6 +831,291 @@ function initCutGeometry(cut) {
 }
 
 // =========================================================
+// PLAYER DE VÍDEO AO VIVO DO CORTE & PAINEL DE CONTEXTO
+// =========================================================
+function getCutSegments(cut) {
+  if (!cut) return [];
+  const allSegs = state.currentVideo?.transcript_segments || cut.segments || [];
+  return allSegs.filter(
+    (s) => s.end > cut.start_time && s.start < cut.end_time && (s.text || '').trim().length > 0
+  );
+}
+
+function updateCutContextPanel(cut) {
+  const justBox = document.getElementById('cut-justification-box');
+  const transBox = document.getElementById('cut-transcript-box');
+  if (!justBox || !transBox) return;
+
+  if (!cut) {
+    justBox.textContent = '';
+    transBox.innerHTML = '';
+    return;
+  }
+
+  justBox.innerHTML = cut.justification
+    ? `<strong>Motivo Viral:</strong> ${cut.justification}`
+    : `<strong>Intervalo:</strong> ${formatTimeRange(cut.start_time, cut.end_time)} (${cut.duration.toFixed(1)}s)`;
+
+  const segs = getCutSegments(cut);
+  if (segs.length === 0) {
+    transBox.innerHTML = `<span style="color: var(--text-dim);">Clique em "Assistir Corte" para ver e ouvir o clipe no editor.</span>`;
+    return;
+  }
+
+  transBox.innerHTML = segs
+    .map((s, i) => {
+      const relSec = Math.max(0, s.start - cut.start_time);
+      return `
+        <div class="cut-seg-item" data-seg-idx="${i}" data-rel-sec="${relSec.toFixed(2)}" onclick="seekClipToRelativeSec(${relSec.toFixed(2)})" title="Clique para pular o vídeo para este trecho">
+          <span class="cut-seg-time">[${formatSecondsMMSS(s.start)}]</span>
+          <span>${s.text}</span>
+        </div>
+      `;
+    })
+    .join('');
+
+  // Atualiza display de tempo inicial na barra do player
+  const timeDisp = document.getElementById('clip-time-display');
+  if (timeDisp && !canvasState.isVideoReady) {
+    timeDisp.textContent = `0:00 / ${formatSecondsMMSS(cut.duration)}`;
+  }
+}
+
+function stopAndResetClipPreview() {
+  stopVideoCanvasLoop();
+  if (canvasState.videoEl) {
+    canvasState.videoEl.pause();
+    canvasState.videoEl.removeAttribute('src');
+    canvasState.videoEl.load();
+  }
+  canvasState.isVideoReady = false;
+  canvasState.isVideoPlaying = false;
+  canvasState.isLoadingClip = false;
+  canvasState.loadedClipKey = null;
+
+  updateClipPlayerButtonsUI();
+  const slider = document.getElementById('clip-seek-slider');
+  if (slider) {
+    slider.value = 0;
+    slider.disabled = true;
+  }
+  const c = getActiveCut();
+  const timeDisp = document.getElementById('clip-time-display');
+  if (timeDisp) {
+    timeDisp.textContent = `0:00 / ${c ? formatSecondsMMSS(c.duration) : '0:00'}`;
+  }
+}
+
+async function togglePlayClipPreview() {
+  const cut = getActiveCut();
+  if (!cut || !state.currentVideo || canvasState.isLoadingClip) return;
+
+  const vid = canvasState.videoEl;
+  const clipKey = `${state.currentVideo.video_id}_${cut.start_time.toFixed(1)}_${cut.end_time.toFixed(1)}`;
+
+  // Se o vídeo deste corte já está carregado, apenas alterna Play / Pause
+  if (canvasState.isVideoReady && canvasState.loadedClipKey === clipKey && vid) {
+    if (vid.paused) {
+      vid.play().catch((err) => console.warn('Falha ao reproduzir vídeo:', err));
+    } else {
+      vid.pause();
+    }
+    return;
+  }
+
+  // Caso contrário, solicita a geração rápida do clipe de prévia (.mp4 com áudio) ao backend
+  canvasState.isLoadingClip = true;
+  updateClipPlayerButtonsUI();
+  showToast('Preparando prévia em vídeo e áudio do corte...');
+
+  try {
+    const res = await fetch('/api/preview-clip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        video_id: state.currentVideo.video_id,
+        source: state.currentVideo.url,
+        start_time: cut.start_time,
+        end_time: cut.end_time,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.clip_url) {
+      throw new Error(data.detail || 'Não foi possível carregar o vídeo de prévia deste corte.');
+    }
+
+    await new Promise((resolve, reject) => {
+      const onLoaded = () => {
+        vid.removeEventListener('loadeddata', onLoaded);
+        vid.removeEventListener('error', onError);
+        resolve();
+      };
+      const onError = () => {
+        vid.removeEventListener('loadeddata', onLoaded);
+        vid.removeEventListener('error', onError);
+        reject(new Error('Erro ao decodificar stream de vídeo no navegador.'));
+      };
+      vid.addEventListener('loadeddata', onLoaded);
+      vid.addEventListener('error', onError);
+      vid.src = data.clip_url;
+      vid.load();
+    });
+
+    canvasState.loadedClipKey = clipKey;
+    canvasState.isVideoReady = true;
+    canvasState.isLoadingClip = false;
+
+    // Se ainda não tínhamos frame estático carregado, ajusta dimensões do canvas pelo vídeo
+    if (!canvasState.imgLoaded && vid.videoWidth && vid.videoHeight) {
+      canvasState.imgNaturalW = vid.videoWidth;
+      canvasState.imgNaturalH = vid.videoHeight;
+      canvasState.editorCanvas.width = vid.videoWidth;
+      canvasState.editorCanvas.height = vid.videoHeight;
+      initCutGeometry(cut);
+      updateCanvasPlaceholderUI(false);
+    }
+
+    const slider = document.getElementById('clip-seek-slider');
+    if (slider) {
+      slider.max = vid.duration || cut.duration || 30;
+      slider.value = 0;
+      slider.disabled = false;
+    }
+
+    updateClipPlayerButtonsUI();
+    await vid.play();
+  } catch (err) {
+    canvasState.isLoadingClip = false;
+    updateClipPlayerButtonsUI();
+    alert('Erro ao reproduzir prévia do corte: ' + err.message);
+  }
+}
+
+function startVideoCanvasLoop() {
+  stopVideoCanvasLoop();
+  const loop = () => {
+    if (!canvasState.isVideoPlaying) return;
+    renderAllCanvases();
+    updateClipPlayerTimelineUI();
+    canvasState.animFrameId = requestAnimationFrame(loop);
+  };
+  canvasState.animFrameId = requestAnimationFrame(loop);
+}
+
+function stopVideoCanvasLoop() {
+  if (canvasState.animFrameId) {
+    cancelAnimationFrame(canvasState.animFrameId);
+    canvasState.animFrameId = null;
+  }
+}
+
+function onClipSeekInput(val) {
+  const vid = canvasState.videoEl;
+  if (!vid || !canvasState.isVideoReady) return;
+  vid.currentTime = parseFloat(val) || 0;
+  updateClipPlayerTimelineUI();
+  renderAllCanvases();
+}
+
+async function seekClipToRelativeSec(relSec) {
+  const cut = getActiveCut();
+  if (!cut) return;
+  const clipKey = `${state.currentVideo?.video_id}_${cut.start_time.toFixed(1)}_${cut.end_time.toFixed(1)}`;
+  if (!canvasState.isVideoReady || canvasState.loadedClipKey !== clipKey) {
+    await togglePlayClipPreview();
+  }
+  if (canvasState.videoEl && canvasState.isVideoReady) {
+    canvasState.videoEl.currentTime = Math.max(0, Math.min(canvasState.videoEl.duration || cut.duration, relSec));
+    renderAllCanvases();
+  }
+}
+
+function toggleMuteClipPreview() {
+  const vid = canvasState.videoEl;
+  if (!vid) return;
+  vid.muted = !vid.muted;
+  const btn = document.getElementById('btn-mute-clip');
+  if (btn) btn.textContent = vid.muted ? '🔇' : '🔊';
+}
+
+function updateClipPlayerButtonsUI() {
+  const btn = document.getElementById('btn-play-clip');
+  const icon = document.getElementById('btn-play-clip-icon');
+  const label = document.getElementById('btn-play-clip-label');
+  if (!btn || !icon || !label) return;
+
+  if (canvasState.isLoadingClip) {
+    btn.disabled = true;
+    icon.textContent = '⏳';
+    label.textContent = 'Carregando Clipe...';
+  } else if (canvasState.isVideoPlaying) {
+    btn.disabled = false;
+    icon.textContent = '⏸️';
+    label.textContent = 'Pausar Corte';
+  } else {
+    btn.disabled = false;
+    icon.textContent = '▶️';
+    label.textContent = canvasState.isVideoReady ? 'Continuar Corte' : 'Assistir Corte';
+  }
+}
+
+function updateClipPlayerTimelineUI() {
+  const vid = canvasState.videoEl;
+  const cut = getActiveCut();
+  if (!vid || !cut) return;
+
+  const cur = vid.currentTime || 0;
+  const tot = vid.duration || cut.duration || 0;
+
+  const slider = document.getElementById('clip-seek-slider');
+  if (slider && !slider.disabled) {
+    slider.max = tot;
+    slider.value = cur;
+  }
+
+  const timeDisp = document.getElementById('clip-time-display');
+  if (timeDisp) {
+    timeDisp.textContent = `${formatSecondsMMSS(cur)} / ${formatSecondsMMSS(tot)}`;
+  }
+
+  // Destaca a frase ativa na caixa de transcrição lateral
+  const absSec = cut.start_time + cur;
+  const segs = getCutSegments(cut);
+  const items = document.querySelectorAll('.cut-seg-item');
+  items.forEach((el, idx) => {
+    const s = segs[idx];
+    const isActive = s && absSec >= s.start && absSec <= s.end;
+    el.classList.toggle('active-seg', !!isActive);
+  });
+}
+
+function formatSecondsMMSS(sec) {
+  const s = Math.max(0, Math.floor(sec || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, '0')}`;
+}
+
+function getActiveMediaSource() {
+  if (canvasState.isVideoReady && canvasState.videoEl && canvasState.videoEl.readyState >= 2) {
+    return {
+      el: canvasState.videoEl,
+      srcW: canvasState.videoEl.videoWidth || canvasState.imgNaturalW || 1920,
+      srcH: canvasState.videoEl.videoHeight || canvasState.imgNaturalH || 1080,
+    };
+  }
+  if (canvasState.imgLoaded && canvasState.currentImg) {
+    return {
+      el: canvasState.currentImg,
+      srcW: canvasState.currentImg.naturalWidth || canvasState.imgNaturalW || 1920,
+      srcH: canvasState.currentImg.naturalHeight || canvasState.imgNaturalH || 1080,
+    };
+  }
+  return null;
+}
+
+// =========================================================
 // RENDERIZAÇÃO 60FPS NOS CANVASES
 // =========================================================
 function renderAllCanvases() {
@@ -744,9 +1127,10 @@ function renderAllCanvases() {
 function renderEditorCanvas() {
   const ctx = canvasState.editorCtx;
   const cut = getActiveCut();
+  const media = getActiveMediaSource();
 
-  // Se o frame não estiver carregado, desenha placeholder limpo no Canvas
-  if (!canvasState.imgLoaded || !canvasState.currentImg) {
+  // Se nem o vídeo nem o frame estiverem carregados, desenha placeholder limpo no Canvas
+  if (!media) {
     const W = canvasState.editorCanvas.width || 1920;
     const H = canvasState.editorCanvas.height || 1080;
     ctx.clearRect(0, 0, W, H);
@@ -764,18 +1148,20 @@ function renderEditorCanvas() {
 
     ctx.fillStyle = '#6366F1';
     ctx.font = '22px Inter, sans-serif';
-    ctx.fillText('Clique em "Carregar Frame" para capturar a imagem deste corte', W / 2, H / 2 + 25);
+    ctx.fillText('Clique em "Assistir Corte" ou "Carregar Frame" para visualizar', W / 2, H / 2 + 25);
     return;
   }
 
-  const img = canvasState.currentImg;
+  const { el: srcEl, srcW, srcH } = media;
   const W = canvasState.imgNaturalW || 1920;
   const H = canvasState.imgNaturalH || 1080;
+  const scaleX = srcW / W;
+  const scaleY = srcH / H;
 
   ctx.clearRect(0, 0, W, H);
 
-  // Desenha imagem original base
-  ctx.drawImage(img, 0, 0, W, H);
+  // Desenha imagem ou frame do vídeo ao vivo
+  ctx.drawImage(srcEl, 0, 0, W, H);
 
   if (!cut) return;
   const mode = cut.layout_mode;
@@ -813,9 +1199,9 @@ function renderEditorCanvas() {
     ctx.fillStyle = 'rgba(11, 13, 18, 0.55)';
     ctx.fillRect(0, 0, W, H);
 
-    // Redesenha as duas regiões nítidas
-    ctx.drawImage(img, top.x, top.y, top.w, top.h, top.x, top.y, top.w, top.h);
-    ctx.drawImage(img, bot.x, bot.y, bot.w, bot.h, bot.x, bot.y, bot.w, bot.h);
+    // Redesenha as duas regiões nítidas escalando da fonte (vídeo ou imagem)
+    ctx.drawImage(srcEl, top.x * scaleX, top.y * scaleY, top.w * scaleX, top.h * scaleY, top.x, top.y, top.w, top.h);
+    ctx.drawImage(srcEl, bot.x * scaleX, bot.y * scaleY, bot.w * scaleX, bot.h * scaleY, bot.x, bot.y, bot.w, bot.h);
 
     // Caixa Topo (Índigo)
     ctx.strokeStyle = '#6366F1';
@@ -879,11 +1265,12 @@ function renderMockupCanvas() {
   const mW = canvasState.mockupCanvas.width || 1080;
   const mH = canvasState.mockupCanvas.height || 1920;
   const cut = getActiveCut();
+  const media = getActiveMediaSource();
 
   ctx.clearRect(0, 0, mW, mH);
   if (!cut) return;
 
-  if (!canvasState.imgLoaded || !canvasState.currentImg) {
+  if (!media) {
     ctx.fillStyle = '#10141D';
     ctx.fillRect(0, 0, mW, mH);
     ctx.strokeStyle = '#232938';
@@ -898,22 +1285,26 @@ function renderMockupCanvas() {
     return;
   }
 
-  const img = canvasState.currentImg;
+  const { el: srcEl, srcW, srcH } = media;
+  const W = canvasState.imgNaturalW || 1920;
+  const H = canvasState.imgNaturalH || 1080;
+  const scaleX = srcW / W;
+  const scaleY = srcH / H;
   const mode = cut.layout_mode;
 
   if (mode === 'manual_crop') {
     const { crop_x: x, crop_y: y, crop_w: w, crop_h: h } = cut.layout_params;
     // Espelha o recorte do canvas exatamente para 1080x1920
-    ctx.drawImage(img, x, y, w, h, 0, 0, mW, mH);
+    ctx.drawImage(srcEl, x * scaleX, y * scaleY, w * scaleX, h * scaleY, 0, 0, mW, mH);
 
   } else if (mode === 'split_screen') {
     const top = cut.layout_params.box_top;
     const bot = cut.layout_params.box_bottom;
 
     // Metade Superior (0 -> 960)
-    ctx.drawImage(img, top.x, top.y, top.w, top.h, 0, 0, mW, 960);
+    ctx.drawImage(srcEl, top.x * scaleX, top.y * scaleY, top.w * scaleX, top.h * scaleY, 0, 0, mW, 960);
     // Metade Inferior (960 -> 1920)
-    ctx.drawImage(img, bot.x, bot.y, bot.w, bot.h, 0, 960, mW, 960);
+    ctx.drawImage(srcEl, bot.x * scaleX, bot.y * scaleY, bot.w * scaleX, bot.h * scaleY, 0, 960, mW, 960);
 
     // Divisória sutil entre as duas metades
     ctx.fillStyle = '#232938';
@@ -925,49 +1316,84 @@ function renderMockupCanvas() {
     // Fundo desfocado cobrindo todo o 1080x1920
     ctx.save();
     ctx.filter = 'blur(25px) brightness(0.8)';
-    const scale = Math.max(mW / img.naturalWidth, mH / img.naturalHeight);
-    const bgW = img.naturalWidth * scale;
-    const bgH = img.naturalHeight * scale;
-    ctx.drawImage(img, (mW - bgW) / 2, (mH - bgH) / 2, bgW, bgH);
+    const scale = Math.max(mW / srcW, mH / srcH);
+    const bgW = srcW * scale;
+    const bgH = srcH * scale;
+    ctx.drawImage(srcEl, (mW - bgW) / 2, (mH - bgH) / 2, bgW, bgH);
     ctx.restore();
 
     // Primeiro plano 16:9 nítido centralizado com zoom_factor
     const fgW = mW * zoom;
-    const fgH = (mW * (img.naturalHeight / img.naturalWidth)) * zoom;
+    const fgH = (mW * (srcH / srcW)) * zoom;
     const fgX = (mW - fgW) / 2;
     const fgY = (mH - fgH) / 2;
-    ctx.drawImage(img, fgX, fgY, fgW, fgH);
+    ctx.drawImage(srcEl, fgX, fgY, fgW, fgH);
 
   } else {
     // horizontal_16_9 no mockup 9:16 (letterbox limpo)
     ctx.fillStyle = '#0B0D12';
     ctx.fillRect(0, 0, mW, mH);
-    const scale = mW / img.naturalWidth;
-    const h = img.naturalHeight * scale;
-    ctx.drawImage(img, 0, (mH - h) / 2, mW, h);
+    const scale = mW / srcW;
+    const h = srcH * scale;
+    ctx.drawImage(srcEl, 0, (mH - h) / 2, mW, h);
   }
 
-  // Simulação de Legendas caso ativadas
+  // Legendas sincronizadas ao vivo caso ativadas
   if (cut.burn_subtitles) {
-    drawMockupSubtitles(ctx, mW, mH);
+    drawMockupSubtitles(ctx, mW, mH, cut);
   }
 }
 
-function drawMockupSubtitles(ctx, mW, mH) {
+function drawMockupSubtitles(ctx, mW, mH, cut) {
+  let activeText = 'EXEMPLO DE LEGENDA DINÂMICA';
+  const segs = getCutSegments(cut);
+
+  if (segs.length > 0) {
+    if (canvasState.isVideoReady && canvasState.videoEl) {
+      const absSec = cut.start_time + (canvasState.videoEl.currentTime || 0);
+      const found = segs.find((s) => absSec >= s.start && absSec <= s.end);
+      activeText = found ? found.text : '';
+    } else {
+      activeText = segs[0].text;
+    }
+  }
+
+  if (!activeText) return;
+
   ctx.save();
-  ctx.font = 'bold 36px Inter, Arial, sans-serif';
+  ctx.font = 'bold 38px Inter, Arial, sans-serif';
   ctx.textAlign = 'center';
-  const text = 'EXEMPLO DE LEGENDA DINÂMICA';
-  const y = mH - 180;
-
-  // Sombra / Contorno preto espesso
   ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 8;
-  ctx.strokeText(text, mW / 2, y);
-
-  // Texto branco brilhante
+  ctx.lineWidth = 9;
   ctx.fillStyle = '#FFFFFF';
-  ctx.fillText(text, mW / 2, y);
+
+  // Quebra automática em até 2 linhas para caber perfeitamente na largura 1080px do Mockup
+  const words = activeText.toUpperCase().split(/\s+/);
+  const lines = [];
+  let currentLine = '';
+  const maxWidth = mW - 120;
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    if (ctx.measureText(testLine).width > maxWidth && currentLine) {
+      lines.push(currentLine);
+      currentLine = word;
+    } else {
+      currentLine = testLine;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+
+  const visibleLines = lines.slice(0, 3);
+  const baseY = mH - 220;
+  const lineHeight = 48;
+
+  visibleLines.forEach((line, i) => {
+    const y = baseY + i * lineHeight;
+    ctx.strokeText(line, mW / 2, y);
+    ctx.fillText(line, mW / 2, y);
+  });
+
   ctx.restore();
 }
 
@@ -986,7 +1412,7 @@ function getCanvasMouseCoords(e) {
 }
 
 function onCanvasMouseDown(e) {
-  if (!canvasState.imgLoaded) return;
+  if (!canvasState.imgLoaded && !canvasState.isVideoReady) return;
   const cut = getActiveCut();
   if (!cut) return;
 
@@ -1210,6 +1636,9 @@ function isPointInsideBox(px, py, box) {
 // =========================================================
 async function startRender() {
   if (state.isRendering) return;
+  if (canvasState.videoEl && !canvasState.videoEl.paused) {
+    canvasState.videoEl.pause();
+  }
   const selecionados = state.cuts.filter(c => c.selected);
   if (selecionados.length === 0) {
     alert('Selecione pelo menos um corte para renderizar.');

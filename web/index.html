@@ -204,9 +204,25 @@
               </button>
             </div>
           </div>
+
+          <!-- BARRA DE REPRODUÇÃO DO CLIPE AO VIVO NO CANVAS (VÍDEO + ÁUDIO) -->
+          <div class="clip-player-bar">
+            <button id="btn-play-clip" class="btn-play-clip" onclick="togglePlayClipPreview()" title="Reproduzir o vídeo e áudio deste corte diretamente no editor e no mockup 9:16">
+              <span id="btn-play-clip-icon">▶️</span>
+              <span id="btn-play-clip-label">Assistir Corte</span>
+            </button>
+
+            <input type="range" id="clip-seek-slider" class="clip-seek-slider" min="0" max="100" step="0.1" value="0" disabled oninput="onClipSeekInput(this.value)">
+
+            <span id="clip-time-display" class="clip-time-display">0:00 / 0:00</span>
+
+            <button id="btn-mute-clip" class="btn-icon-sm" onclick="toggleMuteClipPreview()" title="Ativar/Desativar som da prévia">
+              🔊
+            </button>
+          </div>
         </section>
 
-        <!-- COLUNA DIREITA: PRÉVIA FINAL AO VIVO (MOCKUP 9:16) -->
+        <!-- COLUNA DIREITA: PRÉVIA FINAL AO VIVO (MOCKUP 9:16) + CONTEXTO DO CORTE -->
         <aside class="preview-sidebar">
           <div class="preview-sidebar-title">Prévia Final ao Vivo</div>
 
@@ -216,6 +232,13 @@
           </div>
 
           <div class="preview-format-tag">1080 × 1920 • 60fps Realtime</div>
+
+          <!-- CONTEXTO E FALA DO CORTE PARA MELHOR COMPREENSÃO -->
+          <div class="cut-context-card">
+            <div class="cut-context-header">💡 Contexto & Falas do Corte</div>
+            <div id="cut-justification-box" class="cut-justification-box"></div>
+            <div id="cut-transcript-box" class="cut-transcript-box"></div>
+          </div>
         </aside>
 
       </div>

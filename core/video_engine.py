@@ -528,28 +528,40 @@ def extract_preview_frame(
                 return None
             input_target = str(local_p.resolve())
 
-        # Fast input seeking: -ss DEVE vir ANTES de -i para streams HLS remotos
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-y",
-            "-ss", str(max(0.0, float(timestamp_sec))),
-            "-i", input_target,
-            "-vframes", "1",
-            "-q:v", "2",
-            str(dest)
-        ]
+        ua_header = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
 
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if proc.returncode != 0:
-                logger.warning("Falha no FFmpeg ao extrair frame (code %s): %s", proc.returncode, proc.stderr[:300] if proc.stderr else "")
-                return None
-        except subprocess.TimeoutExpired:
-            logger.warning("Timeout (15s) excedido ao extrair frame via FFmpeg no tempo %ss", timestamp_sec)
-            return None
+        def _run_ffmpeg_extract(target: str) -> bool:
+            cmd = ["ffmpeg", "-nostdin", "-y"]
+            if target.startswith("http://") or target.startswith("https://"):
+                cmd.extend(["-headers", ua_header])
+            cmd.extend([
+                "-ss", str(max(0.0, float(timestamp_sec))),
+                "-i", target,
+                "-vframes", "1",
+                "-q:v", "2",
+                str(dest)
+            ])
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                return proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+            except Exception as exc_cmd:
+                logger.debug("Erro na execução do FFmpeg para frame: %s", exc_cmd)
+                return False
 
-        if not dest.exists() or dest.stat().st_size == 0:
+        success = _run_ffmpeg_extract(input_target)
+
+        # Se falhou e estávamos usando direct_stream_url em cache, tenta resolver uma URL fresca via get_direct_stream_url
+        if not success and is_remote:
+            try:
+                from core.downloader import get_direct_stream_url
+                fresh_url = get_direct_stream_url(src_str)
+                if fresh_url and fresh_url != input_target:
+                    logger.info("Tentando extração de frame com stream URL atualizado...")
+                    success = _run_ffmpeg_extract(fresh_url)
+            except Exception as exc_fresh:
+                logger.warning("Falha ao resolver stream URL atualizado: %s", exc_fresh)
+
+        if not success or not dest.exists() or dest.stat().st_size == 0:
             logger.warning("Arquivo de frame não foi gerado ou está vazio: %s", dest)
             return None
 
@@ -558,6 +570,133 @@ def extract_preview_frame(
 
     except Exception as e:
         logger.warning("Erro inesperado na extração de frame de preview: %s", e)
+        return None
+
+
+def extract_preview_clip(
+    source: str,
+    start_time: float,
+    end_time: float,
+    output_path: Optional[str] = None,
+    direct_stream_url: Optional[str] = None,
+    local_audio_path: Optional[str] = None,
+    max_duration: float = 120.0
+) -> Optional[str]:
+    """
+    Extrai um clipe de vídeo leve (.mp4 720p ultrafast com áudio) do intervalo [start_time, end_time]
+    para reprodução ao vivo dentro do Canvas 60fps do Estúdio antes da renderização final.
+    Combina o stream de vídeo remoto com o áudio local já baixado na etapa 1 para máxima velocidade e som garantido.
+    """
+    try:
+        check_ffmpeg()
+    except Exception as exc:
+        logger.warning("FFmpeg não disponível para extração de clipe de prévia: %s", exc)
+        return None
+
+    try:
+        src_str = str(source).strip()
+        s_time = max(0.0, float(start_time))
+        e_time = max(s_time + 1.0, float(end_time))
+        duration = min(max_duration, e_time - s_time)
+
+        if output_path:
+            dest = Path(output_path)
+        else:
+            clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(src_str).stem)[:25]
+            dest = TEMP_DIR / f"preview_clip_{clean_id}_{int(s_time * 10)}_{int(e_time * 10)}.mp4"
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        # Retorna do cache em disco imediatamente se já foi gerado para este intervalo
+        if dest.exists() and dest.stat().st_size > 2048:
+            logger.info("Clipe de prévia reutilizado do cache: %s", dest.name)
+            return str(dest.resolve())
+
+        is_remote = src_str.startswith("http://") or src_str.startswith("https://")
+        input_target = src_str
+
+        if direct_stream_url:
+            input_target = direct_stream_url
+        elif is_remote:
+            try:
+                from core.downloader import get_direct_stream_url
+                input_target = get_direct_stream_url(src_str, max_resolution=720)
+            except Exception as exc:
+                logger.warning("Falha ao obter stream URL para clipe de prévia: %s", exc)
+                input_target = src_str
+        else:
+            local_p = Path(src_str)
+            if not local_p.exists():
+                return None
+            input_target = str(local_p.resolve())
+
+        has_local_audio = bool(local_audio_path and Path(local_audio_path).exists())
+        ua_header = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
+
+        def _run_ffmpeg_clip(target: str) -> bool:
+            cmd = ["ffmpeg", "-nostdin", "-y"]
+            if target.startswith("http://") or target.startswith("https://"):
+                cmd.extend(["-headers", ua_header])
+            cmd.extend([
+                "-ss", str(round(s_time, 2)),
+                "-t", str(round(duration, 2)),
+                "-i", target,
+            ])
+
+            if has_local_audio:
+                cmd.extend([
+                    "-ss", str(round(s_time, 2)),
+                    "-t", str(round(duration, 2)),
+                    "-i", str(Path(local_audio_path).resolve()),
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                ])
+            else:
+                cmd.extend([
+                    "-map", "0:v:0",
+                    "-map", "0:a:0?",
+                ])
+
+            cmd.extend([
+                "-vf", "scale=-2:720",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "27",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-movflags", "+faststart",
+                str(dest)
+            ])
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                return proc.returncode == 0 and dest.exists() and dest.stat().st_size > 2048
+            except Exception as exc_cmd:
+                logger.debug("Erro na execução do FFmpeg para clipe de prévia: %s", exc_cmd)
+                return False
+
+        success = _run_ffmpeg_clip(input_target)
+
+        if not success and is_remote:
+            try:
+                from core.downloader import get_direct_stream_url
+                fresh_url = get_direct_stream_url(src_str, max_resolution=720)
+                if fresh_url and fresh_url != input_target:
+                    logger.info("Retentando extração de clipe de prévia com stream URL atualizado...")
+                    success = _run_ffmpeg_clip(fresh_url)
+            except Exception as exc_fresh:
+                logger.warning("Falha ao atualizar stream URL para clipe de prévia: %s", exc_fresh)
+
+        if not success or not dest.exists() or dest.stat().st_size <= 2048:
+            logger.warning("Não foi possível gerar o clipe de prévia em: %s", dest)
+            return None
+
+        logger.info("Clipe de prévia gerado com sucesso: %s", dest.name)
+        return str(dest.resolve())
+
+    except Exception as exc:
+        logger.warning("Erro inesperado ao gerar clipe de prévia: %s", exc)
         return None
 
 

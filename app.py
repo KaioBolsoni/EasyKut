@@ -154,7 +154,7 @@ with st.sidebar:
     ai_provider = st.selectbox(
         "Modelo de IA para Curadoria:",
         options=["gemini", "groq"],
-        format_func=lambda x: "Google Gemini (gemini-2.5-flash)" if x == "gemini" else "Groq LLM (gpt-oss-120b)",
+        format_func=lambda x: "Google Gemini (gemini-3.8-flash)" if x == "gemini" else "Groq LLM (gpt-oss-120b)",
         help="Provedor de inteligência artificial que analisará a retenção e identificará os momentos virais."
     )
 
