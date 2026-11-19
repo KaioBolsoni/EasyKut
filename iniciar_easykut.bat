@@ -1,5 +1,5 @@
 @echo off
-title EasyKut
+title EasyKut Studio
 cd /d "%~dp0"
 
 echo [1/3] Liberando porta 8502...
@@ -8,8 +8,9 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8502 -State List
 echo [2/3] Verificando ambiente virtual...
 if not exist "venv\Scripts\python.exe" goto sem_venv
 
-echo [3/3] Abrindo EasyKut no navegador...
-"venv\Scripts\python.exe" -m streamlit run app.py --server.port 8502
+echo [3/3] Abrindo EasyKut Studio no navegador...
+start http://127.0.0.1:8502
+"venv\Scripts\python.exe" -m uvicorn server:app --host 127.0.0.1 --port 8502
 pause
 exit /b 0
 

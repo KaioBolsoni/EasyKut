@@ -103,13 +103,19 @@ def get_direct_stream_url(url: str, max_resolution: int = 1080) -> str:
 def extract_preview_frame(
     source: str,
     timestamp_sec: float = 1.0,
-    output_path: Optional[str] = None
-) -> str:
+    output_path: Optional[str] = None,
+    direct_stream_url: Optional[str] = None
+) -> Optional[str]:
     """
     Fachada para extração de 1 único frame (.jpg) a partir de arquivo local ou URL do YouTube.
     """
     from core.video_engine import extract_preview_frame as _extract
-    return _extract(source=source, timestamp_sec=timestamp_sec, output_path=output_path)
+    return _extract(
+        source=source,
+        timestamp_sec=timestamp_sec,
+        output_path=output_path,
+        direct_stream_url=direct_stream_url
+    )
 
 
 def download_audio(

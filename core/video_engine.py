@@ -59,7 +59,7 @@ def get_video_metadata(video_path: str) -> Dict[str, Any]:
         str(path)
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
     probe_data = json.loads(result.stdout)
 
     video_stream = next(
@@ -478,61 +478,85 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
 def extract_preview_frame(
     source: str,
     timestamp_sec: float = 1.0,
-    output_path: Optional[str] = None
-) -> str:
+    output_path: Optional[str] = None,
+    direct_stream_url: Optional[str] = None
+) -> Optional[str]:
     """
-    Extrai 1 único frame (.jpg) no tempo informado usando FFmpeg.
-    Se source for uma URL do YouTube/web, obtém a URL direta do stream via yt-dlp
-    (extract_info download=False) para capturar o frame em segundos sem precisar
-    baixar o vídeo inteiro antes da aprovação.
-    Se source for um arquivo local existente, extrai o frame localmente com fast seek.
-    Retorna o caminho absoluto do arquivo .jpg gerado.
+    Extrai 1 único frame (.jpg) no tempo informado usando FFmpeg com fast input seek.
+    Se direct_stream_url for fornecido, reaproveita a URL direta de streaming já resolvida.
+    Se source for uma URL web/YouTube e direct_stream_url não for passado, obtém a URL direta via yt-dlp.
+    Usa -ss <timestamp> estritamente ANTES de -i <source> com -nostdin -y e timeout=15s.
+    Em caso de falha ou timeout, registra warning e retorna None (resiliência).
     """
-    check_ffmpeg()
-    src_str = str(source).strip()
+    try:
+        check_ffmpeg()
+    except Exception as exc:
+        logger.warning("FFmpeg não disponível para extração de frame: %s", exc)
+        return None
 
-    if output_path:
-        dest = Path(output_path)
-    else:
-        clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(src_str).stem)[:25]
-        dest = TEMP_DIR / f"frame_{clean_id}_{int(timestamp_sec * 1000)}.jpg"
+    try:
+        src_str = str(source).strip()
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
+        if output_path:
+            dest = Path(output_path)
+        else:
+            clean_id = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(src_str).stem)[:25]
+            dest = TEMP_DIR / f"frame_{clean_id}_{int(timestamp_sec * 1000)}.jpg"
 
-    is_remote = src_str.startswith("http://") or src_str.startswith("https://")
-    input_target = src_str
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
-    if is_remote:
+        is_remote = src_str.startswith("http://") or src_str.startswith("https://")
+        input_target = src_str
+
+        if direct_stream_url:
+            input_target = direct_stream_url
+            logger.debug("Usando stream URL pré-resolvido para extração de frame: %s...", input_target[:60])
+        elif is_remote:
+            try:
+                from core.downloader import get_direct_stream_url
+                input_target = get_direct_stream_url(src_str)
+                logger.info("Stream URL direto obtido para extração de frame: %s...", input_target[:60])
+            except Exception as exc:
+                logger.warning("Falha ao obter stream URL direto com yt-dlp: %s. Tentando URL original.", exc)
+                input_target = src_str
+        else:
+            local_p = Path(src_str)
+            if not local_p.exists():
+                logger.warning("Arquivo fonte não encontrado para extração de frame: %s", src_str)
+                return None
+            input_target = str(local_p.resolve())
+
+        # Fast input seeking: -ss DEVE vir ANTES de -i para streams HLS remotos
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-ss", str(max(0.0, float(timestamp_sec))),
+            "-i", input_target,
+            "-vframes", "1",
+            "-q:v", "2",
+            str(dest)
+        ]
+
         try:
-            from core.downloader import get_direct_stream_url
-            input_target = get_direct_stream_url(src_str)
-            logger.info("Stream URL direto obtido para extração de frame: %s...", input_target[:60])
-        except Exception as exc:
-            logger.warning("Falha ao obter stream URL direto com yt-dlp: %s. Tentando URL original.", exc)
-            input_target = src_str
-    else:
-        local_p = Path(src_str)
-        if not local_p.exists():
-            raise FileNotFoundError(f"Arquivo fonte não encontrado: {src_str}")
-        input_target = str(local_p.resolve())
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if proc.returncode != 0:
+                logger.warning("Falha no FFmpeg ao extrair frame (code %s): %s", proc.returncode, proc.stderr[:300] if proc.stderr else "")
+                return None
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout (15s) excedido ao extrair frame via FFmpeg no tempo %ss", timestamp_sec)
+            return None
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss", str(max(0.0, timestamp_sec)),
-        "-i", input_target,
-        "-vframes", "1",
-        "-q:v", "2",
-        str(dest)
-    ]
+        if not dest.exists() or dest.stat().st_size == 0:
+            logger.warning("Arquivo de frame não foi gerado ou está vazio: %s", dest)
+            return None
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        logger.error("Falha ao extrair frame no FFmpeg: %s", proc.stderr[:300])
-        raise RuntimeError(f"Erro ao extrair frame de preview: {proc.stderr[:200]}")
+        logger.info("Frame de preview extraído com sucesso: %s", dest)
+        return str(dest.resolve())
 
-    logger.info("Frame de preview extraído com sucesso: %s", dest)
-    return str(dest.resolve())
+    except Exception as e:
+        logger.warning("Erro inesperado na extração de frame de preview: %s", e)
+        return None
 
 
 def draw_framing_preview(
@@ -776,6 +800,7 @@ def cut_video(
 
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-y",
         "-ss", str(round(start_time, 2)),
         "-i", str(src),
@@ -794,7 +819,7 @@ def cut_video(
                 str(dest)
             ])
             logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if proc.returncode != 0:
                 logger.error("Falha no FFmpeg stream copy: %s", proc.stderr)
                 raise RuntimeError(f"Erro ao processar corte horizontal: {proc.stderr[:350]}")
@@ -981,7 +1006,7 @@ def cut_video(
     logger.info("Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
                 start_time, end_time, effective_mode, bool(srt_file_path), dest.name)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         logger.error("Falha no FFmpeg: %s", proc.stderr)
         raise RuntimeError(f"Erro ao processar corte de vídeo: {proc.stderr[:350]}")

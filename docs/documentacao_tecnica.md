@@ -1,6 +1,6 @@
-# Documentação Técnica — EasyKut (v2.0)
+# Documentação Técnica — EasyKut Studio (v3.0)
 
-Este documento descreve de forma exata a arquitetura, os módulos, o fluxo de dados ponta a ponta, o esquema do banco de dados SQLite, os mecanismos de resiliência e as regras de ambiente atualmente implementados na versão **2.0** do **EasyKut**.
+Este documento descreve de forma exata a arquitetura, os módulos, os endpoints REST do servidor FastAPI, a interface SPA local (`web/`), o fluxo de dados ponta a ponta, o esquema do banco de dados SQLite, os mecanismos de resiliência e as regras de ambiente implementados na versão **3.0** do **EasyKut Studio**.
 
 ---
 
@@ -11,21 +11,26 @@ cortador_automatico/
 ├── .env                          # Variáveis de ambiente locais (GROQ_API_KEY, GEMINI_API_KEY)
 ├── .env.example                  # Template de variáveis de ambiente
 ├── .gitignore                    # Exclusões do controle de versão (venv/, .env, data/, *.db, etc.)
-├── app.py                        # Aplicação Web Streamlit (UI, estado da esteira e histórico)
-├── iniciar_easykut.bat           # Launcher Windows 1-click (libera porta 8502 e usa Python da venv)
-├── requirements.txt              # Dependências Python do projeto
-├── README.md                     # Guia rápido de instalação e uso
+├── server.py                     # Servidor Web Local FastAPI (Rotas REST, background jobs e arquivos estáticos)
+├── app.py                        # Interface legado Streamlit (mantida para compatibilidade retroativa)
+├── iniciar_easykut.bat           # Launcher Windows 1-click (libera porta 8502, sobe Uvicorn e abre navegador)
+├── requirements.txt              # Dependências Python (FastAPI, Uvicorn, yt-dlp, FFmpeg, OpenCV, etc.)
+├── README.md                     # Guia rápido de instalação e uso do EasyKut Studio
 ├── test_db.py                    # Teste de integração da camada SQLite
 ├── test_fase2.py                 # Teste CLI da esteira de transcrição e análise IA
 ├── test_fase3.py                 # Teste CLI de geração SRT, Face Tracking e renderização FFmpeg
+├── web/
+│   ├── index.html                # Estrutura semântica SPA (Topbar, Hero, Master-Detail Workspace, Library e Modal)
+│   ├── styles.css                # Identidade visual Dark Studio (#0B0D12, #141821, #6366F1), tipografia Inter e Phone Mockup
+│   └── app.js                    # Motor gráfico HTML5 Canvas (60fps), arraste/redimensionamento proporcional e cliente REST API
 ├── .streamlit/
 │   └── config.toml               # Configuração local do servidor Streamlit
 ├── core/
 │   ├── __init__.py               # Fachada pública exportando funções e constantes do pacote core
 │   ├── config.py                 # Gerenciamento de caminhos, auto-descoberta do FFmpeg e validação de chaves
-│   ├── downloader.py             # Integração com yt-dlp para metadados, áudio MP3 (64k) e vídeo MP4
+│   ├── downloader.py             # Integração com yt-dlp para metadados, streaming direto, áudio MP3 e vídeo MP4
 │   ├── ai_apis.py                # Integração com Groq Whisper, Google Gemini e Groq LLMs com fallback e retry
-│   └── video_engine.py           # Motor de vídeo: Face Tracking OpenCV 4/5, gerador SRT, filtros FFmpeg e limpeza
+│   └── video_engine.py           # Motor de vídeo: 4 modos de layout, preview visual, gerador SRT e limpeza
 ├── database/
 │   ├── __init__.py               # Fachada pública exportando funções CRUD do banco
 │   └── db_manager.py             # Gerenciador SQLite3 com modo WAL e integridade referencial (CASCADE)
@@ -34,9 +39,9 @@ cortador_automatico/
 │   ├── downloads/                # Arquivos brutos baixados ({id}_audio.mp3 e {id}_video.mp4)
 │   ├── cortes/                   # Clipes finais renderizados ({stem}_cut_{start}_{end}.mp4)
 │   ├── models/                   # Pesos de detecção facial (face_detection_yunet_2023mar.onnx)
-│   └── temp/                     # Legendas temporárias (sub_{start}_{end}.srt) e artefatos de teste
+│   └── temp/                     # Frames de prévia (.jpg), legendas (.srt) e cache de transcrição
 ├── docs/
-│   ├── arquitetura.md            # Visão geral arquitetural e histórico das 5 fases
+│   ├── arquitetura.md            # Visão geral arquitetural e histórico das fases
 │   └── documentacao_tecnica.md   # Este documento técnico detalhado
 └── prompts/
     └── diretor_cortes.txt        # System prompt de engenharia de retenção e formato JSON estrito
@@ -46,14 +51,18 @@ cortador_automatico/
 
 | Módulo / Arquivo | Responsabilidade Técnica |
 | :--- | :--- |
-| `app.py` | Ponto de entrada da interface gráfica em Streamlit. Implementa a arquitetura **V2.0** com fluxo em 2 passos e **Passo 1.5 — Estúdio de Enquadramento em Tempo Real**: Passo 1 (download apenas de áudio, transcrição Whisper, análise IA ordenada por `virality_score` decrescente de 0 a 100, e extração automática de frames reais de prévia via `extract_preview_frame`), Passo 1.5 (Estúdio interativo por corte com seletor de 4 modos de layout, sliders ao vivo de enquadramento com prévia visual renderizada por `draw_framing_preview`, ajuste de tempo/títulos e botão de atualização de frame), Passo 2 (download do vídeo HD e renderização FFmpeg com `layout_mode` e `layout_params` dedicados), Galeria Persistente pós-rerun (em `st.session_state`) e Aba de Histórico com busca, filtro de score (0–100), exclusão física opcional (`delete_files=True`), abertura rápida de pasta (`os.startfile`) e downloads otimizados via streaming para economia de RAM. |
+| `server.py` | Servidor Web Local construído em **FastAPI**. Substitui o Streamlit como núcleo do frontend, fornecendo endpoints REST assíncronos (`/api/config`, `/api/analyze`, `/api/jobs/{id}`, `/api/frame`, `/api/frame/preview`, `/api/render`, `/api/history`, `/api/open-folder`), gerenciamento de background jobs em threads independentes para evitar timeouts, e montagem estática de `/web` (SPA) e `/data` (mídias). |
+| `web/index.html` | Estrutura semântica da SPA moderna sem build/Node.js: Topbar fixa, aba Estúdio com Hero Input centralizado, Workspace Master-Detail (lista compacta de cortes, palco central com editor HTML5 Canvas e coluna de prévia final com mockup de smartphone) e aba Biblioteca. |
+| `web/styles.css` | Folha de estilos Dark Studio Profissional: paleta grafite (`#0B0D12`, `#141821`, `#232938`), acentos em Índigo (`#6366F1`) e Âmbar (`#F59E0B`), tipografia Inter, scrollbars customizadas e mockup de smartphone 9:16 com notch superior. |
+| `web/app.js` | Motor de aplicação e renderização gráfica em **HTML5 Canvas a 60fps**: controle de arraste e redimensionamento proporcional travado no mouse para Recorte Manual (9:16) e Split-Screen (1080x960 cada), espelhamento ao vivo no mockup do celular, integração REST e gestão de jobs. |
+| `app.py` | Interface legada em Streamlit mantida para compatibilidade com fluxos legados da V2.0. |
 | `core/config.py` | Injeta automaticamente diretórios conhecidos do FFmpeg (`C:\ffmpeg\bin`, `C:\Ghost Toolbox\wget\Youtube-DLP`, `C:\ProgramData\chocolatey\bin`) na variável `os.environ["PATH"]`. Define e cria as pastas `DATA_DIR`, `DOWNLOADS_DIR`, `CUTS_DIR` e `PROMPTS_DIR`. Carrega o arquivo `.env` de forma determinística e disponibiliza `validate_config(provider)` com validação flexível (exigindo `GROQ_API_KEY` + `FFMPEG` como base, e `GEMINI_API_KEY` apenas se Gemini for selecionado). |
 | `core/downloader.py` | Valida URLs com regex (`is_valid_video_url`), sanitiza nomes de arquivos (`sanitize_filename`), consulta metadados sem baixar mídia (`extract_video_info`), obtém URLs diretas de stream HTTP sem download prévio via yt-dlp (`get_direct_stream_url`), extrai frames rápidos remotos/locais (`extract_preview_frame`), baixa áudio comprimido em MP3 48kbps via pós-processador `FFmpegExtractAudio` (`download_audio`) e baixa o vídeo em MP4 limitado à resolução escolhida (`download_video`). |
 | `core/ai_apis.py` | Gerencia clientes autenticados da Groq (`get_groq_client`) e Google GenAI (`get_gemini_client`). Executa a transcrição com timestamps via `transcribe_audio_groq` (`whisper-large-v3-turbo`), formata a transcrição em linhas `[MM:SS - MM:SS (start -> end)] texto` (`format_transcript_with_timestamps`), realiza a curadoria viral via Gemini (`analyze_viral_cuts_gemini`) ou Groq (`analyze_viral_cuts_groq`) sob orientação de `prompts/diretor_cortes.txt`, orquestra o chaveamento automático entre provedores (`detect_viral_moments`) e sanitiza o JSON retornado (`_clean_and_parse_json`), normalizando scores (0–100) e tipo (`short` / `longo`). |
 | `core/video_engine.py` | Valida binários (`check_ffmpeg`), extrai metadados técnicos via `ffprobe` (`get_video_metadata`), converte segundos em timestamp SRT (`format_srt_time`), gera legendas `.srt` ajustadas para `00:00:00,000` (`generate_srt_for_segment`) com escape estrito de caracteres especiais (`:, ', [, ], ,`), extrai frames únicos com fast seek (`extract_preview_frame`), gera prévias visuais de enquadramento com OpenCV/Pillow (`draw_framing_preview`), executa rastreamento facial compatível com OpenCV 4 e 5 (`_FaceDetectorWrapper` e `detect_smooth_face_crop_x`), gerencia os 4 modos de layout e renderização FFmpeg (`cut_video`), gera thumbnails JPEG (`extract_frame_thumbnail`) e remove arquivos temporários (`cleanup_temporary_files`). |
 | `database/db_manager.py` | Gerencia conexões SQLite (`get_connection`) com `timeout=15.0`, `check_same_thread=False`, `PRAGMA foreign_keys = ON` e `PRAGMA journal_mode = WAL`. Cria as tabelas `videos` e `cortes` (`init_db`) e implementa todas as operações CRUD (`add_video`, `get_video`, `update_video_status`, `list_videos`, `delete_video` com exclusão opcional de arquivos físicos via `delete_files=False`, `add_corte`, `list_cortes`, `update_corte_status`, `save_analysis`). |
 | `prompts/diretor_cortes.txt` | Define as regras de curadoria viral: gancho magnético nos primeiros 3–5 segundos, contexto autossuficiente, eliminação de vácuos, pontuação estrita de `virality_score` de 0 a 100, classificação de `tipo` ("short" até 3 min ou "longo" 7+ min) e saída em JSON puro compatível com `core/ai_apis.py`. |
-| `iniciar_easykut.bat` | Script Batch Windows que posiciona o diretório de trabalho em `%~dp0`, encerra processos existentes na porta `8502` via PowerShell (`Get-NetTCPConnection` + `Stop-Process`), valida a existência de `venv\Scripts\python.exe` e executa o Streamlit isolado na porta `8502`. |
+| `iniciar_easykut.bat` | Script Batch Windows que posiciona o diretório de trabalho em `%~dp0`, encerra processos existentes na porta `8502` via PowerShell (`Get-NetTCPConnection` + `Stop-Process`), valida `venv\Scripts\python.exe`, abre o navegador padrão em `http://127.0.0.1:8502` e inicia o servidor Uvicorn FastAPI. |
 
 ---
 
@@ -106,16 +115,16 @@ flowchart TD
    - Todos os dados são consolidados em `st.session_state["analise_atual"]` e registrados no banco SQLite.
    - O feedback em tempo real é fornecido via `st.status(..., expanded=True)`.
 
-2. **Passo 1.5 — Estúdio de Enquadramento & Revisão Interativa:**
-   - Cada corte sugerido é renderizado em um card expansível (`st.expander`), exibindo badge de score, tipo, duração e campos editáveis de título e tempos (`start_time` e `end_time`).
-   - Se o usuário alterar os segundos de início/fim, o botão **"🔄 Atualizar Frame"** re-extrai o frame exato no novo ponto temporal.
-   - O usuário seleciona o formato de saída desejado:
-     - **Vertical Sem Zoom (Blur 9:16):** Permite aproximar levemente o vídeo centralizado via slider de aproximação suave (1.0x a 1.3x) enquanto o fundo desfocado preenche o canvas 1080x1920.
-     - **Seleção Manual (Caixa 9:16):** Sliders de Posição Horizontal (X %), Posição Vertical (Y %) e Tamanho (%) posicionam milimetricamente o recorte vertical 9:16 sobre o frame real com máscara atenuada ao redor.
-     - **Split-Screen (2 Caixas — 1080x1920):** Controles independentes para Caixa Topo (Falante 1) e Caixa Base (Falante 2) com proporção 1.125 cada (1080x960), exibidas em Ciano e Laranja/Amarelo.
-     - **Horizontal Natural (16:9):** Preserva 100% da resolução widescreen original sem cortes laterais (padrão para conteúdos longos).
-     - **Face Tracking Inteligente (9:16):** Preset opcional que executa a detecção facial dinâmica via OpenCV no momento do corte.
-   - A função `draw_framing_preview()` renderiza a prévia visual em tempo real lado a lado com os controles.
+2. **Passo 1.5 — Estúdio de Enquadramento em Tempo Real (HTML5 Canvas 60fps):**
+   - **Workspace Master-Detail:**
+     - **Coluna Esquerda (280px):** Lista compacta de cortes sugeridos com cards táteis contendo checkbox de seleção, badge de score de viralidade (`0–100`), título e duração formatada. Ao clicar em qualquer corte, ele se torna o corte ativo em edição no palco central.
+     - **Palco Central (Canvas Interativo):** Canvas HTML5 de alto desempenho desenhando o frame real do vídeo com suporte completo a arraste e redimensionamento proporcional travado no mouse:
+       - **16:9 Original:** Preserva o widescreen nativo original sem corte nem distorção.
+       - **9:16 Sem Zoom (Blur):** Centraliza o vídeo original com proporção intacta sobre canvas 1080x1920 com fundo desfocado + escurecido e slider suave de aproximação (zoom 1.0x a 1.3x).
+       - **Recorte Manual:** Desenha 1 caixa arrastável e redimensionável diretamente com o cursor do mouse sobre o frame real, travada rigorosamente na proporção 9:16 com 4 alças de canto (`NW, NE, SW, SE`).
+       - **Split-Screen:** Desenha 2 caixas independentes arrastáveis e redimensionáveis: Caixa Topo (Índigo `#6366F1`, falante 1) e Caixa Base (Âmbar `#F59E0B`, falante 2), cada uma travada na proporção 9:8 (1080x960).
+     - **Coluna Direita (Mockup de Smartphone 9:16 ao Vivo):** Segundo canvas (`#mockup-canvas`) embutido em um mockup de celular com notch que espelha em tempo real a 60fps exatamente como o vídeo final ficará enquanto o usuário arrasta as caixas com o mouse.
+   - Os controles do topo permitem editar o título, ajustar milimetricamente os segundos de início/fim, ligar/desligar legendas queimadas e clicar em **"🔄 Atualizar Frame"** para recarregar o frame instantaneamente no novo instante.
 
 3. **Passo 2 — Renderização Sob Demanda via FFmpeg:**
    - Ao acionar **"🎬 Renderizar Cortes Selecionados"**, o sistema baixa o vídeo fonte em alta definição (`download_video`, 720p ou 1080p) apenas se ainda não existir localmente.
@@ -275,16 +284,33 @@ CREATE TABLE IF NOT EXISTS cortes (
 7. **Aceleração da Amostragem Facial no OpenCV (`core/video_engine.py`):**
    - Substituição de buscas demuxadas repetitivas (`cap.set`) por leitura sequencial otimizada com `cap.grab()` nos frames intermediários, acelerando a fase de rastreamento facial em até 4x sem travar o processamento.
 
-8. **Persistência de Sessão da Galeria no Streamlit (`app.py`):**
-   - Os cortes renderizados e metadados são salvos em `st.session_state`, garantindo que downloads sucessivos ou interações na interface não façam a galeria desaparecer da tela.
+8. **Arquitetura de Background Jobs Não-Bloqueante (`server.py`):**
+   - As operações intensivas (`/api/analyze` e `/api/render`) executam em threads desacopladas com identificador único (`job_id`).
+   - O frontend consulta o progresso assincronamente a cada 1 segundo em `/api/jobs/{job_id}`, eliminando completamente problemas de timeout HTTP em conexões lentas ou vídeos de longa duração.
 
 ---
 
-## 5. Regras de Ambiente e Git
+## 5. Especificação dos Endpoints REST (`server.py`)
+
+| Método | Endpoint | Descrição Técnica |
+| :--- | :--- | :--- |
+| `GET` | `/api/config` | Retorna o status de conexão das chaves (`GROQ_API_KEY`, `GEMINI_API_KEY`, `FFMPEG_AVAILABLE`) e o provedor padrão sugerido. |
+| `POST` | `/api/analyze` | Recebe `{ "url", "provider", "max_cuts" }`, inicia o job de análise em background e retorna `{ "job_id", "message" }`. |
+| `GET` | `/api/jobs/{job_id}` | Consulta o progresso em tempo real do job (`status`, `step`, `progress`, `result`, `error`). |
+| `POST` | `/api/frame` | Recebe `{ "source", "timestamp_sec" }`, extrai 1 frame JPEG no instante informado e retorna seu caminho e URL estática. |
+| `POST` | `/api/frame/preview` | Recebe `{ "frame_path", "mode", "params" }`, aplica o recorte/canvas e retorna a prévia desenhada em tempo real. |
+| `POST` | `/api/render` | Recebe `{ "video_id", "cuts": [...] }`, dispara a renderização FFmpeg em background e retorna `{ "job_id", "message" }`. |
+| `GET` | `/api/history` | Lista vídeos e cortes salvos no SQLite com suporte a filtros de busca textual (`?search=...`) e nota mínima (`?min_score=...`). |
+| `DELETE` | `/api/history/{video_id}` | Exclui o registro no SQLite e opcionalmente remove os arquivos físicos do disco (`?delete_files=true`). |
+| `POST` | `/api/open-folder` | Invoca `os.startfile(CUTS_DIR)` no Windows abrindo a pasta de cortes diretamente no Explorador de Arquivos. |
+
+---
+
+## 6. Regras de Ambiente e Git
 
 1. **Restrição de Versão do OpenCV (`opencv-python<5`):**
    - O arquivo `requirements.txt` especifica `opencv-python<5` para priorizar a série `4.x` (que inclui `cv2.CascadeClassifier` e os XMLs nativos em `cv2.data.haarcascades`), enquanto `core/video_engine.py` mantém suporte híbrido para OpenCV 4.x e 5.x.
-2. **Inicialização Isolada via Ambiente Virtual (`python -m streamlit`):**
-   - O projeto deve ser executado exclusivamente invocando o interpretador da virtualenv local (`venv\Scripts\python.exe -m streamlit run app.py --server.port 8502`), conforme automatizado pelo `iniciar_easykut.bat`. Isso evita conflitos com instalações globais do Python no Windows ou portas presas em execuções anteriores.
+2. **Inicialização Isolada do Servidor Uvicorn (`python -m uvicorn`):**
+   - O projeto é executado exclusivamente invocando o interpretador da virtualenv local (`venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 8502`), conforme automatizado pelo `iniciar_easykut.bat`. Isso garante a liberação prévia da porta 8502 e abre o navegador automaticamente em `http://127.0.0.1:8502`.
 3. **Fluxo Git `main`-only:**
    - Todo o desenvolvimento, correções e evoluções são realizados **sempre direto na branch `main`**. Não devem ser criadas branches de feature ou homologação.
