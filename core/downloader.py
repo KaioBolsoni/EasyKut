@@ -4,18 +4,30 @@ Utiliza a biblioteca yt-dlp para extrair metadados e baixar mídias
 de forma segura e assíncrona/otimizada.
 """
 
+import ipaddress
 import logging
 import re
-import time
+import socket
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
 
 import yt_dlp
 
 from core.config import BASE_DIR, DOWNLOADS_DIR, get_cookies_file
 
 logger = logging.getLogger(__name__)
+_download_video_lock = threading.Lock()
+
+# Allowlist de domínios públicos de vídeo suportados (proteção contra SSRF)
+ALLOWED_VIDEO_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "twitch.tv",
+)
 
 
 def _apply_common_ydl_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
@@ -28,6 +40,7 @@ def _apply_common_ydl_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
     opts["retries"] = 3
     opts["fragment_retries"] = 3
     opts["extractor_retries"] = 3
+    opts.setdefault("socket_timeout", 30)
     opts["remote_components"] = ["ejs:github"]
 
     cookies_file = get_cookies_file()
@@ -64,18 +77,88 @@ def _raise_formatted_ytdlp_error(exc: Exception, url: str) -> None:
     raise exc
 
 
+def _is_forbidden_ip(ip_obj: ipaddress._BaseAddress) -> bool:
+    """Retorna True se o endereço IP for privado, loopback, link-local, multicast ou reservado."""
+    return bool(
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def _is_allowed_public_host(hostname: str) -> bool:
+    """
+    Valida se o hostname pertence à allowlist de plataformas de vídeo suportadas
+    e não resolve para endereços internos/privados (mitigação contra SSRF/DNS rebinding).
+    """
+    host = (hostname or "").strip().lower().rstrip(".")
+    if not host or host in ("localhost", "localhost.localdomain"):
+        return False
+
+    # Bloqueia IPs literais (IPv4/IPv6) diretamente
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+
+    # Exige correspondência com domínio público permitido
+    if not any(host == d or host.endswith("." + d) for d in ALLOWED_VIDEO_DOMAINS):
+        return False
+
+    # Se o DNS estiver disponível, verifica se todos os IPs resolvidos são públicos
+    try:
+        addr_infos = socket.getaddrinfo(host, None)
+        for info in addr_infos:
+            sockaddr = info[4]
+            if sockaddr:
+                ip_str = sockaddr[0].split("%")[0]
+                ip_obj = ipaddress.ip_address(ip_str)
+                if _is_forbidden_ip(ip_obj):
+                    return False
+    except OSError:
+        # Em ambiente offline/sem DNS, a allowlist de domínio já restringe hosts internos
+        pass
+
+    return True
+
+
 def is_valid_video_url(url: str) -> bool:
     """
-    Valida se a URL fornecida tem padrão de plataforma de vídeo suportada (ex: YouTube, Shorts, etc.).
+    Valida estritamente se a URL pertence a uma plataforma de vídeo pública suportada (YouTube, Vimeo, Twitch),
+    bloqueando esquemas não-HTTP(S), caminhos locais, caracteres de controle e destinos internos (SSRF).
     """
     if not url or not isinstance(url, str):
         return False
     u = url.strip()
-    if not u.startswith("http://") and not u.startswith("https://"):
+    if not u or u.startswith("-") or any(ch in u for ch in ("\r", "\n", "\x00", " ", "\t")):
+        return False
+
+    if "://" not in u:
         u = "https://" + u
-    youtube_pattern = r"(youtube\.com/(watch\?.*v=|shorts/|embed/|live/)|youtu\.be/)[a-zA-Z0-9_-]{11}"
-    generic_url_pattern = r"^https?://[^\s]+"
-    return bool(re.search(youtube_pattern, u) or re.match(generic_url_pattern, u))
+
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    if not parsed.hostname or not _is_allowed_public_host(parsed.hostname):
+        return False
+
+    host = parsed.hostname.lower().rstrip(".")
+    # Para YouTube, exige estrutura válida de vídeo/shorts/embed/live
+    if host == "youtu.be" or host.endswith(".youtu.be") or host == "youtube.com" or host.endswith(".youtube.com"):
+        youtube_pattern = r"(youtube\.com/(watch\?.*v=|shorts/|embed/|live/)|youtu\.be/)[a-zA-Z0-9_-]{11}"
+        return bool(re.search(youtube_pattern, u))
+
+    return bool(parsed.path and parsed.path != "/")
 
 
 def sanitize_filename(name: str) -> str:
@@ -354,19 +437,20 @@ def download_video(
         "progress_hooks": [_hook] if progress_callback else [],
     })
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=True)
-        except Exception as exc:
-            _raise_formatted_ytdlp_error(exc, url)
+    with _download_video_lock:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as exc:
+                _raise_formatted_ytdlp_error(exc, url)
 
-        video_id = info.get("id", "video")
-        video_path = target_dir / f"{video_id}_video.mp4"
+            video_id = info.get("id", "video")
+            video_path = target_dir / f"{video_id}_video.mp4"
 
-        if not video_path.exists():
-            matches = list(target_dir.glob(f"{video_id}_video.*"))
-            if matches:
-                video_path = matches[0]
+            if not video_path.exists():
+                matches = list(target_dir.glob(f"{video_id}_video.*"))
+                if matches:
+                    video_path = matches[0]
 
-        logger.info("Vídeo baixado com sucesso em: %s", video_path)
-        return str(video_path.resolve())
+            logger.info("Vídeo baixado com sucesso em: %s", video_path)
+            return str(video_path.resolve())
