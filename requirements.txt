@@ -1,10 +1,9 @@
-streamlit
-yt-dlp
-ffmpeg-python
-opencv-python<5
-groq
-google-genai
-python-dotenv
-fastapi
-uvicorn
-python-multipart
+# Dependências diretas de produção do EasyKut Studio V3 (versões pinadas)
+fastapi==0.165.0
+uvicorn==0.54.0
+python-multipart==0.0.34
+python-dotenv==1.2.4
+yt-dlp==2026.11.23
+opencv-python==4.14.0.94
+groq==1.7.0
+google-genai==3.5.0

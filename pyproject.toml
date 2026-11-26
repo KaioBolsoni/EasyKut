@@ -1,0 +1,25 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+exclude = [
+    "venv",
+    ".git",
+    "data",
+    "__pycache__",
+    "test_db.py",
+    "test_fase2.py",
+    "test_fase3.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",  # linhas longas em strings/prompts/filtros FFmpeg
+    "E402",  # sys.path bootstrap antes dos imports em server.py
+    "B008",  # Query()/Depends() como default de parâmetros FastAPI
+    "B904",  # raise HTTPException dentro de except sem from
+]
+
+[tool.bandit]
+exclude_dirs = ["venv", "tests", "data"]
+skips = ["B101"]
