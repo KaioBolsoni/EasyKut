@@ -85,7 +85,10 @@ function initDOM() {
   // Toolbar do Corte
   document.getElementById('active-cut-title').addEventListener('input', (e) => {
     const c = getActiveCut();
-    if (c) c.title = e.target.value;
+    if (c) {
+      c.title = e.target.value;
+      schedulePersistCutEdits(c);
+    }
     updateCutsSidebarUI();
   });
 
@@ -98,6 +101,7 @@ function initDOM() {
       updateActiveCutToolbar();
       updateCutsSidebarUI();
       updateCutContextPanel(c);
+      schedulePersistCutEdits(c);
     }
   });
 
@@ -110,6 +114,7 @@ function initDOM() {
       updateActiveCutToolbar();
       updateCutsSidebarUI();
       updateCutContextPanel(c);
+      schedulePersistCutEdits(c);
     }
   });
 
@@ -119,6 +124,7 @@ function initDOM() {
     if (c) {
       c.burn_subtitles = e.target.checked;
       renderAllCanvases();
+      schedulePersistCutEdits(c);
     }
   });
 
@@ -366,15 +372,39 @@ async function startAnalysis() {
 }
 
 function pollJob(jobId, onSuccess, onError) {
-  if (state.jobPoller) clearInterval(state.jobPoller);
+  if (state.jobPoller) {
+    clearInterval(state.jobPoller);
+    state.jobPoller = null;
+  }
+
+  let isStopped = false;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 5;
+
+  const stopPolling = () => {
+    isStopped = true;
+    if (state.jobPoller) {
+      clearInterval(state.jobPoller);
+      state.jobPoller = null;
+    }
+  };
 
   state.jobPoller = setInterval(async () => {
+    if (isStopped) return;
     try {
       const res = await fetch(`/api/jobs/${jobId}`);
       if (!res.ok) {
+        if (res.status === 404) {
+          stopPolling();
+          onError('O job não foi encontrado no servidor (o servidor pode ter sido reiniciado).');
+          return;
+        }
         throw new Error(`Erro na comunicação com o servidor (${res.status})`);
       }
+
+      consecutiveErrors = 0;
       const job = await res.json();
+      if (isStopped) return;
 
       // Exibe na barra de progresso (Análise e Renderização) o texto real de job.step retornado pelo backend
       const stepLabel = job.step || 'Processando...';
@@ -402,17 +432,20 @@ function pollJob(jobId, onSuccess, onError) {
 
       const status = (job.status || '').toLowerCase().trim();
       if (status === 'completed' || status === 'done') {
-        clearInterval(state.jobPoller);
-        state.jobPoller = null;
+        stopPolling();
         onSuccess(job.result);
-      } else if (status === 'failed' || status === 'error') {
-        clearInterval(state.jobPoller);
-        state.jobPoller = null;
+      } else if (status === 'error' || status === 'failed') {
+        stopPolling();
         const errMsg = job.error || job.step || 'Erro durante o processamento.';
         onError(errMsg);
       }
     } catch (err) {
+      consecutiveErrors += 1;
       console.error('Erro de polling:', err);
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        stopPolling();
+        onError(`Falha persistente de comunicação com o servidor: ${err.message}`);
+      }
     }
   }, 1000);
 }
@@ -451,8 +484,8 @@ function onAnalysisSuccess(result) {
 }
 
 function onAnalysisError(errorMsg) {
-  alert('Erro na esteira de IA: ' + errorMsg);
   resetHeroUI();
+  alert('Erro na esteira de IA: ' + errorMsg);
 }
 
 function resetHeroUI() {
@@ -493,7 +526,7 @@ function initWorkspaceData() {
 
 function updateCutsSidebarUI() {
   const container = document.getElementById('cuts-list-container');
-  container.innerHTML = '';
+  container.replaceChildren();
 
   const totalCuts = state.cuts.length;
   document.getElementById('cuts-count-header').textContent = `Cortes Sugeridos (${totalCuts})`;
@@ -501,29 +534,63 @@ function updateCutsSidebarUI() {
   state.cuts.forEach((c, idx) => {
     const card = document.createElement('div');
     card.className = `cut-item-card ${idx === state.activeCutIndex ? 'active' : ''}`;
-    card.onclick = () => selectCut(idx);
+    card.addEventListener('click', () => selectCut(idx));
 
-    const score = Math.round(c.virality_score || 80);
+    const score = Math.round(Number(c.virality_score) || 80);
     const scoreBadgeClass = score >= 75 ? 'cut-score-badge' : 'cut-score-badge med';
 
-    card.innerHTML = `
-      <div class="cut-item-top">
-        <label class="cut-check-label" onclick="event.stopPropagation()">
-          <input type="checkbox" ${c.selected ? 'checked' : ''} onchange="toggleCutSelection(${idx}, this.checked)">
-          <span>#${idx + 1}</span>
-        </label>
-        <div style="display: flex; align-items: center; gap: 4px;">
-          <button class="cut-card-play-mini" onclick="event.stopPropagation(); selectAndPlayCut(${idx})" title="Assistir este corte no Estúdio">▶ Ver</button>
-          <span class="${scoreBadgeClass}">⭐ ${score}</span>
-        </div>
-      </div>
-      <div class="cut-title-text" title="${c.title}">${c.title}</div>
-      <div class="cut-meta-text">
-        <span>⏱️ ${c.duration.toFixed(1)}s</span>
-        <span>${formatTimeRange(c.start_time, c.end_time)}</span>
-      </div>
-    `;
+    const topRow = document.createElement('div');
+    topRow.className = 'cut-item-top';
 
+    const checkLabel = document.createElement('label');
+    checkLabel.className = 'cut-check-label';
+    checkLabel.addEventListener('click', (e) => e.stopPropagation());
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = Boolean(c.selected);
+    checkbox.addEventListener('change', (e) => toggleCutSelection(idx, e.target.checked));
+
+    const idxSpan = document.createElement('span');
+    idxSpan.textContent = `#${idx + 1}`;
+    checkLabel.append(checkbox, idxSpan);
+
+    const actionsGroup = document.createElement('div');
+    actionsGroup.style.display = 'flex';
+    actionsGroup.style.alignItems = 'center';
+    actionsGroup.style.gap = '4px';
+
+    const playBtn = document.createElement('button');
+    playBtn.className = 'cut-card-play-mini';
+    playBtn.title = 'Assistir este corte no Estúdio';
+    playBtn.textContent = '▶ Ver';
+    playBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectAndPlayCut(idx);
+    });
+
+    const scoreBadge = document.createElement('span');
+    scoreBadge.className = scoreBadgeClass;
+    scoreBadge.textContent = `⭐ ${score}`;
+    actionsGroup.append(playBtn, scoreBadge);
+
+    topRow.append(checkLabel, actionsGroup);
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'cut-title-text';
+    const safeTitle = String(c.title || '');
+    titleEl.title = safeTitle;
+    titleEl.textContent = safeTitle;
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'cut-meta-text';
+    const durSpan = document.createElement('span');
+    durSpan.textContent = `⏱️ ${(Number(c.duration) || 0).toFixed(1)}s`;
+    const rangeSpan = document.createElement('span');
+    rangeSpan.textContent = formatTimeRange(Number(c.start_time) || 0, Number(c.end_time) || 0);
+    metaRow.append(durSpan, rangeSpan);
+
+    card.append(topRow, titleEl, metaRow);
     container.appendChild(card);
   });
 
@@ -647,6 +714,7 @@ function setLayoutMode(mode) {
 
   updateActiveCutToolbar();
   renderAllCanvases();
+  schedulePersistCutEdits(c);
 }
 
 function onZoomSliderChange(val) {
@@ -655,6 +723,7 @@ function onZoomSliderChange(val) {
     c.layout_params.zoom_factor = parseFloat(val);
     document.getElementById('lbl-zoom-val').textContent = `${parseFloat(val).toFixed(2)}x`;
     renderAllCanvases();
+    schedulePersistCutEdits(c);
   }
 }
 
@@ -739,6 +808,7 @@ async function refreshCutFrame() {
   if (btnOverlay) btnOverlay.disabled = true;
 
   showToast('Capturando frame no tempo exato...');
+  const videoId = state.currentVideo.video_id;
   const source = state.currentVideo.url;
   const ts = Math.max(0, c.start_time + 0.5);
 
@@ -746,12 +816,11 @@ async function refreshCutFrame() {
     const res = await fetch('/api/frame', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source, timestamp_sec: ts })
+      body: JSON.stringify({ video_id: videoId, source, timestamp_sec: ts })
     });
     const data = await res.json();
     if (res.ok && data.success && data.frame_url) {
       c.frame_url = data.frame_url;
-      c.frame_path = data.frame_path;
       loadCutFrame(c);
       showToast('Frame atualizado com sucesso!');
     } else {
@@ -846,33 +915,51 @@ function updateCutContextPanel(cut) {
   const transBox = document.getElementById('cut-transcript-box');
   if (!justBox || !transBox) return;
 
+  justBox.replaceChildren();
+  transBox.replaceChildren();
+
   if (!cut) {
-    justBox.textContent = '';
-    transBox.innerHTML = '';
     return;
   }
 
-  justBox.innerHTML = cut.justification
-    ? `<strong>Motivo Viral:</strong> ${cut.justification}`
-    : `<strong>Intervalo:</strong> ${formatTimeRange(cut.start_time, cut.end_time)} (${cut.duration.toFixed(1)}s)`;
+  const labelStrong = document.createElement('strong');
+  if (cut.justification) {
+    labelStrong.textContent = 'Motivo Viral: ';
+    justBox.append(labelStrong, document.createTextNode(String(cut.justification)));
+  } else {
+    labelStrong.textContent = 'Intervalo: ';
+    const infoText = `${formatTimeRange(Number(cut.start_time) || 0, Number(cut.end_time) || 0)} (${(Number(cut.duration) || 0).toFixed(1)}s)`;
+    justBox.append(labelStrong, document.createTextNode(infoText));
+  }
 
   const segs = getCutSegments(cut);
   if (segs.length === 0) {
-    transBox.innerHTML = `<span style="color: var(--text-dim);">Clique em "Assistir Corte" para ver e ouvir o clipe no editor.</span>`;
+    const emptyHint = document.createElement('span');
+    emptyHint.style.color = 'var(--text-dim)';
+    emptyHint.textContent = 'Clique em "Assistir Corte" para ver e ouvir o clipe no editor.';
+    transBox.appendChild(emptyHint);
     return;
   }
 
-  transBox.innerHTML = segs
-    .map((s, i) => {
-      const relSec = Math.max(0, s.start - cut.start_time);
-      return `
-        <div class="cut-seg-item" data-seg-idx="${i}" data-rel-sec="${relSec.toFixed(2)}" onclick="seekClipToRelativeSec(${relSec.toFixed(2)})" title="Clique para pular o vídeo para este trecho">
-          <span class="cut-seg-time">[${formatSecondsMMSS(s.start)}]</span>
-          <span>${s.text}</span>
-        </div>
-      `;
-    })
-    .join('');
+  segs.forEach((s, i) => {
+    const relSec = Math.max(0, (Number(s.start) || 0) - (Number(cut.start_time) || 0));
+    const item = document.createElement('div');
+    item.className = 'cut-seg-item';
+    item.dataset.segIdx = String(i);
+    item.dataset.relSec = relSec.toFixed(2);
+    item.title = 'Clique para pular o vídeo para este trecho';
+    item.addEventListener('click', () => seekClipToRelativeSec(Number(relSec.toFixed(2))));
+
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'cut-seg-time';
+    timeSpan.textContent = `[${formatSecondsMMSS(s.start)}]`;
+
+    const textSpan = document.createElement('span');
+    textSpan.textContent = String(s.text || '');
+
+    item.append(timeSpan, document.createTextNode(' '), textSpan);
+    transBox.appendChild(item);
+  });
 
   // Atualiza display de tempo inicial na barra do player
   const timeDisp = document.getElementById('clip-time-display');
@@ -1486,7 +1573,7 @@ function onCanvasMouseDown(e) {
 }
 
 function onCanvasMouseMove(e) {
-  if (!canvasState.imgLoaded) return;
+  if (!canvasState.imgLoaded && !canvasState.isVideoReady) return;
   const cut = getActiveCut();
   if (!cut) return;
 
@@ -1540,9 +1627,13 @@ function onCanvasMouseMove(e) {
 }
 
 function onCanvasMouseUp() {
+  const wasDragging = canvasState.isDragging;
   canvasState.isDragging = false;
   canvasState.dragTarget = null;
   canvasState.activeHandle = null;
+  if (wasDragging) {
+    schedulePersistCutEdits(getActiveCut());
+  }
 }
 
 // Utilitário de redimensionamento proporcional
@@ -1702,11 +1793,11 @@ function onRenderSuccess(result) {
 }
 
 function onRenderError(errorMsg) {
-  alert('Erro durante a renderização: ' + errorMsg);
   state.isRendering = false;
   updateRenderButtonState();
   const overlay = document.getElementById('render-progress-overlay');
   if (overlay) overlay.style.display = 'none';
+  alert('Erro durante a renderização: ' + errorMsg);
 }
 
 // =========================================================
@@ -1720,14 +1811,20 @@ async function loadLibraryHistory() {
     const res = await fetch(`/api/history?search=${encodeURIComponent(search)}&min_score=${minScore}`);
     const videos = await res.json();
     const container = document.getElementById('library-cards-container');
-    container.innerHTML = '';
+    container.replaceChildren();
 
     if (!videos || videos.length === 0) {
-      container.innerHTML = `
-        <div style="grid-column: 1 / -1; padding: 3rem; text-align: center; color: var(--text-dim);">
-          <p style="font-size: 1.1rem; font-weight: 500;">Nenhum vídeo processado encontrado na biblioteca.</p>
-        </div>
-      `;
+      const emptyBox = document.createElement('div');
+      emptyBox.style.gridColumn = '1 / -1';
+      emptyBox.style.padding = '3rem';
+      emptyBox.style.textAlign = 'center';
+      emptyBox.style.color = 'var(--text-dim)';
+      const emptyP = document.createElement('p');
+      emptyP.style.fontSize = '1.1rem';
+      emptyP.style.fontWeight = '500';
+      emptyP.textContent = 'Nenhum vídeo processado encontrado na biblioteca.';
+      emptyBox.appendChild(emptyP);
+      container.appendChild(emptyBox);
       return;
     }
 
@@ -1735,42 +1832,101 @@ async function loadLibraryHistory() {
       const card = document.createElement('div');
       card.className = 'video-card-hist';
 
-      let cutsHTML = '';
+      const header = document.createElement('div');
+      header.className = 'video-card-hist-header';
+
+      const displayTitle = String(v.title || v.url || '');
+      const titleDiv = document.createElement('div');
+      titleDiv.className = 'video-card-hist-title';
+      titleDiv.title = displayTitle;
+      titleDiv.textContent = `📹 ${displayTitle}`;
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'icon-btn';
+      delBtn.style.color = 'var(--accent-red)';
+      delBtn.style.width = '30px';
+      delBtn.style.height = '30px';
+      delBtn.title = 'Excluir vídeo';
+      delBtn.addEventListener('click', () => deleteVideoItem(Number(v.id)));
+      delBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+
+      header.append(titleDiv, delBtn);
+
+      const body = document.createElement('div');
+      body.className = 'video-card-hist-body';
+
+      const metaDiv = document.createElement('div');
+      metaDiv.style.fontSize = '0.8rem';
+      metaDiv.style.color = 'var(--text-dim)';
+      metaDiv.textContent = `ID: ${v.id} | Duração: ${v.duration}s | Status: ${v.status}`;
+      body.appendChild(metaDiv);
+
       if (v.cortes && v.cortes.length > 0) {
         v.cortes.forEach(c => {
-          cutsHTML += `
-            <div class="cut-row-hist">
-              <div class="cut-row-info">
-                <strong>${c.title}</strong>
-                <span style="font-size: 0.75rem; color: var(--text-muted);">⭐ ${c.virality_score}/100 | ${c.start_time}s - ${c.end_time}s</span>
-              </div>
-              <div style="display: flex; gap: 0.5rem; align-items: center;">
-                ${c.video_url ? `
-                  <a class="action-btn" style="height: 30px; font-size: 0.75rem;" href="${c.video_url}" download>⬇️ Baixar (.mp4)</a>
-                ` : '<span style="font-size: 0.75rem; color: var(--accent-red);">Arquivo ausente</span>'}
-              </div>
-            </div>
-          `;
+          const cutRow = document.createElement('div');
+          cutRow.className = 'cut-row-hist';
+
+          const infoDiv = document.createElement('div');
+          infoDiv.className = 'cut-row-info';
+
+          const cutTitleStrong = document.createElement('strong');
+          cutTitleStrong.textContent = String(c.title || '');
+
+          const cutMetaSpan = document.createElement('span');
+          cutMetaSpan.style.fontSize = '0.75rem';
+          cutMetaSpan.style.color = 'var(--text-muted)';
+          cutMetaSpan.textContent = `⭐ ${c.virality_score}/100 | ${c.start_time}s - ${c.end_time}s`;
+
+          infoDiv.append(cutTitleStrong, cutMetaSpan);
+
+          const actionsDiv = document.createElement('div');
+          actionsDiv.style.display = 'flex';
+          actionsDiv.style.gap = '0.5rem';
+          actionsDiv.style.alignItems = 'center';
+
+          const safeVideoUrl = getSafeCutDownloadUrl(c.video_url);
+          if (safeVideoUrl) {
+            const dlLink = document.createElement('a');
+            dlLink.className = 'action-btn';
+            dlLink.style.height = '30px';
+            dlLink.style.fontSize = '0.75rem';
+            dlLink.href = safeVideoUrl;
+            dlLink.setAttribute('download', '');
+            dlLink.textContent = '⬇️ Baixar (.mp4)';
+            actionsDiv.appendChild(dlLink);
+          } else {
+            const missingSpan = document.createElement('span');
+            missingSpan.style.fontSize = '0.75rem';
+            missingSpan.style.color = 'var(--accent-red)';
+            missingSpan.textContent = 'Arquivo ausente';
+            actionsDiv.appendChild(missingSpan);
+          }
+
+          if (c.id) {
+            const delCutBtn = document.createElement('button');
+            delCutBtn.className = 'icon-btn';
+            delCutBtn.style.color = 'var(--accent-red)';
+            delCutBtn.style.width = '28px';
+            delCutBtn.style.height = '28px';
+            delCutBtn.title = 'Excluir apenas este corte';
+            delCutBtn.addEventListener('click', () => deleteCorteItem(Number(c.id)));
+            delCutBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+            actionsDiv.appendChild(delCutBtn);
+          }
+
+          cutRow.append(infoDiv, actionsDiv);
+          body.appendChild(cutRow);
         });
       } else {
-        cutsHTML = `<p style="font-size: 0.8rem; color: var(--text-dim); padding: 0.5rem 0;">Nenhum corte deste vídeo atingiu a nota mínima.</p>`;
+        const noCutsP = document.createElement('p');
+        noCutsP.style.fontSize = '0.8rem';
+        noCutsP.style.color = 'var(--text-dim)';
+        noCutsP.style.padding = '0.5rem 0';
+        noCutsP.textContent = 'Nenhum corte deste vídeo atingiu a nota mínima.';
+        body.appendChild(noCutsP);
       }
 
-      card.innerHTML = `
-        <div class="video-card-hist-header">
-          <div class="video-card-hist-title" title="${v.title || v.url}">
-            📹 ${v.title || v.url}
-          </div>
-          <button class="icon-btn" style="color: var(--accent-red); width: 30px; height: 30px;" onclick="deleteVideoItem(${v.id})" title="Excluir vídeo">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-          </button>
-        </div>
-        <div class="video-card-hist-body">
-          <div style="font-size: 0.8rem; color: var(--text-dim);">ID: ${v.id} | Duração: ${v.duration}s | Status: ${v.status}</div>
-          ${cutsHTML}
-        </div>
-      `;
-
+      card.append(header, body);
       container.appendChild(card);
     });
 
@@ -1795,9 +1951,65 @@ async function deleteVideoItem(videoId) {
   }
 }
 
+async function deleteCorteItem(corteId) {
+  const deleteFile = confirm('Excluir este corte? Clique em OK para apagar também o arquivo .mp4 do disco (ou Cancelar para manter o arquivo).');
+  try {
+    const res = await fetch(`/api/cortes/${corteId}?delete_file=${deleteFile}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (res.ok && data.success) {
+      showToast('Corte excluído com sucesso!');
+      loadLibraryHistory();
+    } else {
+      alert('Erro ao excluir corte: ' + (data.detail || res.status));
+    }
+  } catch (err) {
+    alert('Erro ao excluir corte: ' + err.message);
+  }
+}
+
+const schedulePersistCutEdits = debounce(async (cut) => {
+  if (!cut || !cut.id) return;
+  if (typeof cut.end_time !== 'number' || typeof cut.start_time !== 'number' || cut.end_time <= cut.start_time) {
+    return;
+  }
+  try {
+    await fetch(`/api/cortes/${cut.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: cut.title,
+        start_time: cut.start_time,
+        end_time: cut.end_time,
+        layout_mode: cut.layout_mode,
+        layout_params: cut.layout_params || {},
+        burn_subtitles: Boolean(cut.burn_subtitles),
+      }),
+    });
+  } catch (err) {
+    console.warn('Falha ao salvar edição do corte em segundo plano:', err);
+  }
+}, 500);
+
 // =========================================================
 // HELPERS & UTILITÁRIOS
 // =========================================================
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getSafeCutDownloadUrl(url) {
+  if (typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!trimmed.startsWith('/data/cortes/')) return null;
+  if (trimmed.includes('..') || /[\r\n\x00]/.test(trimmed)) return null;
+  return trimmed;
+}
+
 function makeEven(val) {
   const n = Math.round(val);
   return n % 2 === 0 ? n : n - 1;
