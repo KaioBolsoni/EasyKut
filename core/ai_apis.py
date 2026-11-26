@@ -38,17 +38,20 @@ GROQ_MODELS = [
 
 
 def get_groq_client() -> Groq:
-    """Retorna instância autenticada do cliente Groq."""
+    """Retorna instância autenticada do cliente Groq com timeout explícito."""
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY não configurada no arquivo .env")
-    return Groq(api_key=GROQ_API_KEY)
+    return Groq(api_key=GROQ_API_KEY, timeout=60.0)
 
 
 def get_gemini_client() -> genai.Client:
-    """Retorna instância autenticada do cliente Google GenAI."""
+    """Retorna instância autenticada do cliente Google GenAI com timeout explícito (60s)."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY não configurada no arquivo .env")
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=60000),
+    )
 
 
 def load_director_prompt() -> str:
@@ -94,7 +97,7 @@ def transcribe_audio_groq(
                 "-vn", "-ac", "1", "-ar", "16000", "-b:a", "24k",
                 str(compressed)
             ]
-            subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=120)
             if compressed.exists() and compressed.stat().st_size > 0:
                 target_audio_path = compressed
                 logger.info("Áudio recomprimido com sucesso para %.2f MB.", compressed.stat().st_size / (1024 * 1024))
