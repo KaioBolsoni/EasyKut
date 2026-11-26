@@ -7,8 +7,11 @@ from database.db_manager import (
     list_videos,
     delete_video,
     add_corte,
+    get_corte,
     list_cortes,
+    update_corte,
     update_corte_status,
+    delete_corte,
     save_analysis,
 )
 
@@ -21,7 +24,10 @@ __all__ = [
     "list_videos",
     "delete_video",
     "add_corte",
+    "get_corte",
     "list_cortes",
+    "update_corte",
     "update_corte_status",
+    "delete_corte",
     "save_analysis",
 ]

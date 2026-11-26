@@ -4,14 +4,81 @@ Responsável pela inicialização das tabelas e operações CRUD de vídeos e co
 """
 
 from contextlib import contextmanager
+import json
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Iterator, List, Optional
 
-# Diretório base do projeto e pasta de dados
+logger = logging.getLogger(__name__)
+
+# Diretório base do projeto e pasta de dados (caminhos absolutos determinísticos)
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-DEFAULT_DB_PATH = DATA_DIR / "cortador.db"
+DATA_DIR = (BASE_DIR / "data").resolve()
+DEFAULT_DB_PATH = (DATA_DIR / "cortador.db").resolve()
+
+SCHEMA_VERSION = 2
+VALID_LAYOUT_MODES = {
+    "horizontal_16_9",
+    "vertical_blur",
+    "manual_crop",
+    "split_screen",
+    "face_tracking_9_16",
+}
+
+
+def _validate_corte_bounds(
+    start_time: float,
+    end_time: float,
+    virality_score: Optional[float] = None
+) -> None:
+    """Valida invariantes de domínio de um corte antes de persistir no SQLite."""
+    s = float(start_time)
+    e = float(end_time)
+    if s < 0.0:
+        raise ValueError(f"start_time não pode ser negativo: {s}")
+    if e <= s:
+        raise ValueError(f"end_time ({e}) deve ser estritamente maior que start_time ({s}).")
+    if virality_score is not None:
+        sc = float(virality_score)
+        if sc < 0.0 or sc > 100.0:
+            raise ValueError(f"virality_score deve estar entre 0 e 100: {sc}")
+
+
+def _serialize_layout_params(layout_params: Any) -> str:
+    """Serializa layout_params (dict ou string JSON) com segurança para armazenamento TEXT."""
+    if layout_params is None:
+        return "{}"
+    if isinstance(layout_params, str):
+        stripped = layout_params.strip()
+        if not stripped:
+            return "{}"
+        json.loads(stripped)  # valida JSON
+        return stripped
+    if isinstance(layout_params, dict):
+        return json.dumps(layout_params, ensure_ascii=False)
+    raise ValueError("layout_params deve ser um dicionário ou string JSON válida.")
+
+
+def _deserialize_corte_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """Converte sqlite3.Row de 'cortes' em dict com layout_params desserializado e burn_subtitles bool."""
+    item = dict(row)
+    raw_lp = item.get("layout_params")
+    if isinstance(raw_lp, str):
+        try:
+            item["layout_params"] = json.loads(raw_lp) if raw_lp.strip() else {}
+        except Exception:
+            item["layout_params"] = {}
+    elif raw_lp is None:
+        item["layout_params"] = {}
+    if "burn_subtitles" in item:
+        item["burn_subtitles"] = bool(item["burn_subtitles"])
+    return item
+
+
+def _resolve_db_path(db_path: Optional[Path] = None) -> Path:
+    """Garante que todas as operações utilizem exatamente o mesmo caminho absoluto de banco SQLite."""
+    return Path(db_path).resolve() if db_path is not None else DEFAULT_DB_PATH
 
 
 @contextmanager
@@ -20,7 +87,7 @@ def get_connection(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connectio
     Context manager para conexão SQLite com fechamento explícito garantido no Windows,
     evitando vazamento de handles e bloqueios 'database is locked'.
     """
-    path = db_path or DEFAULT_DB_PATH
+    path = _resolve_db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(path), timeout=15.0, check_same_thread=False)
@@ -37,9 +104,40 @@ def get_connection(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connectio
         conn.close()
 
 
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Executa migrations idempotentes baseadas em PRAGMA user_version,
+    adicionando colunas da V3 em bancos legados sem perda de dados.
+    """
+    cursor = conn.cursor()
+    current_version = int(cursor.execute("PRAGMA user_version;").fetchone()[0])
+
+    if current_version < 2:
+        existing_cols = {
+            row["name"]
+            for row in cursor.execute("PRAGMA table_info(cortes);").fetchall()
+        }
+        migrations_v2 = [
+            ("tipo", "TEXT DEFAULT 'short'"),
+            ("layout_mode", "TEXT DEFAULT 'vertical_blur'"),
+            ("layout_params", "TEXT DEFAULT '{}'"),
+            ("burn_subtitles", "INTEGER DEFAULT 1"),
+            ("updated_at", "TIMESTAMP"),
+        ]
+        added_updated_at = False
+        for col_name, col_def in migrations_v2:
+            if col_name not in existing_cols:
+                cursor.execute(f"ALTER TABLE cortes ADD COLUMN {col_name} {col_def};")
+                if col_name == "updated_at":
+                    added_updated_at = True
+        if added_updated_at:
+            cursor.execute("UPDATE cortes SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL;")
+        cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     """
-    Inicializa o banco de dados criando as tabelas necessárias caso não existam.
+    Inicializa o banco de dados criando as tabelas necessárias e aplicando migrations de schema.
     """
     with get_connection(db_path) as conn:
         conn.execute("PRAGMA journal_mode = WAL;")
@@ -51,7 +149,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
                 title TEXT DEFAULT '',
-                duration REAL DEFAULT 0.0,
+                duration REAL DEFAULT 0.0 CHECK (duration >= 0.0),
                 file_path TEXT DEFAULT '',
                 audio_path TEXT DEFAULT '',
                 status TEXT DEFAULT 'pending',
@@ -66,18 +164,24 @@ def init_db(db_path: Optional[Path] = None) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id INTEGER NOT NULL,
                 title TEXT DEFAULT '',
-                start_time REAL NOT NULL,
-                end_time REAL NOT NULL,
+                start_time REAL NOT NULL CHECK (start_time >= 0.0),
+                end_time REAL NOT NULL CHECK (end_time > start_time),
                 duration REAL GENERATED ALWAYS AS (end_time - start_time) VIRTUAL,
-                virality_score REAL DEFAULT 0.0,
+                virality_score REAL DEFAULT 0.0 CHECK (virality_score >= 0.0 AND virality_score <= 100.0),
                 justification TEXT DEFAULT '',
+                tipo TEXT DEFAULT 'short',
+                layout_mode TEXT DEFAULT 'vertical_blur',
+                layout_params TEXT DEFAULT '{}',
+                burn_subtitles INTEGER DEFAULT 1,
                 output_path TEXT DEFAULT '',
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE
             );
         """)
 
+        _run_migrations(conn)
         conn.commit()
 
 
@@ -91,16 +195,20 @@ def add_video(
     db_path: Optional[Path] = None
 ) -> int:
     """
-    Insere um novo vídeo na base e retorna o ID gerado.
+    Insere um novo vídeo na base com commit imediato e retorna o ID inteiro gerado (cursor.lastrowid).
     """
-    with get_connection(db_path) as conn:
+    target_db = _resolve_db_path(db_path)
+    with get_connection(target_db) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO videos (url, title, duration, file_path, audio_path, status)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (url, title, duration, file_path, audio_path, status))
+        """, (str(url or ""), str(title or ""), float(duration or 0.0), str(file_path or ""), str(audio_path or ""), str(status or "pending")))
         conn.commit()
-        return cursor.lastrowid
+        last_id = cursor.lastrowid
+        if last_id is None or int(last_id) <= 0:
+            raise RuntimeError("Falha ao obter cursor.lastrowid válido após inserção na tabela 'videos'.")
+        return int(last_id)
 
 
 def get_video(video_id: int, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
@@ -176,16 +284,18 @@ def list_videos(
 def delete_video(video_id: int, delete_files: bool = False, db_path: Optional[Path] = None) -> bool:
     """
     Remove um vídeo e seus cortes associados (via cascade no SQLite).
-    Se delete_files=True, remove também os arquivos físicos do disco (vídeos, áudios e cortes em data/cortes/ e data/downloads/).
+    Se delete_files=True, remove também os arquivos físicos confinados a DATA_DIR após a confirmação do DELETE SQL.
     """
-    with get_connection(db_path) as conn:
+    target_db = _resolve_db_path(db_path)
+    files_to_delete: List[Path] = []
+
+    with get_connection(target_db) as conn:
         cursor = conn.cursor()
 
         if delete_files:
             # Coleta caminhos de mídias brutas associadas
             cursor.execute("SELECT file_path, audio_path FROM videos WHERE id = ?", (video_id,))
             vid_row = cursor.fetchone()
-            files_to_delete = []
             if vid_row:
                 if vid_row["file_path"]:
                     files_to_delete.append(Path(vid_row["file_path"]))
@@ -198,17 +308,30 @@ def delete_video(video_id: int, delete_files: bool = False, db_path: Optional[Pa
                 if c_row["output_path"]:
                     files_to_delete.append(Path(c_row["output_path"]))
 
-            # Exclui arquivos físicos com segurança
-            for f in files_to_delete:
-                try:
-                    if f.exists() and f.is_file():
-                        f.unlink()
-                except Exception:
-                    pass
+            # Inclui caches de transcrição (atual em data/cache e legado em data/temp) associados ao vídeo
+            files_to_delete.append(DATA_DIR / "cache" / f"transcript_{video_id}.json")
+            files_to_delete.append(DATA_DIR / "temp" / f"transcript_{video_id}.json")
 
         cursor.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         conn.commit()
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+
+    if deleted and delete_files:
+        for f in files_to_delete:
+            try:
+                resolved = f.resolve()
+                if not resolved.is_relative_to(DATA_DIR):
+                    logger.warning("Exclusão física bloqueada por segurança (caminho fora de DATA_DIR): %s", f)
+                    continue
+                if resolved == target_db:
+                    logger.warning("Exclusão física bloqueada: tentativa de remover o arquivo do banco SQLite.")
+                    continue
+                if resolved.exists() and resolved.is_file():
+                    resolved.unlink()
+            except Exception as exc:
+                logger.warning("Falha ao remover arquivo físico '%s': %s", f.name, exc)
+
+    return deleted
 
 
 def add_corte(
@@ -220,19 +343,58 @@ def add_corte(
     justification: str = "",
     output_path: str = "",
     status: str = "pending",
-    db_path: Optional[Path] = None
+    db_path: Optional[Path] = None,
+    tipo: str = "short",
+    layout_mode: str = "vertical_blur",
+    layout_params: Optional[Dict[str, Any]] = None,
+    burn_subtitles: bool = True,
 ) -> int:
     """
-    Insere um corte associado a um vídeo e retorna o ID do corte.
+    Insere um corte associado a um vídeo com validação de domínio e retorna o ID inteiro do corte.
+    """
+    if isinstance(video_id, bool) or video_id is None:
+        raise ValueError(f"video_id inválido ao inserir corte: {video_id!r}")
+    try:
+        vid_int = int(video_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"video_id deve ser inteiro válido, recebido: {video_id!r}") from exc
+    if vid_int <= 0:
+        raise ValueError(f"video_id deve ser positivo, recebido: {vid_int}")
+
+    _validate_corte_bounds(start_time, end_time, virality_score)
+    lp_json = _serialize_layout_params(layout_params)
+    mode_clean = str(layout_mode or "vertical_blur").strip() or "vertical_blur"
+    tipo_clean = str(tipo or "short").strip().lower()
+    if tipo_clean not in ("short", "longo"):
+        tipo_clean = "short" if (float(end_time) - float(start_time)) <= 180.0 else "longo"
+
+    target_db = _resolve_db_path(db_path)
+    with get_connection(target_db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO cortes (
+                video_id, title, start_time, end_time, virality_score, justification,
+                tipo, layout_mode, layout_params, burn_subtitles, output_path, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            vid_int, str(title or ""), float(start_time), float(end_time), float(virality_score or 0.0),
+            str(justification or ""), tipo_clean, mode_clean, lp_json, 1 if burn_subtitles else 0,
+            str(output_path or ""), str(status or "pending")
+        ))
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def get_corte(corte_id: int, db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """
+    Busca um corte específico pelo ID. Retorna dicionário com layout_params desserializado ou None.
     """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO cortes (video_id, title, start_time, end_time, virality_score, justification, output_path, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (video_id, title, start_time, end_time, virality_score, justification, output_path, status))
-        conn.commit()
-        return cursor.lastrowid
+        cursor.execute("SELECT * FROM cortes WHERE id = ?", (corte_id,))
+        row = cursor.fetchone()
+        return _deserialize_corte_row(row) if row else None
 
 
 def list_cortes(
@@ -266,7 +428,89 @@ def list_cortes(
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
+        return [_deserialize_corte_row(row) for row in cursor.fetchall()]
+
+
+def update_corte(
+    corte_id: int,
+    title: Optional[str] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    virality_score: Optional[float] = None,
+    justification: Optional[str] = None,
+    tipo: Optional[str] = None,
+    layout_mode: Optional[str] = None,
+    layout_params: Optional[Dict[str, Any]] = None,
+    burn_subtitles: Optional[bool] = None,
+    output_path: Optional[str] = None,
+    status: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """
+    Atualiza parcialmente (PATCH) metadados, tempos, layout e status de um corte existente,
+    validando invariantes (start_time >= 0 e end_time > start_time) antes do UPDATE.
+    """
+    target_db = _resolve_db_path(db_path)
+    with get_connection(target_db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT start_time, end_time, virality_score FROM cortes WHERE id = ?", (corte_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            return False
+
+        eff_start = float(start_time) if start_time is not None else float(existing["start_time"])
+        eff_end = float(end_time) if end_time is not None else float(existing["end_time"])
+        eff_score = float(virality_score) if virality_score is not None else float(existing["virality_score"])
+        _validate_corte_bounds(eff_start, eff_end, eff_score)
+
+        updates = ["updated_at = CURRENT_TIMESTAMP"]
+        params: List[Any] = []
+
+        if title is not None:
+            updates.append("title = ?")
+            params.append(str(title))
+        if start_time is not None:
+            updates.append("start_time = ?")
+            params.append(eff_start)
+        if end_time is not None:
+            updates.append("end_time = ?")
+            params.append(eff_end)
+        if virality_score is not None:
+            updates.append("virality_score = ?")
+            params.append(eff_score)
+        if justification is not None:
+            updates.append("justification = ?")
+            params.append(str(justification))
+        if tipo is not None:
+            t_clean = str(tipo).strip().lower()
+            if t_clean not in ("short", "longo"):
+                raise ValueError(f"tipo inválido: {tipo!r}")
+            updates.append("tipo = ?")
+            params.append(t_clean)
+        if layout_mode is not None:
+            m_clean = str(layout_mode).strip()
+            if m_clean not in VALID_LAYOUT_MODES:
+                raise ValueError(f"layout_mode inválido: {layout_mode!r}")
+            updates.append("layout_mode = ?")
+            params.append(m_clean)
+        if layout_params is not None:
+            updates.append("layout_params = ?")
+            params.append(_serialize_layout_params(layout_params))
+        if burn_subtitles is not None:
+            updates.append("burn_subtitles = ?")
+            params.append(1 if burn_subtitles else 0)
+        if output_path is not None:
+            updates.append("output_path = ?")
+            params.append(str(output_path))
+        if status is not None:
+            updates.append("status = ?")
+            params.append(str(status))
+
+        params.append(corte_id)
+        query = f"UPDATE cortes SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, params)
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def update_corte_status(
@@ -278,37 +522,61 @@ def update_corte_status(
     """
     Atualiza o status e caminho de saída do corte processado.
     """
-    updates = ["status = ?"]
-    params: List[Any] = [status]
+    return update_corte(corte_id=corte_id, status=status, output_path=output_path, db_path=db_path)
 
-    if output_path is not None:
-        updates.append("output_path = ?")
-        params.append(output_path)
 
-    params.append(corte_id)
-    query = f"UPDATE cortes SET {', '.join(updates)} WHERE id = ?"
+def delete_corte(corte_id: int, delete_file: bool = False, db_path: Optional[Path] = None) -> bool:
+    """
+    Remove um corte individual pelo ID.
+    Se delete_file=True, remove o arquivo .mp4 associado confinado a DATA_DIR após o DELETE SQL.
+    """
+    target_db = _resolve_db_path(db_path)
+    out_file: Optional[Path] = None
 
-    with get_connection(db_path) as conn:
+    with get_connection(target_db) as conn:
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        if delete_file:
+            cursor.execute("SELECT output_path FROM cortes WHERE id = ?", (corte_id,))
+            row = cursor.fetchone()
+            if row and row["output_path"]:
+                out_file = Path(row["output_path"])
+
+        cursor.execute("DELETE FROM cortes WHERE id = ?", (corte_id,))
         conn.commit()
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+
+    if deleted and delete_file and out_file is not None:
+        try:
+            resolved = out_file.resolve()
+            if not resolved.is_relative_to(DATA_DIR) or resolved == target_db:
+                logger.warning("Exclusão física de corte bloqueada por segurança: %s", out_file)
+            elif resolved.exists() and resolved.is_file():
+                resolved.unlink()
+        except Exception as exc:
+            logger.warning("Falha ao remover arquivo físico do corte '%s': %s", out_file.name, exc)
+
+    return deleted
 
 
 def save_analysis(
-    video_id: int,
+    video_id: Optional[int],
     transcript: Any,
     analysis_data: Any,
-    db_path: Optional[Path] = None
+    db_path: Optional[Path] = None,
+    url: str = "",
+    title: str = "",
+    duration: float = 0.0,
+    file_path: str = "",
+    audio_path: str = "",
 ) -> List[int]:
     """
-    Salva a análise de cortes gerada pela IA para um determinado vídeo.
-    Compatível com listas de dicionários ou objetos contendo a chave 'cortes'.
-    Atualiza o status do vídeo para 'analyzed' e insere cada corte na tabela 'cortes'.
-    Retorna a lista de IDs dos cortes gerados.
+    Salva a análise de cortes gerada pela IA para um determinado vídeo de forma atômica.
+    Valida se o video_id inteiro existe na tabela 'videos' usando o mesmo db_path;
+    caso não exista (ou seja inválido), recupera pela URL ou cria o registro pai antes
+    de inserir em 'cortes', prevenindo 'FOREIGN KEY constraint failed'.
+    Retorna a lista de IDs inteiros dos cortes gerados.
     """
-    # Atualiza o status do vídeo
-    update_video_status(video_id=video_id, status="analyzed", db_path=db_path)
+    target_db = _resolve_db_path(db_path)
 
     # Normaliza lista de cortes
     cortes = []
@@ -317,19 +585,98 @@ def save_analysis(
     elif isinstance(analysis_data, list):
         cortes = analysis_data
 
-    inserted_ids: List[int] = []
-    for c in cortes:
-        if isinstance(c, dict):
-            c_id = add_corte(
-                video_id=video_id,
-                start_time=float(c.get("start_time", 0.0)),
-                end_time=float(c.get("end_time", 0.0)),
-                title=str(c.get("title", "")),
-                virality_score=float(c.get("virality_score", 0.0)),
-                justification=str(c.get("justification", "")),
-                status="pending",
-                db_path=db_path
+    # Tenta converter video_id para inteiro válido (evitando None, bool ou string URL)
+    effective_video_id: Optional[int] = None
+    if not isinstance(video_id, bool) and video_id is not None:
+        try:
+            parsed_id = int(video_id)
+            if parsed_id > 0:
+                effective_video_id = parsed_id
+        except (TypeError, ValueError):
+            if not url and isinstance(video_id, str) and video_id.strip():
+                url = video_id.strip()
+
+    with get_connection(target_db) as conn:
+        cursor = conn.cursor()
+
+        # 1. Verifica se o registro pai existe na tabela 'videos'
+        parent_exists = False
+        if effective_video_id is not None:
+            cursor.execute("SELECT id FROM videos WHERE id = ?", (effective_video_id,))
+            row = cursor.fetchone()
+            if row is not None:
+                effective_video_id = int(row["id"])
+                parent_exists = True
+
+        # 2. Caso não exista, tenta recuperar pela URL ou recria o registro pai no mesmo banco
+        if not parent_exists:
+            if url:
+                cursor.execute(
+                    "SELECT id FROM videos WHERE url = ? ORDER BY id DESC LIMIT 1",
+                    (url,)
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    effective_video_id = int(row["id"])
+                    parent_exists = True
+
+        if not parent_exists:
+            fallback_url = url.strip() if isinstance(url, str) and url.strip() else "unknown://recovered"
+            cursor.execute("""
+                INSERT INTO videos (url, title, duration, file_path, audio_path, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                fallback_url,
+                str(title or ""),
+                float(duration or 0.0),
+                str(file_path or ""),
+                str(audio_path or ""),
+                "analyzed",
+            ))
+            conn.commit()
+            effective_video_id = int(cursor.lastrowid)
+        else:
+            cursor.execute(
+                "UPDATE videos SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("analyzed", effective_video_id)
             )
-            inserted_ids.append(c_id)
+
+        # 3. Insere os cortes vinculados ao effective_video_id garantido na tabela 'videos'
+        inserted_ids: List[int] = []
+        for c in cortes:
+            if isinstance(c, dict):
+                c_start = max(0.0, float(c.get("start_time", 0.0)))
+                c_end = max(c_start + 0.5, float(c.get("end_time", 0.0)))
+                c_score = min(100.0, max(0.0, float(c.get("virality_score", 0.0))))
+                c_tipo = str(c.get("tipo", "short" if (c_end - c_start) <= 180.0 else "longo")).strip().lower()
+                if c_tipo not in ("short", "longo"):
+                    c_tipo = "short" if (c_end - c_start) <= 180.0 else "longo"
+                c_mode = str(c.get("layout_mode", "horizontal_16_9" if (c_tipo == "longo" or (c_end - c_start) >= 180.0) else "vertical_blur")).strip()
+                c_lp = _serialize_layout_params(c.get("layout_params") or ({"zoom_factor": 1.0} if c_mode == "vertical_blur" else {}))
+                c_subs = 1 if c.get("burn_subtitles", True) else 0
+
+                cursor.execute("""
+                    INSERT INTO cortes (
+                        video_id, title, start_time, end_time, virality_score, justification,
+                        tipo, layout_mode, layout_params, burn_subtitles, output_path, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    effective_video_id,
+                    str(c.get("title", "")),
+                    c_start,
+                    c_end,
+                    c_score,
+                    str(c.get("justification", "")),
+                    c_tipo,
+                    c_mode,
+                    c_lp,
+                    c_subs,
+                    "",
+                    "pending",
+                ))
+                inserted_ids.append(int(cursor.lastrowid))
+
+        conn.commit()
 
     return inserted_ids
