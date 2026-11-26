@@ -4,15 +4,17 @@ Substitui a interface Streamlit por uma API REST robusta e veloz,
 mantendo 100% dos motores Python existentes (yt-dlp, Groq Whisper, Gemini/Groq LLMs, OpenCV e FFmpeg).
 """
 
+import copy
 import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 import uuid
 
 # Garante inclusão do diretório raiz no sys.path e define BASE_DIR absoluto
@@ -20,12 +22,14 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.config import (
+    CACHE_DIR,
     FFMPEG_AVAILABLE,
     GEMINI_API_KEY,
     GROQ_API_KEY,
@@ -43,7 +47,6 @@ from core.ai_apis import detect_viral_moments, transcribe_audio_groq
 from core.video_engine import (
     cleanup_temporary_files,
     cut_video,
-    draw_framing_preview,
     extract_preview_clip,
     extract_preview_frame,
     get_video_metadata,
@@ -51,12 +54,15 @@ from core.video_engine import (
 from database.db_manager import (
     add_corte,
     add_video,
+    delete_corte,
     delete_video,
+    get_corte,
     get_video,
     init_db,
     list_cortes,
     list_videos,
     save_analysis,
+    update_corte,
     update_corte_status,
     update_video_status,
 )
@@ -72,15 +78,35 @@ logger = logging.getLogger("easykut_server")
 init_db()
 
 # Garante que as pastas de dados e web sejam criadas com caminhos absolutos baseados em BASE_DIR
-TEMP_DIR = BASE_DIR / "data" / "temp"
-CUTS_DIR = BASE_DIR / "data" / "cortes"
-DOWNLOADS_DIR = BASE_DIR / "data" / "downloads"
-WEB_DIR = BASE_DIR / "web"
+TEMP_DIR = (BASE_DIR / "data" / "temp").resolve()
+CUTS_DIR = (BASE_DIR / "data" / "cortes").resolve()
+DOWNLOADS_DIR = (BASE_DIR / "data" / "downloads").resolve()
+WEB_DIR = (BASE_DIR / "web").resolve()
 
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 CUTS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 WEB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_transcripts_to_cache() -> None:
+    """
+    Move arquivos transcript_*.json legados de data/temp/ (exposto via StaticFiles)
+    para data/cache/ (privado, não servido via HTTP).
+    """
+    for legacy_file in TEMP_DIR.glob("transcript_*.json"):
+        try:
+            dest = CACHE_DIR / legacy_file.name
+            if not dest.exists():
+                shutil.move(str(legacy_file), str(dest))
+            else:
+                legacy_file.unlink()
+        except Exception as exc:
+            logger.warning("Não foi possível migrar transcrição legada '%s': %s", legacy_file.name, exc)
+
+
+_migrate_legacy_transcripts_to_cache()
 
 # Instância FastAPI
 app = FastAPI(
@@ -89,27 +115,58 @@ app = FastAPI(
     description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais."
 )
 
-# Habilita CORS para origens locais e acesso direto
-origins = [
+# Política estrita de CORS e origens locais permitidas
+ALLOWED_ORIGINS = [
     "http://127.0.0.1:8502",
     "http://localhost:8502",
-    "http://127.0.0.1:8000",
-    "http://localhost:8000",
-    "http://127.0.0.1",
-    "http://localhost",
 ]
+ALLOWED_HOSTS = {
+    "127.0.0.1:8502",
+    "localhost:8502",
+    "testserver",
+    "testserver:80",
+}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
+
+@app.middleware("http")
+async def local_security_middleware(request: Request, call_next):
+    """
+    Proteção contra DNS rebinding, CSRF cross-origin em rotas mutáveis /api/*
+    e injeção de cabeçalhos defensivos padrão.
+    """
+    host_header = (request.headers.get("host") or "").strip().lower()
+    if host_header and host_header not in ALLOWED_HOSTS:
+        logger.warning("Requisição bloqueada por Host não permitido: %s", host_header)
+        return JSONResponse(status_code=403, content={"detail": "Host não autorizado."})
+
+    if request.url.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = (request.headers.get("origin") or "").strip()
+        if origin and origin not in ALLOWED_ORIGINS:
+            logger.warning("Requisição mutável bloqueada por Origin não permitido: %s", origin)
+            return JSONResponse(status_code=403, content={"detail": "Origem não autorizada."})
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
+
 # ==========================================
-# GERENCIAMENTO DE JOBS EM SEGUNDO PLANO
+# GERENCIAMENTO DE JOBS E LIMITES DE CONCORRÊNCIA
 # ==========================================
+MAX_CONCURRENT_ANALYZE_JOBS = 2
+MAX_CONCURRENT_RENDER_JOBS = 2
+preview_ffmpeg_semaphore = threading.Semaphore(2)
+
 jobs_lock = threading.Lock()
 jobs: Dict[str, Dict[str, Any]] = {}
 analyses_cache: Dict[int, Dict[str, Any]] = {}
@@ -143,39 +200,65 @@ def update_job(
 # ==========================================
 # MODELOS PYDANTIC (SCHEMAS)
 # ==========================================
+AllowedLayoutMode = Literal[
+    "horizontal_16_9",
+    "vertical_blur",
+    "manual_crop",
+    "split_screen",
+    "face_tracking_9_16",
+]
+
+
 class AnalyzeRequest(BaseModel):
     url: str
-    provider: Optional[str] = "gemini"
-    max_cuts: Optional[int] = 5
+    provider: Literal["gemini", "groq"] = "gemini"
+    max_cuts: int = Field(default=5, ge=1, le=20)
 
 
 class FrameRequest(BaseModel):
-    source: str
-    timestamp_sec: float = 1.0
+    video_id: Optional[int] = None
+    source: Optional[str] = None
+    timestamp_sec: float = Field(default=1.0, ge=0.0)
 
 
 class PreviewClipRequest(BaseModel):
     video_id: Optional[int] = None
-    source: str
-    start_time: float = 0.0
-    end_time: float = 30.0
+    source: Optional[str] = None
+    start_time: float = Field(default=0.0, ge=0.0)
+    end_time: float = Field(default=30.0, gt=0.0)
 
 
-class FramePreviewRequest(BaseModel):
-    frame_path: str
-    mode: str = "manual_crop"
-    params: Optional[Dict[str, Any]] = None
+class UpdateCorteRequest(BaseModel):
+    title: Optional[str] = None
+    start_time: Optional[float] = Field(default=None, ge=0.0)
+    end_time: Optional[float] = Field(default=None, gt=0.0)
+    tipo: Optional[Literal["short", "longo"]] = None
+    layout_mode: Optional[AllowedLayoutMode] = None
+    layout_params: Optional[Dict[str, Any]] = None
+    burn_subtitles: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_time_order(self):
+        if self.start_time is not None and self.end_time is not None and self.end_time <= self.start_time:
+            raise ValueError("end_time deve ser maior que start_time.")
+        return self
 
 
 class RenderCutItem(BaseModel):
     id: Optional[int] = None
     title: Optional[str] = None
     titulo: Optional[str] = None
-    start_time: float
-    end_time: float
-    layout_mode: Optional[str] = "vertical_blur"
+    start_time: float = Field(..., ge=0.0)
+    end_time: float = Field(..., gt=0.0)
+    layout_mode: AllowedLayoutMode = "vertical_blur"
     layout_params: Optional[Dict[str, Any]] = None
     burn_subtitles: Optional[bool] = True
+
+    @model_validator(mode="after")
+    def validate_time_order(self):
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time deve ser maior que start_time.")
+        return self
 
     def get_effective_title(self, fallback: str = "Corte") -> str:
         return self.titulo or self.title or fallback
@@ -184,7 +267,7 @@ class RenderCutItem(BaseModel):
 class RenderRequest(BaseModel):
     video_id: int
     cuts: List[RenderCutItem]
-    max_resolution: Optional[int] = 1080
+    max_resolution: Literal[720, 1080] = 1080
 
 
 # ==========================================
@@ -232,13 +315,15 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
             audio_path=audio_file,
             status="transcribing"
         )
+        if not isinstance(video_id, int) or video_id <= 0 or not get_video(video_id):
+            raise RuntimeError(f"Falha ao confirmar registro do vídeo na tabela 'videos' (video_id={video_id!r}).")
 
         # 2. Transcrição com Groq Whisper
         update_job(job_id, step="[2/4] Transcrevendo áudio com Groq Whisper-large-v3...", progress=45)
         transcript_data = transcribe_audio_groq(audio_file)
 
-        # Salva cache de transcrição em disco para reutilização na renderização
-        transcript_cache_path = TEMP_DIR / f"transcript_{video_id}.json"
+        # Salva cache de transcrição em data/cache/ (fora de StaticFiles) para reutilização na renderização
+        transcript_cache_path = CACHE_DIR / f"transcript_{video_id}.json"
         try:
             with open(transcript_cache_path, "w", encoding="utf-8") as f_cache:
                 json.dump(transcript_data, f_cache, ensure_ascii=False)
@@ -349,8 +434,27 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
                 "segments": cut_segs,
             })
 
+        # Garante que o registro pai (video_id inteiro) ainda existe na tabela 'videos' antes de inserir cortes
+        if not isinstance(video_id, int) or video_id <= 0 or not get_video(video_id):
+            logger.warning("video_id %r ausente em 'videos' antes de save_analysis; recriando registro pai.", video_id)
+            video_id = add_video(
+                url=url,
+                title=video_title,
+                duration=video_duration,
+                audio_path=audio_file,
+                status="analyzed"
+            )
+
         # Salva análise no banco SQLite e vincula IDs primários aos cortes formatados
-        inserted_ids = save_analysis(video_id=video_id, transcript=transcript_data, analysis_data=cortes_detectados)
+        inserted_ids = save_analysis(
+            video_id=video_id,
+            transcript=transcript_data,
+            analysis_data=cortes_detectados,
+            url=url,
+            title=video_title,
+            duration=video_duration,
+            audio_path=audio_file,
+        )
         for idx, c_fmt in enumerate(cortes_formatados):
             if idx < len(inserted_ids):
                 c_fmt["id"] = inserted_ids[idx]
@@ -384,20 +488,21 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
                 "transcript_segments": transcript_data.get("segments", []) or [],
             }
         )
-    except Exception as exc:
-        logger.exception("Erro crítico na esteira de análise (job %s): %s", job_id, exc)
-        if "video_id" in locals():
+    except Exception as e:
+        logger.exception("Erro crítico na esteira de análise (job %s): %s", job_id, e)
+        if "video_id" in locals() and isinstance(video_id, int) and video_id > 0:
             try:
                 update_video_status(video_id, status="failed")
             except Exception:
                 pass
-        update_job(
-            job_id,
-            status="failed",
-            step="Erro durante o processamento da análise",
-            progress=100,
-            error=str(exc)
-        )
+        with jobs_lock:
+            if job_id not in jobs:
+                jobs[job_id] = {"job_id": job_id, "type": "analyze"}
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["step"] = "Erro durante o processamento da análise"
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["updated_at"] = time.time()
 
 
 @app.post("/api/analyze")
@@ -415,6 +520,15 @@ def start_analyze(req: AnalyzeRequest):
 
     job_id = f"job_analyze_{uuid.uuid4().hex[:10]}"
     with jobs_lock:
+        active_analyze = sum(
+            1 for j in jobs.values()
+            if j.get("type") == "analyze" and j.get("status") == "running"
+        )
+        if active_analyze >= MAX_CONCURRENT_ANALYZE_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual."
+            )
         jobs[job_id] = {
             "job_id": job_id,
             "type": "analyze",
@@ -442,30 +556,89 @@ def start_analyze(req: AnalyzeRequest):
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
     """
-    Retorna o status atual, progresso em tempo real e resultado ou erro de um job.
+    Retorna uma cópia segura (deep copy) do status atual, progresso e resultado/erro de um job.
     """
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' não encontrado.")
-        return job
+        return copy.deepcopy(job)
+
+
+def _resolve_trusted_video_source(
+    video_id: Optional[int],
+    source: Optional[str]
+) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Resolve a fonte de vídeo exclusivamente a partir de registros confiáveis já cadastrados
+    (analyses_cache ou tabela SQLite 'videos'), prevenindo LFI (leitura de arquivos locais arbitrários) e SSRF.
+    Retorna (trusted_source_url, cached_stream_url, local_audio_path).
+    """
+    cached_stream: Optional[str] = None
+    local_audio: Optional[str] = None
+    trusted_url: Optional[str] = None
+
+    if video_id is not None:
+        if video_id in analyses_cache:
+            entry = analyses_cache[video_id]
+            trusted_url = entry.get("url")
+            cached_stream = entry.get("direct_stream_url")
+            local_audio = entry.get("audio_path")
+
+        if not trusted_url or not local_audio:
+            video_row = get_video(video_id)
+            if video_row:
+                trusted_url = trusted_url or video_row.get("url")
+                local_audio = local_audio or video_row.get("audio_path")
+
+    if not trusted_url and source:
+        clean_src = source.strip()
+        # Rejeita imediatamente caminhos locais ou URLs não autorizadas
+        if not is_valid_video_url(clean_src):
+            raise HTTPException(
+                status_code=400,
+                detail="Fonte de vídeo inválida ou não permitida. Informe um video_id cadastrado."
+            )
+        for entry in analyses_cache.values():
+            if entry.get("url") == clean_src:
+                trusted_url = clean_src
+                cached_stream = cached_stream or entry.get("direct_stream_url")
+                local_audio = local_audio or entry.get("audio_path")
+                break
+        if not trusted_url:
+            for row in list_videos():
+                if row.get("url") == clean_src:
+                    trusted_url = clean_src
+                    local_audio = local_audio or row.get("audio_path")
+                    break
+
+    if not trusted_url or not is_valid_video_url(trusted_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Vídeo não encontrado ou fonte não autorizada. Informe um video_id válido."
+        )
+
+    return trusted_url, cached_stream, local_audio
 
 
 @app.post("/api/frame")
 def get_frame(req: FrameRequest):
     """
-    Extrai 1 único frame JPEG (.jpg) no segundo especificado a partir de uma URL ou arquivo local.
+    Extrai 1 único frame JPEG (.jpg) no segundo especificado a partir de um vídeo previamente cadastrado.
     Reaproveita a URL direta de stream já em cache para evitar chamadas redundantes ao yt-dlp.
     """
-    try:
-        cached_stream = None
-        for entry in analyses_cache.values():
-            if entry.get("url") == req.source and entry.get("direct_stream_url"):
-                cached_stream = entry["direct_stream_url"]
-                break
+    trusted_url, cached_stream, _ = _resolve_trusted_video_source(req.video_id, req.source)
 
+    acquired = preview_ffmpeg_semaphore.acquire(timeout=1.5)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas extrações de prévia em andamento. Tente novamente em instantes."
+        )
+
+    try:
         frame_path = extract_preview_frame(
-            source=req.source,
+            source=trusted_url,
             timestamp_sec=req.timestamp_sec,
             direct_stream_url=cached_stream
         )
@@ -473,7 +646,7 @@ def get_frame(req: FrameRequest):
             if cached_stream:
                 logger.info("Tentando extrair frame novamente sem o stream URL em cache...")
                 frame_path = extract_preview_frame(
-                    source=req.source,
+                    source=trusted_url,
                     timestamp_sec=req.timestamp_sec,
                     direct_stream_url=None
                 )
@@ -483,13 +656,16 @@ def get_frame(req: FrameRequest):
         frame_url = f"/data/temp/{Path(frame_path).name}"
         return {
             "success": True,
-            "frame_path": frame_path,
             "frame_url": frame_url,
             "timestamp_sec": req.timestamp_sec,
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Erro ao extrair frame no tempo %s: %s", req.timestamp_sec, exc)
-        raise HTTPException(status_code=500, detail=f"Erro ao extrair frame: {exc}")
+        raise HTTPException(status_code=500, detail="Erro interno ao extrair frame de prévia.")
+    finally:
+        preview_ffmpeg_semaphore.release()
 
 
 @app.post("/api/preview-clip")
@@ -498,29 +674,21 @@ def get_preview_clip(req: PreviewClipRequest):
     Gera e retorna um clipe de vídeo leve (.mp4 com áudio) do intervalo [start_time, end_time]
     para reprodução em tempo real a 60fps no Canvas do Estúdio e no Mockup 9:16 antes da renderização.
     """
+    if req.end_time <= req.start_time:
+        raise HTTPException(status_code=400, detail="end_time deve ser maior que start_time.")
+
+    trusted_url, cached_stream, local_audio = _resolve_trusted_video_source(req.video_id, req.source)
+
+    acquired = preview_ffmpeg_semaphore.acquire(timeout=1.5)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas prévias em vídeo sendo geradas simultaneamente. Aguarde alguns segundos."
+        )
+
     try:
-        cached_stream = None
-        local_audio = None
-
-        if req.video_id and req.video_id in analyses_cache:
-            entry = analyses_cache[req.video_id]
-            cached_stream = entry.get("direct_stream_url")
-            local_audio = entry.get("audio_path")
-
-        if not cached_stream or not local_audio:
-            for entry in analyses_cache.values():
-                if entry.get("url") == req.source:
-                    cached_stream = cached_stream or entry.get("direct_stream_url")
-                    local_audio = local_audio or entry.get("audio_path")
-                    break
-
-        if not local_audio and req.video_id:
-            video_row = get_video(req.video_id)
-            if video_row and video_row.get("audio_path"):
-                local_audio = video_row["audio_path"]
-
         clip_path = extract_preview_clip(
-            source=req.source,
+            source=trusted_url,
             start_time=req.start_time,
             end_time=req.end_time,
             direct_stream_url=cached_stream,
@@ -532,38 +700,17 @@ def get_preview_clip(req: PreviewClipRequest):
         clip_url = f"/data/temp/{Path(clip_path).name}"
         return {
             "success": True,
-            "clip_path": clip_path,
             "clip_url": clip_url,
             "start_time": req.start_time,
             "end_time": req.end_time,
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Erro ao gerar clipe de prévia (%ss -> %ss): %s", req.start_time, req.end_time, exc)
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar clipe de prévia: {exc}")
-
-
-@app.post("/api/frame/preview")
-def get_frame_preview(req: FramePreviewRequest):
-    """
-    Aplica o enquadramento escolhido (manual_crop, split_screen, vertical_blur)
-    sobre o frame original gerando a miniatura visual ao vivo.
-    """
-    try:
-        preview_path = draw_framing_preview(
-            frame_path=req.frame_path,
-            mode=req.mode,
-            params=req.params
-        )
-        preview_url = f"/data/temp/{Path(preview_path).name}"
-        return {
-            "success": True,
-            "preview_path": preview_path,
-            "preview_url": preview_url,
-            "mode": req.mode,
-        }
-    except Exception as exc:
-        logger.error("Erro ao desenhar prévia de enquadramento: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar prévia de enquadramento: {exc}")
+        raise HTTPException(status_code=500, detail="Erro interno ao gerar clipe de prévia.")
+    finally:
+        preview_ffmpeg_semaphore.release()
 
 
 def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_resolution: int) -> None:
@@ -582,9 +729,11 @@ def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_r
             video_file = download_video(video["url"], max_resolution=max_resolution)
             update_video_status(video_id, status="cutting", file_path=video_file)
 
-        # 2. Carrega transcrição para legendas sincronizadas
+        # 2. Carrega transcrição de data/cache/ (privado) para legendas sincronizadas
         segments = []
-        transcript_cache_path = TEMP_DIR / f"transcript_{video_id}.json"
+        transcript_cache_path = CACHE_DIR / f"transcript_{video_id}.json"
+        if not transcript_cache_path.exists():
+            transcript_cache_path = TEMP_DIR / f"transcript_{video_id}.json"
         if transcript_cache_path.exists():
             try:
                 with open(transcript_cache_path, "r", encoding="utf-8") as f_tr:
@@ -608,18 +757,30 @@ def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_r
                 progress=pct
             )
 
-            # Insere ou atualiza o corte no banco SQLite
+            # Insere ou atualiza todos os campos editados do corte no banco SQLite
             corte_db_id = c.id
-            if not corte_db_id:
+            if not corte_db_id or not get_corte(corte_db_id):
                 corte_db_id = add_corte(
                     video_id=video_id,
                     start_time=c.start_time,
                     end_time=c.end_time,
                     title=cut_title,
+                    layout_mode=c.layout_mode,
+                    layout_params=c.layout_params,
+                    burn_subtitles=bool(c.burn_subtitles),
                     status="rendering"
                 )
             else:
-                update_corte_status(corte_db_id, status="rendering")
+                update_corte(
+                    corte_db_id,
+                    title=cut_title,
+                    start_time=c.start_time,
+                    end_time=c.end_time,
+                    layout_mode=c.layout_mode,
+                    layout_params=c.layout_params,
+                    burn_subtitles=bool(c.burn_subtitles),
+                    status="rendering"
+                )
 
             # Renderiza via FFmpeg com o layout e parâmetros exatos
             output_clip = cut_video(
@@ -659,18 +820,19 @@ def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_r
         )
     except Exception as exc:
         logger.exception("Erro crítico na esteira de renderização (job %s): %s", job_id, exc)
-        if "video_id" in locals():
+        if "video_id" in locals() and isinstance(video_id, int) and video_id > 0:
             try:
                 update_video_status(video_id, status="failed")
             except Exception:
                 pass
-        update_job(
-            job_id,
-            status="failed",
-            step="Erro durante a renderização com FFmpeg",
-            progress=100,
-            error=str(exc)
-        )
+        with jobs_lock:
+            if job_id not in jobs:
+                jobs[job_id] = {"job_id": job_id, "type": "render"}
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["step"] = "Erro durante a renderização com FFmpeg"
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["error"] = str(exc)
+            jobs[job_id]["updated_at"] = time.time()
 
 
 @app.post("/api/render")
@@ -688,6 +850,15 @@ def start_render(req: RenderRequest):
 
     job_id = f"job_render_{uuid.uuid4().hex[:10]}"
     with jobs_lock:
+        active_render = sum(
+            1 for j in jobs.values()
+            if j.get("type") == "render" and j.get("status") == "running"
+        )
+        if active_render >= MAX_CONCURRENT_RENDER_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar."
+            )
         jobs[job_id] = {
             "job_id": job_id,
             "type": "render",
@@ -764,9 +935,62 @@ def delete_history_item(
     success = delete_video(video_id=video_id, delete_files=delete_files)
     if not success:
         raise HTTPException(status_code=404, detail=f"Vídeo ID {video_id} não encontrado.")
+    analyses_cache.pop(video_id, None)
     return {
         "success": True,
         "message": f"Vídeo ID {video_id} {'e arquivos físicos ' if delete_files else ''}removido com sucesso."
+    }
+
+
+@app.get("/api/cortes/{corte_id}")
+def get_corte_item(corte_id: int):
+    """Retorna os metadados completos de um corte individual pelo ID."""
+    corte = get_corte(corte_id)
+    if not corte:
+        raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
+    out_p = corte.get("output_path", "")
+    corte["video_url"] = f"/data/cortes/{Path(out_p).name}" if (out_p and os.path.exists(out_p)) else None
+    return corte
+
+
+@app.patch("/api/cortes/{corte_id}")
+def patch_corte_item(corte_id: int, req: UpdateCorteRequest):
+    """Atualiza parcialmente título, tempos, layout e legendas de um corte no SQLite."""
+    try:
+        updated = update_corte(
+            corte_id=corte_id,
+            title=req.title,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            tipo=req.tipo,
+            layout_mode=req.layout_mode,
+            layout_params=req.layout_params,
+            burn_subtitles=req.burn_subtitles,
+        )
+    except ValueError as val_exc:
+        raise HTTPException(status_code=400, detail=str(val_exc))
+
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
+
+    return {
+        "success": True,
+        "corte": get_corte(corte_id),
+    }
+
+
+@app.delete("/api/cortes/{corte_id}")
+def delete_corte_item(
+    corte_id: int,
+    delete_file: bool = Query(False, description="Apagar também o arquivo .mp4 renderizado do disco")
+):
+    """Remove um corte individual do SQLite com opção de exclusão física segura."""
+    success = delete_corte(corte_id=corte_id, delete_file=delete_file)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
+    return {
+        "success": True,
+        "message": f"Corte ID {corte_id} {'e arquivo físico ' if delete_file else ''}removido com sucesso."
     }
 
 
@@ -783,11 +1007,11 @@ def open_folder():
             subprocess.Popen(["explorer", cuts_abs])
         return {
             "success": True,
-            "message": f"Pasta aberta no Explorador: {cuts_abs}"
+            "message": "Pasta data/cortes/ aberta no Explorador de Arquivos."
         }
     except Exception as exc:
         logger.error("Erro ao abrir pasta data/cortes/: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Erro ao abrir pasta no Explorador: {exc}")
+        raise HTTPException(status_code=500, detail="Erro interno ao abrir pasta de cortes no Explorador.")
 
 
 # ==========================================
