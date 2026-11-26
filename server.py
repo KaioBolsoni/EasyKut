@@ -1,19 +1,17 @@
 """
-EasyKut Studio (v3.0) - Servidor Web Local FastAPI
-Substitui a interface Streamlit por uma API REST robusta e veloz,
-mantendo 100% dos motores Python existentes (yt-dlp, Groq Whisper, Gemini/Groq LLMs, OpenCV e FFmpeg).
+Servidor Backend FastAPI do EasyKut Studio (V3.0)
+Camada HTTP fina responsável por rotas REST, contratos Pydantic/OpenAPI,
+hardening de segurança local, observabilidade (X-Request-ID, /api/health) e arquivos estáticos.
 """
 
-import copy
-import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 import threading
-import time
 from typing import Any, Dict, List, Literal, Optional
 import uuid
 
@@ -22,72 +20,64 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
+from core.ai_apis import detect_viral_moments, transcribe_audio_groq
 from core.config import (
     CACHE_DIR,
+    DATA_DIR,
     FFMPEG_AVAILABLE,
-    GEMINI_API_KEY,
-    GROQ_API_KEY,
     validate_config,
 )
 from core.downloader import (
-    download_audio,
     download_audio_with_metadata,
     download_video,
-    extract_video_info,
-    get_direct_stream_url,
     is_valid_video_url,
 )
-from core.ai_apis import detect_viral_moments, transcribe_audio_groq
+from core.logging_config import configure_logging, request_id_var
+from core.media_utils import normalize_virality_score
 from core.video_engine import (
     cleanup_temporary_files,
     cut_video,
     extract_preview_clip,
     extract_preview_frame,
-    get_video_metadata,
 )
 from database.db_manager import (
-    add_corte,
-    add_video,
     delete_corte,
     delete_video,
+    get_connection,
     get_corte,
     get_video,
     init_db,
-    list_cortes,
-    list_videos,
-    save_analysis,
+    list_videos_with_cortes,
     update_corte,
-    update_corte_status,
-    update_video_status,
+)
+from services.job_manager import job_manager
+from services.media_service import (
+    resolve_trusted_video_source as _service_resolve_source,
+    run_analyze_job as _service_run_analyze_job,
+    run_render_job as _service_run_render_job,
 )
 
-# Configuração de Logs
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+# Configuração de Logging Rotativo + Correlation ID
+configure_logging()
 logger = logging.getLogger("easykut_server")
 
-# Inicializa o banco de dados SQLite
+# Inicializa banco de dados SQLite (migrations v1 -> v3)
 init_db()
 
-# Garante que as pastas de dados e web sejam criadas com caminhos absolutos baseados em BASE_DIR
+# Pastas de dados e interface web
 TEMP_DIR = (BASE_DIR / "data" / "temp").resolve()
 CUTS_DIR = (BASE_DIR / "data" / "cortes").resolve()
 DOWNLOADS_DIR = (BASE_DIR / "data" / "downloads").resolve()
 WEB_DIR = (BASE_DIR / "web").resolve()
 
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-CUTS_DIR.mkdir(parents=True, exist_ok=True)
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-WEB_DIR.mkdir(parents=True, exist_ok=True)
+for _d in (TEMP_DIR, CUTS_DIR, DOWNLOADS_DIR, CACHE_DIR, WEB_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 
 def _migrate_legacy_transcripts_to_cache() -> None:
@@ -107,12 +97,14 @@ def _migrate_legacy_transcripts_to_cache() -> None:
 
 
 _migrate_legacy_transcripts_to_cache()
+# GC automático de arquivos temporários com mais de 24h no startup
+cleanup_temporary_files(temp_dir=TEMP_DIR, remove_raw_downloads=False, max_age_hours=24.0)
 
 # Instância FastAPI
 app = FastAPI(
     title="EasyKut Studio API",
-    version="3.0.0",
-    description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais."
+    version="3.1.0",
+    description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais.",
 )
 
 # Política estrita de CORS e origens locais permitidas
@@ -132,44 +124,59 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept"],
+    allow_headers=["Content-Type", "Accept", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "X-Total-Count"],
 )
 
 
 @app.middleware("http")
 async def local_security_middleware(request: Request, call_next):
     """
-    Proteção contra DNS rebinding, CSRF cross-origin em rotas mutáveis /api/*
-    e injeção de cabeçalhos defensivos padrão.
+    Proteção contra DNS rebinding, CSRF cross-origin em rotas mutáveis /api/*,
+    rastreamento por X-Request-ID e injeção de cabeçalhos defensivos padrão.
     """
-    host_header = (request.headers.get("host") or "").strip().lower()
-    if host_header and host_header not in ALLOWED_HOSTS:
-        logger.warning("Requisição bloqueada por Host não permitido: %s", host_header)
-        return JSONResponse(status_code=403, content={"detail": "Host não autorizado."})
+    incoming_req_id = (request.headers.get("x-request-id") or "").strip()
+    if incoming_req_id and re.fullmatch(r"[A-Za-z0-9_.-]{4,64}", incoming_req_id):
+        req_id = incoming_req_id
+    else:
+        req_id = uuid.uuid4().hex[:12]
 
-    if request.url.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        origin = (request.headers.get("origin") or "").strip()
-        if origin and origin not in ALLOWED_ORIGINS:
-            logger.warning("Requisição mutável bloqueada por Origin não permitido: %s", origin)
-            return JSONResponse(status_code=403, content={"detail": "Origem não autorizada."})
+    token = request_id_var.set(req_id)
+    try:
+        host_header = (request.headers.get("host") or "").strip().lower()
+        if host_header and host_header not in ALLOWED_HOSTS:
+            logger.warning("Requisição bloqueada por Host não permitido: %s", host_header)
+            resp = JSONResponse(status_code=403, content={"detail": "Host não autorizado."})
+            resp.headers["X-Request-ID"] = req_id
+            return resp
 
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "same-origin")
-    return response
+        if request.url.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = (request.headers.get("origin") or "").strip()
+            if origin and origin not in ALLOWED_ORIGINS:
+                logger.warning("Requisição mutável bloqueada por Origin não permitido: %s", origin)
+                resp = JSONResponse(status_code=403, content={"detail": "Origem não autorizada."})
+                resp.headers["X-Request-ID"] = req_id
+                return resp
+
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers["X-Request-ID"] = req_id
+        return response
+    finally:
+        request_id_var.reset(token)
 
 
 # ==========================================
-# GERENCIAMENTO DE JOBS E LIMITES DE CONCORRÊNCIA
+# ALIASES DE ESTADO (DELEGADOS AO JobManager)
 # ==========================================
-MAX_CONCURRENT_ANALYZE_JOBS = 2
-MAX_CONCURRENT_RENDER_JOBS = 2
-preview_ffmpeg_semaphore = threading.Semaphore(2)
-
-jobs_lock = threading.Lock()
-jobs: Dict[str, Dict[str, Any]] = {}
-analyses_cache: Dict[int, Dict[str, Any]] = {}
+MAX_CONCURRENT_ANALYZE_JOBS = job_manager.max_concurrent_analyze
+MAX_CONCURRENT_RENDER_JOBS = job_manager.max_concurrent_render
+preview_ffmpeg_semaphore = job_manager.preview_ffmpeg_semaphore
+jobs_lock = job_manager.lock
+jobs = job_manager.jobs
+analyses_cache = job_manager.analyses_cache
 
 
 def update_job(
@@ -178,27 +185,20 @@ def update_job(
     step: Optional[str] = None,
     progress: Optional[int] = None,
     result: Optional[Any] = None,
-    error: Optional[str] = None
+    error: Optional[str] = None,
 ) -> None:
-    """Atualiza o estado de um job de processamento de forma thread-safe."""
-    with jobs_lock:
-        if job_id not in jobs:
-            return
-        if status is not None:
-            jobs[job_id]["status"] = status
-        if step is not None:
-            jobs[job_id]["step"] = step
-        if progress is not None:
-            jobs[job_id]["progress"] = progress
-        if result is not None:
-            jobs[job_id]["result"] = result
-        if error is not None:
-            jobs[job_id]["error"] = error
-        jobs[job_id]["updated_at"] = time.time()
+    job_manager.update_job(
+        job_id=job_id,
+        status=status,
+        step=step,
+        progress=progress,
+        result=result,
+        error=error,
+    )
 
 
 # ==========================================
-# MODELOS PYDANTIC (SCHEMAS)
+# MODELOS PYDANTIC (REQUEST & RESPONSE SCHEMAS)
 # ==========================================
 AllowedLayoutMode = Literal[
     "horizontal_16_9",
@@ -270,377 +270,213 @@ class RenderRequest(BaseModel):
     max_resolution: Literal[720, 1080] = 1080
 
 
+class CleanupRequest(BaseModel):
+    remove_raw_downloads: bool = False
+    max_age_hours: Optional[float] = Field(default=None, ge=0.0)
+
+
+class JobAcceptedResponse(BaseModel):
+    job_id: str
+    message: str
+
+
+class ConfigResponse(BaseModel):
+    ready: bool
+    keys: Dict[str, bool]
+    default_provider: Literal["gemini", "groq"]
+    status_details: Dict[str, Any]
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "degraded"]
+    version: str
+    db_ok: bool
+    ffmpeg_available: bool
+    disk_free_mb: float
+    active_jobs: Dict[str, int]
+
+
+class FrameResponse(BaseModel):
+    success: bool
+    frame_url: str
+    timestamp_sec: float
+
+
+class PreviewClipResponse(BaseModel):
+    success: bool
+    clip_url: str
+    start_time: float
+    end_time: float
+
+
+class CleanupResponse(BaseModel):
+    success: bool
+    deleted_count: int
+    freed_mb: float
+    pruned_jobs: int
+    pruned_cache: int
+
+
+class MessageResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class CorteMutationResponse(BaseModel):
+    success: bool
+    corte: Dict[str, Any]
+
+
+# ==========================================
+# WRAPPERS INTERNOS DE SERVIÇO
+# ==========================================
+def _resolve_trusted_video_source(
+    video_id: Optional[int],
+    source: Optional[str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    return _service_resolve_source(video_id=video_id, source=source, manager=job_manager)
+
+
+def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> None:
+    _service_run_analyze_job(
+        job_id=job_id,
+        url=url,
+        provider=provider,
+        max_cuts=max_cuts,
+        manager=job_manager,
+        cache_dir=CACHE_DIR,
+        download_audio_fn=download_audio_with_metadata,
+        transcribe_fn=transcribe_audio_groq,
+        detect_fn=detect_viral_moments,
+        extract_frame_fn=extract_preview_frame,
+    )
+
+
+def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_resolution: int) -> None:
+    _service_run_render_job(
+        job_id=job_id,
+        video_id=video_id,
+        cuts=cuts,
+        max_resolution=max_resolution,
+        manager=job_manager,
+        cache_dir=CACHE_DIR,
+        temp_dir=TEMP_DIR,
+        download_video_fn=download_video,
+        cut_video_fn=cut_video,
+    )
+
+
 # ==========================================
 # ROTAS DA API REST (/api)
 # ==========================================
-@app.get("/api/config")
+@app.get("/api/health", response_model=HealthResponse)
+def health_check(response: Response):
+    """Healthcheck operacional: verifica SQLite, FFmpeg, espaço em disco e fila de jobs."""
+    db_ok = False
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT 1;").fetchone()
+        db_ok = True
+    except Exception as exc:
+        logger.error("Healthcheck SQLite falhou: %s", exc)
+
+    try:
+        disk_usage = shutil.disk_usage(str(DATA_DIR))
+        disk_free_mb = round(disk_usage.free / (1024 * 1024), 1)
+    except Exception:
+        disk_free_mb = -1.0
+
+    counts = job_manager.active_counts()
+    is_healthy = db_ok
+    if not is_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return HealthResponse(
+        status="ok" if is_healthy else "degraded",
+        version=app.version,
+        db_ok=db_ok,
+        ffmpeg_available=bool(FFMPEG_AVAILABLE),
+        disk_free_mb=disk_free_mb,
+        active_jobs=counts,
+    )
+
+
+@app.get("/api/config", response_model=ConfigResponse)
 def get_config():
-    """
-    Retorna o status de conexão das chaves de API (Groq, Gemini),
-    disponibilidade do FFmpeg, presença de cookies.txt e provedor padrão recomendado.
-    """
+    """Retorna o status das chaves de API, disponibilidade do FFmpeg, cookies e provedor padrão."""
     is_ready, details = validate_config()
-    return {
-        "ready": is_ready,
-        "keys": {
+    return ConfigResponse(
+        ready=is_ready,
+        keys={
             "GROQ_API_KEY": bool(details.get("GROQ_API_KEY")),
             "GEMINI_API_KEY": bool(details.get("GEMINI_API_KEY")),
             "FFMPEG_AVAILABLE": bool(details.get("FFMPEG")),
             "COOKIES_TXT": bool(details.get("COOKIES_TXT")),
         },
-        "default_provider": "gemini" if details.get("GEMINI_API_KEY") else "groq",
-        "status_details": details,
-    }
+        default_provider="gemini" if details.get("GEMINI_API_KEY") else "groq",
+        status_details=details,
+    )
 
 
-def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> None:
-    """Thread de execução em background da esteira de ingestão e curadoria IA (1 única chamada yt-dlp)."""
-    try:
-        # 1. Ingestão unificada: Metadados + Download de Áudio + Stream URL em 1 única chamada yt-dlp
-        update_job(job_id, step="[1/4] Extraindo metadados e baixando áudio leve (1 chamada yt-dlp)...", progress=15)
-        ingest = download_audio_with_metadata(url)
-        info = ingest["info"]
-        audio_file = ingest["audio_path"]
-        direct_stream_url = ingest.get("direct_stream_url")
-
-        video_title = info.get("title", "Vídeo Sem Título")
-        video_duration = float(info.get("duration", 0.0))
-        video_thumbnail = info.get("thumbnail", "")
-        video_uploader = info.get("uploader", "")
-
-        video_id = add_video(
-            url=url,
-            title=video_title,
-            duration=video_duration,
-            audio_path=audio_file,
-            status="transcribing"
-        )
-        if not isinstance(video_id, int) or video_id <= 0 or not get_video(video_id):
-            raise RuntimeError(f"Falha ao confirmar registro do vídeo na tabela 'videos' (video_id={video_id!r}).")
-
-        # 2. Transcrição com Groq Whisper
-        update_job(job_id, step="[2/4] Transcrevendo áudio com Groq Whisper-large-v3...", progress=45)
-        transcript_data = transcribe_audio_groq(audio_file)
-
-        # Salva cache de transcrição em data/cache/ (fora de StaticFiles) para reutilização na renderização
-        transcript_cache_path = CACHE_DIR / f"transcript_{video_id}.json"
-        try:
-            with open(transcript_cache_path, "w", encoding="utf-8") as f_cache:
-                json.dump(transcript_data, f_cache, ensure_ascii=False)
-        except Exception as exc_cache:
-            logger.warning("Falha ao salvar cache de transcrição: %s", exc_cache)
-
-        # 3. Detecção de momentos virais com IA
-        prov_clean = (provider or "gemini").lower().strip()
-        update_job(job_id, step=f"[3/4] Analisando momentos de retenção com {prov_clean.upper()}...", progress=70)
-        cortes_detectados = detect_viral_moments(transcript_data, provider=prov_clean)
-
-        if not cortes_detectados:
-            update_video_status(video_id, status="completed_no_cuts")
-            update_job(
-                job_id,
-                status="completed",
-                step="Análise finalizada: Nenhum corte viral detectado pela IA.",
-                progress=100,
-                result={
-                    "video_id": video_id,
-                    "url": url,
-                    "title": video_title,
-                    "duration": video_duration,
-                    "thumbnail": video_thumbnail,
-                    "uploader": video_uploader,
-                    "cortes": []
-                }
-            )
-            return
-
-        # Ordena cortes por virality_score decrescente (0-100)
-        def _get_score(c):
-            val = float(c.get("virality_score", 0.0) or 0.0)
-            return val * 10.0 if (0.0 < val <= 10.0) else val
-
-        cortes_detectados.sort(key=_get_score, reverse=True)
-
-        # 4. Captura automática de frames de prévia reaproveitando o stream já obtido (zero novas chamadas yt-dlp)
-        update_job(job_id, step=f"[4/4] Capturando frames reais de prévia para {len(cortes_detectados)} cortes...", progress=85)
-
-        cortes_formatados: List[Dict[str, Any]] = []
-        for idx, c in enumerate(cortes_detectados):
-            c_start = float(c.get("start_time", 0.0))
-            c_end = float(c.get("end_time", 0.0))
-            c_dur = max(1.0, c_end - c_start)
-            c_tipo = str(c.get("tipo", "short")).lower().strip()
-
-            # Modo padrão inicial: horizontal para vídeos longos (7+ min), senão vertical_blur
-            if c_tipo == "longo" or c_dur >= 180.0:
-                modo_inicial = "horizontal_16_9"
-            else:
-                modo_inicial = "vertical_blur"
-
-            # Captura frame real via FFmpeg; se falhar, utiliza thumbnail do YouTube como fallback visual garantido
-            ts_frame = max(0.0, c_start + min(1.5, c_dur / 2.0))
-            frame_path = ""
-            frame_url = ""
-            try:
-                frame_path = extract_preview_frame(
-                    source=url,
-                    timestamp_sec=ts_frame,
-                    direct_stream_url=direct_stream_url
-                )
-                if frame_path and os.path.exists(frame_path):
-                    frame_url = f"/data/temp/{Path(frame_path).name}"
-                else:
-                    frame_path = ""
-                    frame_url = ""
-            except Exception as exc_frame:
-                logger.warning("Falha ao extrair frame de preview do corte %d: %s", idx, exc_frame)
-                frame_path = ""
-                frame_url = ""
-
-            # Fallback resiliente: se a captura do frame falhar, usa a thumbnail oficial para manter a prévia ativa
-            if not frame_url and video_thumbnail:
-                frame_url = video_thumbnail
-
-            raw_sc = float(c.get("virality_score", 80.0) or 80.0)
-            norm_sc = raw_sc * 10.0 if (0.0 < raw_sc <= 10.0) else raw_sc
-
-            # Filtra segmentos da transcrição pertencentes a este corte para legenda ao vivo e prévia textual
-            all_segs = transcript_data.get("segments", []) or []
-            cut_segs = [
-                {
-                    "start": round(float(s.get("start", 0.0)), 2),
-                    "end": round(float(s.get("end", 0.0)), 2),
-                    "text": str(s.get("text", "")).strip(),
-                }
-                for s in all_segs
-                if float(s.get("end", 0.0)) > c_start and float(s.get("start", 0.0)) < c_end and str(s.get("text", "")).strip()
-            ]
-
-            cortes_formatados.append({
-                "idx": idx,
-                "selected": (idx < max_cuts),
-                "title": str(c.get("title", f"Corte #{idx+1}")),
-                "start_time": c_start,
-                "end_time": c_end,
-                "duration": round(c_dur, 1),
-                "virality_score": round(min(100.0, max(0.0, norm_sc)), 0),
-                "tipo": c_tipo,
-                "justification": str(c.get("justification", "")),
-                "layout_mode": modo_inicial,
-                "layout_params": {"zoom_factor": 1.0} if modo_inicial == "vertical_blur" else {},
-                "burn_subtitles": True,
-                "frame_path": frame_path,
-                "frame_url": frame_url,
-                "segments": cut_segs,
-            })
-
-        # Garante que o registro pai (video_id inteiro) ainda existe na tabela 'videos' antes de inserir cortes
-        if not isinstance(video_id, int) or video_id <= 0 or not get_video(video_id):
-            logger.warning("video_id %r ausente em 'videos' antes de save_analysis; recriando registro pai.", video_id)
-            video_id = add_video(
-                url=url,
-                title=video_title,
-                duration=video_duration,
-                audio_path=audio_file,
-                status="analyzed"
-            )
-
-        # Salva análise no banco SQLite e vincula IDs primários aos cortes formatados
-        inserted_ids = save_analysis(
-            video_id=video_id,
-            transcript=transcript_data,
-            analysis_data=cortes_detectados,
-            url=url,
-            title=video_title,
-            duration=video_duration,
-            audio_path=audio_file,
-        )
-        for idx, c_fmt in enumerate(cortes_formatados):
-            if idx < len(inserted_ids):
-                c_fmt["id"] = inserted_ids[idx]
-
-        # Cache em memória (inclui direct_stream_url e audio_path para /api/frame e /api/preview-clip)
-        analyses_cache[video_id] = {
-            "transcript_data": transcript_data,
-            "url": url,
-            "title": video_title,
-            "duration": video_duration,
-            "thumbnail": video_thumbnail,
-            "uploader": video_uploader,
-            "direct_stream_url": direct_stream_url,
-            "audio_path": audio_file,
-        }
-
-        # Conclui o job
-        update_job(
-            job_id,
-            status="completed",
-            step="Análise e extração de prévias concluídas com sucesso!",
-            progress=100,
-            result={
-                "video_id": video_id,
-                "url": url,
-                "title": video_title,
-                "duration": video_duration,
-                "thumbnail": video_thumbnail,
-                "uploader": video_uploader,
-                "cortes": cortes_formatados,
-                "transcript_segments": transcript_data.get("segments", []) or [],
-            }
-        )
-    except Exception as e:
-        logger.exception("Erro crítico na esteira de análise (job %s): %s", job_id, e)
-        if "video_id" in locals() and isinstance(video_id, int) and video_id > 0:
-            try:
-                update_video_status(video_id, status="failed")
-            except Exception:
-                pass
-        with jobs_lock:
-            if job_id not in jobs:
-                jobs[job_id] = {"job_id": job_id, "type": "analyze"}
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["step"] = "Erro durante o processamento da análise"
-            jobs[job_id]["progress"] = 100
-            jobs[job_id]["error"] = str(e)
-            jobs[job_id]["updated_at"] = time.time()
-
-
-@app.post("/api/analyze")
+@app.post("/api/analyze", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
 def start_analyze(req: AnalyzeRequest):
-    """
-    Inicia a esteira de análise assíncrona para uma URL de vídeo.
-    Retorna imediatamente um job_id para acompanhamento pelo frontend.
-    """
+    """Inicia a esteira assíncrona de análise IA para uma URL suportada (retorna 202 Accepted)."""
     target_url = (req.url or "").strip()
-    if not target_url.startswith("http://") and not target_url.startswith("https://"):
+    if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
 
     if not is_valid_video_url(target_url):
         raise HTTPException(status_code=400, detail="URL de vídeo inválida ou não suportada.")
 
-    job_id = f"job_analyze_{uuid.uuid4().hex[:10]}"
-    with jobs_lock:
-        active_analyze = sum(
-            1 for j in jobs.values()
-            if j.get("type") == "analyze" and j.get("status") == "running"
+    job_id = job_manager.create_job(
+        job_type="analyze",
+        step="Iniciando esteira de análise...",
+        progress=5,
+    )
+    if job_id is None:
+        raise HTTPException(
+            status_code=429,
+            detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual.",
         )
-        if active_analyze >= MAX_CONCURRENT_ANALYZE_JOBS:
-            raise HTTPException(
-                status_code=429,
-                detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual."
-            )
-        jobs[job_id] = {
-            "job_id": job_id,
-            "type": "analyze",
-            "status": "running",
-            "step": "Iniciando esteira de análise...",
-            "progress": 5,
-            "result": None,
-            "error": None,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
 
     threading.Thread(
         target=_run_analyze_job,
         args=(job_id, target_url, req.provider or "gemini", req.max_cuts or 5),
-        daemon=True
+        daemon=True,
     ).start()
 
-    return {
-        "job_id": job_id,
-        "message": "Análise de vídeo iniciada com sucesso em segundo plano."
-    }
+    return JobAcceptedResponse(
+        job_id=job_id,
+        message="Análise de vídeo iniciada com sucesso em segundo plano.",
+    )
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
-    """
-    Retorna uma cópia segura (deep copy) do status atual, progresso e resultado/erro de um job.
-    """
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' não encontrado.")
-        return copy.deepcopy(job)
+    """Retorna cópia profunda segura do estado atual, progresso e resultado/erro de um job."""
+    snapshot = job_manager.get_job_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' não encontrado.")
+    return snapshot
 
 
-def _resolve_trusted_video_source(
-    video_id: Optional[int],
-    source: Optional[str]
-) -> tuple[str, Optional[str], Optional[str]]:
-    """
-    Resolve a fonte de vídeo exclusivamente a partir de registros confiáveis já cadastrados
-    (analyses_cache ou tabela SQLite 'videos'), prevenindo LFI (leitura de arquivos locais arbitrários) e SSRF.
-    Retorna (trusted_source_url, cached_stream_url, local_audio_path).
-    """
-    cached_stream: Optional[str] = None
-    local_audio: Optional[str] = None
-    trusted_url: Optional[str] = None
-
-    if video_id is not None:
-        if video_id in analyses_cache:
-            entry = analyses_cache[video_id]
-            trusted_url = entry.get("url")
-            cached_stream = entry.get("direct_stream_url")
-            local_audio = entry.get("audio_path")
-
-        if not trusted_url or not local_audio:
-            video_row = get_video(video_id)
-            if video_row:
-                trusted_url = trusted_url or video_row.get("url")
-                local_audio = local_audio or video_row.get("audio_path")
-
-    if not trusted_url and source:
-        clean_src = source.strip()
-        # Rejeita imediatamente caminhos locais ou URLs não autorizadas
-        if not is_valid_video_url(clean_src):
-            raise HTTPException(
-                status_code=400,
-                detail="Fonte de vídeo inválida ou não permitida. Informe um video_id cadastrado."
-            )
-        for entry in analyses_cache.values():
-            if entry.get("url") == clean_src:
-                trusted_url = clean_src
-                cached_stream = cached_stream or entry.get("direct_stream_url")
-                local_audio = local_audio or entry.get("audio_path")
-                break
-        if not trusted_url:
-            for row in list_videos():
-                if row.get("url") == clean_src:
-                    trusted_url = clean_src
-                    local_audio = local_audio or row.get("audio_path")
-                    break
-
-    if not trusted_url or not is_valid_video_url(trusted_url):
-        raise HTTPException(
-            status_code=400,
-            detail="Vídeo não encontrado ou fonte não autorizada. Informe um video_id válido."
-        )
-
-    return trusted_url, cached_stream, local_audio
-
-
-@app.post("/api/frame")
+@app.post("/api/frame", response_model=FrameResponse)
 def get_frame(req: FrameRequest):
-    """
-    Extrai 1 único frame JPEG (.jpg) no segundo especificado a partir de um vídeo previamente cadastrado.
-    Reaproveita a URL direta de stream já em cache para evitar chamadas redundantes ao yt-dlp.
-    """
+    """Extrai 1 frame JPEG no timestamp informado a partir de vídeo previamente cadastrado."""
     trusted_url, cached_stream, _ = _resolve_trusted_video_source(req.video_id, req.source)
 
     acquired = preview_ffmpeg_semaphore.acquire(timeout=1.5)
     if not acquired:
         raise HTTPException(
             status_code=429,
-            detail="Muitas extrações de prévia em andamento. Tente novamente em instantes."
+            detail="Muitas extrações de prévia em andamento. Tente novamente em instantes.",
         )
 
     try:
         frame_path = extract_preview_frame(
             source=trusted_url,
             timestamp_sec=req.timestamp_sec,
-            direct_stream_url=cached_stream
+            direct_stream_url=cached_stream,
         )
         if not frame_path or not os.path.exists(frame_path):
             if cached_stream:
@@ -648,17 +484,16 @@ def get_frame(req: FrameRequest):
                 frame_path = extract_preview_frame(
                     source=trusted_url,
                     timestamp_sec=req.timestamp_sec,
-                    direct_stream_url=None
+                    direct_stream_url=None,
                 )
-
         if not frame_path or not os.path.exists(frame_path):
-            raise RuntimeError("Não foi possível gerar o frame de prévia para este timestamp.")
-        frame_url = f"/data/temp/{Path(frame_path).name}"
-        return {
-            "success": True,
-            "frame_url": frame_url,
-            "timestamp_sec": req.timestamp_sec,
-        }
+            raise HTTPException(status_code=500, detail="Não foi possível extrair o frame solicitado via FFmpeg.")
+
+        return FrameResponse(
+            success=True,
+            frame_url=f"/data/temp/{Path(frame_path).name}",
+            timestamp_sec=req.timestamp_sec,
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -668,12 +503,9 @@ def get_frame(req: FrameRequest):
         preview_ffmpeg_semaphore.release()
 
 
-@app.post("/api/preview-clip")
+@app.post("/api/preview-clip", response_model=PreviewClipResponse)
 def get_preview_clip(req: PreviewClipRequest):
-    """
-    Gera e retorna um clipe de vídeo leve (.mp4 com áudio) do intervalo [start_time, end_time]
-    para reprodução em tempo real a 60fps no Canvas do Estúdio e no Mockup 9:16 antes da renderização.
-    """
+    """Gera e retorna clipe leve (.mp4 com áudio) para prévia em tempo real no Canvas."""
     if req.end_time <= req.start_time:
         raise HTTPException(status_code=400, detail="end_time deve ser maior que start_time.")
 
@@ -683,7 +515,7 @@ def get_preview_clip(req: PreviewClipRequest):
     if not acquired:
         raise HTTPException(
             status_code=429,
-            detail="Muitas prévias em vídeo sendo geradas simultaneamente. Aguarde alguns segundos."
+            detail="Muitas prévias em vídeo sendo geradas simultaneamente. Aguarde alguns segundos.",
         )
 
     try:
@@ -692,18 +524,17 @@ def get_preview_clip(req: PreviewClipRequest):
             start_time=req.start_time,
             end_time=req.end_time,
             direct_stream_url=cached_stream,
-            local_audio_path=local_audio
+            local_audio_path=local_audio,
         )
         if not clip_path or not os.path.exists(clip_path):
-            raise RuntimeError("Não foi possível gerar o clipe de prévia em vídeo para este corte.")
+            raise HTTPException(status_code=500, detail="Não foi possível gerar o vídeo de prévia para este corte.")
 
-        clip_url = f"/data/temp/{Path(clip_path).name}"
-        return {
-            "success": True,
-            "clip_url": clip_url,
-            "start_time": req.start_time,
-            "end_time": req.end_time,
-        }
+        return PreviewClipResponse(
+            success=True,
+            clip_url=f"/data/temp/{Path(clip_path).name}",
+            start_time=req.start_time,
+            end_time=req.end_time,
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -713,134 +544,9 @@ def get_preview_clip(req: PreviewClipRequest):
         preview_ffmpeg_semaphore.release()
 
 
-def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_resolution: int) -> None:
-    """Thread de execução em background da renderização FFmpeg com os 4 modos."""
-    try:
-        video = get_video(video_id)
-        if not video:
-            raise ValueError(f"Vídeo ID {video_id} não encontrado no banco de dados.")
-
-        update_job(job_id, step="[1/2] Verificando vídeo fonte em alta resolução...", progress=10)
-
-        # 1. Download do vídeo em alta definição (se ainda não existir no disco)
-        video_file = video.get("file_path", "")
-        if not video_file or not os.path.exists(video_file):
-            update_job(job_id, step=f"[1/2] Baixando vídeo fonte em {max_resolution}p via yt-dlp...", progress=20)
-            video_file = download_video(video["url"], max_resolution=max_resolution)
-            update_video_status(video_id, status="cutting", file_path=video_file)
-
-        # 2. Carrega transcrição de data/cache/ (privado) para legendas sincronizadas
-        segments = []
-        transcript_cache_path = CACHE_DIR / f"transcript_{video_id}.json"
-        if not transcript_cache_path.exists():
-            transcript_cache_path = TEMP_DIR / f"transcript_{video_id}.json"
-        if transcript_cache_path.exists():
-            try:
-                with open(transcript_cache_path, "r", encoding="utf-8") as f_tr:
-                    t_data = json.load(f_tr)
-                    segments = t_data.get("segments", [])
-            except Exception:
-                pass
-        elif video_id in analyses_cache:
-            segments = analyses_cache[video_id].get("transcript_data", {}).get("segments", [])
-
-        # 3. Renderização de cada corte selecionado
-        rendered_cuts: List[Dict[str, Any]] = []
-        total_cuts = len(cuts)
-
-        for idx, c in enumerate(cuts):
-            pct = 30 + int((idx / total_cuts) * 65)
-            cut_title = c.get_effective_title(f"Corte #{idx+1}")
-            update_job(
-                job_id,
-                step=f"[2/2] Renderizando corte {idx+1}/{total_cuts}: '{cut_title}' no modo '{c.layout_mode}'...",
-                progress=pct
-            )
-
-            # Insere ou atualiza todos os campos editados do corte no banco SQLite
-            corte_db_id = c.id
-            if not corte_db_id or not get_corte(corte_db_id):
-                corte_db_id = add_corte(
-                    video_id=video_id,
-                    start_time=c.start_time,
-                    end_time=c.end_time,
-                    title=cut_title,
-                    layout_mode=c.layout_mode,
-                    layout_params=c.layout_params,
-                    burn_subtitles=bool(c.burn_subtitles),
-                    status="rendering"
-                )
-            else:
-                update_corte(
-                    corte_db_id,
-                    title=cut_title,
-                    start_time=c.start_time,
-                    end_time=c.end_time,
-                    layout_mode=c.layout_mode,
-                    layout_params=c.layout_params,
-                    burn_subtitles=bool(c.burn_subtitles),
-                    status="rendering"
-                )
-
-            # Renderiza via FFmpeg com o layout e parâmetros exatos
-            output_clip = cut_video(
-                input_path=video_file,
-                start_time=c.start_time,
-                end_time=c.end_time,
-                layout_mode=c.layout_mode,
-                layout_params=c.layout_params,
-                burn_subtitles=bool(c.burn_subtitles),
-                segments=segments
-            )
-
-            update_corte_status(corte_db_id, status="completed", output_path=output_clip)
-
-            rendered_cuts.append({
-                "id": corte_db_id,
-                "title": cut_title,
-                "start_time": c.start_time,
-                "end_time": c.end_time,
-                "duration": round(c.end_time - c.start_time, 1),
-                "layout_mode": c.layout_mode,
-                "output_path": output_clip,
-                "video_url": f"/data/cortes/{Path(output_clip).name}",
-            })
-
-        update_video_status(video_id, status="completed")
-
-        update_job(
-            job_id,
-            status="completed",
-            step=f"Renderização concluída! {len(rendered_cuts)} corte(s) prontos para download.",
-            progress=100,
-            result={
-                "video_id": video_id,
-                "rendered_cuts": rendered_cuts,
-            }
-        )
-    except Exception as exc:
-        logger.exception("Erro crítico na esteira de renderização (job %s): %s", job_id, exc)
-        if "video_id" in locals() and isinstance(video_id, int) and video_id > 0:
-            try:
-                update_video_status(video_id, status="failed")
-            except Exception:
-                pass
-        with jobs_lock:
-            if job_id not in jobs:
-                jobs[job_id] = {"job_id": job_id, "type": "render"}
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["step"] = "Erro durante a renderização com FFmpeg"
-            jobs[job_id]["progress"] = 100
-            jobs[job_id]["error"] = str(exc)
-            jobs[job_id]["updated_at"] = time.time()
-
-
-@app.post("/api/render")
+@app.post("/api/render", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
 def start_render(req: RenderRequest):
-    """
-    Inicia a renderização em background dos cortes selecionados pelo usuário,
-    aplicando os parâmetros de enquadramento customizados (4 modos) e legendas.
-    """
+    """Inicia a renderização assíncrona em background dos cortes selecionados (retorna 202 Accepted)."""
     if not req.cuts:
         raise HTTPException(status_code=400, detail="Nenhum corte selecionado para renderização.")
 
@@ -848,68 +554,64 @@ def start_render(req: RenderRequest):
     if not video:
         raise HTTPException(status_code=404, detail=f"Vídeo ID {req.video_id} não encontrado.")
 
-    job_id = f"job_render_{uuid.uuid4().hex[:10]}"
-    with jobs_lock:
-        active_render = sum(
-            1 for j in jobs.values()
-            if j.get("type") == "render" and j.get("status") == "running"
+    job_id = job_manager.create_job(
+        job_type="render",
+        step=f"Iniciando renderização de {len(req.cuts)} corte(s)...",
+        progress=5,
+    )
+    if job_id is None:
+        raise HTTPException(
+            status_code=429,
+            detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar.",
         )
-        if active_render >= MAX_CONCURRENT_RENDER_JOBS:
-            raise HTTPException(
-                status_code=429,
-                detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar."
-            )
-        jobs[job_id] = {
-            "job_id": job_id,
-            "type": "render",
-            "status": "running",
-            "step": f"Iniciando renderização de {len(req.cuts)} corte(s)...",
-            "progress": 5,
-            "result": None,
-            "error": None,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
 
     threading.Thread(
         target=_run_render_job,
         args=(job_id, req.video_id, req.cuts, req.max_resolution or 1080),
-        daemon=True
+        daemon=True,
     ).start()
 
-    return {
-        "job_id": job_id,
-        "message": "Processo de renderização iniciado em segundo plano."
-    }
+    return JobAcceptedResponse(
+        job_id=job_id,
+        message="Processo de renderização iniciado em segundo plano.",
+    )
 
 
 @app.get("/api/history")
 def get_history(
+    response: Response,
     search: Optional[str] = Query(None, description="Busca textual por título ou URL"),
-    min_score: Optional[float] = Query(0.0, description="Nota mínima de viralidade (0 a 100)")
+    min_score: Optional[float] = Query(0.0, ge=0.0, le=100.0, description="Nota mínima de viralidade (0 a 100)"),
+    limit: int = Query(50, ge=1, le=200, description="Máximo de vídeos por página"),
+    offset: int = Query(0, ge=0, description="Deslocamento de paginação"),
 ):
     """
-    Retorna a lista de vídeos cadastrados no SQLite com seus respectivos cortes renderizados.
-    Compatível com filtros de busca textual e nota mínima.
+    Retorna vídeos paginados com seus cortes em consulta em lote (sem N+1).
+    Expõe o total de vídeos correspondentes no cabeçalho X-Total-Count.
     """
-    videos = list_videos(search=search)
+    videos, total_count = list_videos_with_cortes(search=search, limit=limit, offset=offset)
+    response.headers["X-Total-Count"] = str(total_count)
+
+    existing_cut_names = (
+        {p.name for p in CUTS_DIR.iterdir() if p.is_file()}
+        if CUTS_DIR.exists()
+        else set()
+    )
+
     history_items: List[Dict[str, Any]] = []
-
     for v in videos:
-        all_cuts = list_cortes(video_id=v["id"])
         filtered_cuts: List[Dict[str, Any]] = []
-
-        for c in all_cuts:
-            raw_score = float(c.get("virality_score") or 0.0)
-            norm_score = raw_score * 10.0 if (0.0 < raw_score <= 10.0) else raw_score
-
+        for c in v.get("cortes", []):
+            norm_score = normalize_virality_score(c.get("virality_score", 0.0), default=0.0)
             if min_score is None or norm_score >= min_score:
                 out_p = c.get("output_path", "")
                 video_url = None
                 file_exists = False
-                if out_p and os.path.exists(out_p):
-                    video_url = f"/data/cortes/{Path(out_p).name}"
-                    file_exists = True
+                if out_p:
+                    out_path_obj = Path(out_p)
+                    if out_path_obj.name in existing_cut_names or os.path.exists(out_p):
+                        video_url = f"/data/cortes/{out_path_obj.name}"
+                        file_exists = True
 
                 c_item = dict(c)
                 c_item["virality_score"] = round(norm_score, 0)
@@ -924,27 +626,25 @@ def get_history(
     return history_items
 
 
-@app.delete("/api/history/{video_id}")
+@app.delete("/api/history/{video_id}", response_model=MessageResponse)
 def delete_history_item(
     video_id: int,
-    delete_files: bool = Query(False, description="Apagar também os arquivos .mp4/.mp3 físicos do disco")
+    delete_files: bool = Query(False, description="Apagar também os arquivos .mp4/.mp3 físicos do disco"),
 ):
-    """
-    Remove o vídeo e seus cortes associados do SQLite, com opção de excluir também os arquivos físicos.
-    """
+    """Remove vídeo e cortes associados do SQLite, com opção segura de exclusão física."""
     success = delete_video(video_id=video_id, delete_files=delete_files)
     if not success:
         raise HTTPException(status_code=404, detail=f"Vídeo ID {video_id} não encontrado.")
-    analyses_cache.pop(video_id, None)
-    return {
-        "success": True,
-        "message": f"Vídeo ID {video_id} {'e arquivos físicos ' if delete_files else ''}removido com sucesso."
-    }
+    job_manager.pop_analysis_cache(video_id)
+    return MessageResponse(
+        success=True,
+        message=f"Vídeo ID {video_id} {'e arquivos físicos ' if delete_files else ''}removido com sucesso.",
+    )
 
 
 @app.get("/api/cortes/{corte_id}")
 def get_corte_item(corte_id: int):
-    """Retorna os metadados completos de um corte individual pelo ID."""
+    """Retorna metadados completos de um corte individual pelo ID."""
     corte = get_corte(corte_id)
     if not corte:
         raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
@@ -953,7 +653,7 @@ def get_corte_item(corte_id: int):
     return corte
 
 
-@app.patch("/api/cortes/{corte_id}")
+@app.patch("/api/cortes/{corte_id}", response_model=CorteMutationResponse)
 def patch_corte_item(corte_id: int, req: UpdateCorteRequest):
     """Atualiza parcialmente título, tempos, layout e legendas de um corte no SQLite."""
     try:
@@ -973,42 +673,63 @@ def patch_corte_item(corte_id: int, req: UpdateCorteRequest):
     if not updated:
         raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
 
-    return {
-        "success": True,
-        "corte": get_corte(corte_id),
-    }
+    return CorteMutationResponse(
+        success=True,
+        corte=get_corte(corte_id) or {},
+    )
 
 
-@app.delete("/api/cortes/{corte_id}")
+@app.delete("/api/cortes/{corte_id}", response_model=MessageResponse)
 def delete_corte_item(
     corte_id: int,
-    delete_file: bool = Query(False, description="Apagar também o arquivo .mp4 renderizado do disco")
+    delete_file: bool = Query(False, description="Apagar também o arquivo .mp4 renderizado do disco"),
 ):
     """Remove um corte individual do SQLite com opção de exclusão física segura."""
     success = delete_corte(corte_id=corte_id, delete_file=delete_file)
     if not success:
         raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
-    return {
-        "success": True,
-        "message": f"Corte ID {corte_id} {'e arquivo físico ' if delete_file else ''}removido com sucesso."
-    }
+    return MessageResponse(
+        success=True,
+        message=f"Corte ID {corte_id} {'e arquivo físico ' if delete_file else ''}removido com sucesso.",
+    )
 
 
-@app.post("/api/open-folder")
+@app.post("/api/cleanup", response_model=CleanupResponse)
+def cleanup_resources(req: Optional[CleanupRequest] = None):
+    """
+    Executa limpeza sob demanda de arquivos temporários (data/temp/, opcionalmente downloads brutos)
+    e poda entradas expiradas de jobs/cache em memória, preservando data/cortes/.
+    """
+    payload = req or CleanupRequest()
+    disk_res = cleanup_temporary_files(
+        temp_dir=TEMP_DIR,
+        downloads_dir=DOWNLOADS_DIR,
+        remove_raw_downloads=payload.remove_raw_downloads,
+        max_age_hours=payload.max_age_hours,
+    )
+    mem_res = job_manager.prune()
+    return CleanupResponse(
+        success=True,
+        deleted_count=int(disk_res["deleted_count"]),
+        freed_mb=float(disk_res["freed_mb"]),
+        pruned_jobs=int(mem_res["pruned_jobs"]),
+        pruned_cache=int(mem_res["pruned_cache"]),
+    )
+
+
+@app.post("/api/open-folder", response_model=MessageResponse)
 def open_folder():
-    """
-    Abre a pasta data/cortes/ diretamente no Explorador de Arquivos do Windows via os.startfile.
-    """
+    """Abre a pasta data/cortes/ diretamente no Explorador de Arquivos do Windows."""
     try:
         cuts_abs = str(CUTS_DIR.resolve())
         if hasattr(os, "startfile"):
-            os.startfile(cuts_abs)
+            os.startfile(cuts_abs)  # nosec B606
         else:
-            subprocess.Popen(["explorer", cuts_abs])
-        return {
-            "success": True,
-            "message": "Pasta data/cortes/ aberta no Explorador de Arquivos."
-        }
+            subprocess.Popen(["explorer", cuts_abs])  # nosec B603, B607
+        return MessageResponse(
+            success=True,
+            message="Pasta data/cortes/ aberta no Explorador de Arquivos.",
+        )
     except Exception as exc:
         logger.error("Erro ao abrir pasta data/cortes/: %s", exc)
         raise HTTPException(status_code=500, detail="Erro interno ao abrir pasta de cortes no Explorador.")
