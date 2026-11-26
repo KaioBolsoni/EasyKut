@@ -1,7 +1,45 @@
 /**
- * EasyKut Studio V3.0 — Application & Canvas Engine
- * HTML5 Canvas 60fps Interactive Framing & Live Phone Mockup Mirror
+ * EasyKut Studio V3.1 — Aplicação Principal (ES Module)
+ * Coordena estado do Estúdio, polling de jobs, player de clipe, biblioteca e auto-save,
+ * delegando utilitários (./js/utils.js), chamadas REST (./js/api.js) e Canvas 60fps (./js/canvas_engine.js).
  */
+
+import {
+  apiDeleteCorte,
+  apiDeleteVideo,
+  apiExtractFrame,
+  apiExtractPreviewClip,
+  apiGetConfig,
+  apiGetHistory,
+  apiGetJob,
+  apiOpenFolder,
+  apiPatchCorte,
+  apiStartAnalyze,
+  apiStartRender,
+} from './js/api.js';
+import {
+  checkHandleHit,
+  createCanvasState,
+  getCanvasMouseCoords,
+  initBlurBuffer,
+  initCutGeometry,
+  invalidateBlurCache,
+  isPointInsideBox,
+  renderEditorCanvas,
+  renderMockupCanvas,
+  resizeBoxWithAspectRatio,
+  updateCanvasCursor,
+} from './js/canvas_engine.js';
+import {
+  clamp,
+  debounce,
+  escapeHtml,
+  formatSecondsMMSS,
+  formatTimeRange,
+  getSafeCutDownloadUrl,
+  makeEven,
+  showToast,
+} from './js/utils.js';
 
 // Estado Global da Aplicação
 const state = {
@@ -11,78 +49,49 @@ const state = {
   isRendering: false,
   activeJobId: null,
   jobPoller: null,
-  
-  // Dados do Vídeo Analisado
+
   currentVideo: null,
   cuts: [],
   activeCutIndex: 0,
 
-  // Configurações do Usuário
   defaultProvider: 'gemini',
   maxCuts: 5,
 };
 
-// Canvas Engine State
-const canvasState = {
-  editorCanvas: null,
-  editorCtx: null,
-  mockupCanvas: null,
-  mockupCtx: null,
-  
-  currentImg: null,
-  imgLoaded: false,
-  imgNaturalW: 1920,
-  imgNaturalH: 1080,
-
-  // Player de Vídeo Ao Vivo Integrado ao Canvas 60fps
-  videoEl: null,
-  isVideoReady: false,
-  isVideoPlaying: false,
-  isLoadingClip: false,
-  animFrameId: null,
-  loadedClipKey: null,
-
-  // Interação do Mouse
-  isDragging: false,
-  dragTarget: null,       // 'manual_box' | 'manual_handle' | 'top_box' | 'top_handle' | 'bot_box' | 'bot_handle'
-  activeHandle: null,     // 'nw' | 'ne' | 'sw' | 'se'
-  dragStartX: 0,
-  dragStartY: 0,
-  initialBox: null,
-  handleSize: 12,
-};
+const canvasState = createCanvasState();
 
 // =========================================================
 // INICIALIZAÇÃO
 // =========================================================
-window.addEventListener('DOMContentLoaded', () => {
+function boot() {
   initDOM();
   initCanvas();
   fetchConfig();
-});
+}
+
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', boot);
+} else {
+  boot();
+}
 
 function initDOM() {
-  // Tabs
   document.getElementById('tab-btn-studio').addEventListener('click', () => switchTab('studio'));
   document.getElementById('tab-btn-library').addEventListener('click', () => switchTab('library'));
 
-  // Topbar
   document.getElementById('btn-open-folder').addEventListener('click', openCutsFolder);
   document.getElementById('btn-settings-modal').addEventListener('click', openSettingsModal);
   document.getElementById('modal-close-btn').addEventListener('click', closeSettingsModal);
   document.getElementById('modal-save-btn').addEventListener('click', saveSettingsModal);
 
-  // Hero Input
   document.getElementById('btn-analyze').addEventListener('click', startAnalysis);
   document.getElementById('input-yt-url').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') startAnalysis();
   });
 
-  // Workspace
   document.getElementById('btn-new-video').addEventListener('click', resetToHero);
   document.getElementById('btn-render-selected').addEventListener('click', startRender);
 
-  // Toolbar do Corte
   document.getElementById('active-cut-title').addEventListener('input', (e) => {
     const c = getActiveCut();
     if (c) {
@@ -128,15 +137,10 @@ function initDOM() {
     }
   });
 
-  // Layout Buttons
-  document.querySelectorAll('.layout-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const mode = btn.dataset.mode;
-      setLayoutMode(mode);
-    });
+  document.querySelectorAll('.layout-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setLayoutMode(btn.dataset.mode));
   });
 
-  // Library Filters
   document.getElementById('lib-search-input').addEventListener('input', debounce(loadLibraryHistory, 300));
   document.getElementById('lib-score-slider').addEventListener('input', (e) => {
     document.getElementById('lib-score-val').textContent = e.target.value;
@@ -147,15 +151,14 @@ function initDOM() {
 function initCanvas() {
   canvasState.editorCanvas = document.getElementById('editor-canvas');
   canvasState.editorCtx = canvasState.editorCanvas.getContext('2d');
-  
+
   canvasState.mockupCanvas = document.getElementById('mockup-canvas');
   canvasState.mockupCtx = canvasState.mockupCanvas.getContext('2d');
-
-  // Dimensões do Canvas do Mockup 9:16 (HD 1080x1920 nativo)
   canvasState.mockupCanvas.width = 1080;
   canvasState.mockupCanvas.height = 1920;
 
-  // Inicializa Elemento de Vídeo HTML5 para reprodução 60fps no Canvas
+  initBlurBuffer(canvasState);
+
   const vid = document.createElement('video');
   vid.crossOrigin = 'anonymous';
   vid.playsInline = true;
@@ -191,7 +194,6 @@ function initCanvas() {
 
   canvasState.videoEl = vid;
 
-  // Eventos de Mouse no Editor Canvas
   const canvas = canvasState.editorCanvas;
   canvas.addEventListener('mousedown', onCanvasMouseDown);
   window.addEventListener('mousemove', onCanvasMouseMove);
@@ -203,14 +205,10 @@ function initCanvas() {
 // =========================================================
 async function fetchConfig() {
   try {
-    const res = await fetch('/api/config');
-    const data = await res.json();
+    const { data } = await apiGetConfig();
     state.config = data;
-    
-    // Atualiza modal de status
     updateConfigModalUI(data);
 
-    // Ajusta provedor padrão
     if (data.default_provider) {
       state.defaultProvider = data.default_provider;
       const select = document.getElementById('select-hero-provider');
@@ -227,37 +225,24 @@ function updateConfigModalUI(data) {
   const fTag = document.getElementById('cfg-status-ffmpeg');
   const cTag = document.getElementById('cfg-status-cookies');
 
-  if (data.keys.GROQ_API_KEY) {
-    gTag.className = 'status-tag-ok'; gTag.textContent = 'Conectado';
-  } else {
-    gTag.className = 'status-tag-off'; gTag.textContent = 'Ausente';
-  }
+  gTag.className = data.keys.GROQ_API_KEY ? 'status-tag-ok' : 'status-tag-off';
+  gTag.textContent = data.keys.GROQ_API_KEY ? 'Conectado' : 'Ausente';
 
-  if (data.keys.GEMINI_API_KEY) {
-    mTag.className = 'status-tag-ok'; mTag.textContent = 'Conectado';
-  } else {
-    mTag.className = 'status-tag-off'; mTag.textContent = 'Ausente';
-  }
+  mTag.className = data.keys.GEMINI_API_KEY ? 'status-tag-ok' : 'status-tag-off';
+  mTag.textContent = data.keys.GEMINI_API_KEY ? 'Conectado' : 'Ausente';
 
-  if (data.keys.FFMPEG_AVAILABLE) {
-    fTag.className = 'status-tag-ok'; fTag.textContent = 'Pronto';
-  } else {
-    fTag.className = 'status-tag-off'; fTag.textContent = 'Ausente';
-  }
+  fTag.className = data.keys.FFMPEG_AVAILABLE ? 'status-tag-ok' : 'status-tag-off';
+  fTag.textContent = data.keys.FFMPEG_AVAILABLE ? 'Pronto' : 'Ausente';
 
   if (cTag) {
-    if (data.keys.COOKIES_TXT) {
-      cTag.className = 'status-tag-ok'; cTag.textContent = 'Carregado';
-    } else {
-      cTag.className = 'status-tag-off'; cTag.textContent = 'Opcional (Não detectado)';
-    }
+    cTag.className = data.keys.COOKIES_TXT ? 'status-tag-ok' : 'status-tag-off';
+    cTag.textContent = data.keys.COOKIES_TXT ? 'Carregado' : 'Opcional (Não detectado)';
   }
 }
 
 async function openCutsFolder() {
   try {
-    const res = await fetch('/api/open-folder', { method: 'POST' });
-    const data = await res.json();
+    const { data } = await apiOpenFolder();
     if (data.success) {
       showToast('Pasta data/cortes/ aberta no Explorador de Arquivos!');
     }
@@ -267,16 +252,16 @@ async function openCutsFolder() {
 }
 
 // =========================================================
-// NAVEGAÇÃO DE ABAS
+// NAVEGAÇÃO DE ABAS & MODAL
 // =========================================================
 function switchTab(tabName) {
   state.activeTab = tabName;
   if (tabName !== 'studio' && canvasState.videoEl && !canvasState.videoEl.paused) {
     canvasState.videoEl.pause();
   }
-  
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+
+  document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach((p) => p.classList.remove('active'));
 
   if (tabName === 'studio') {
     document.getElementById('tab-btn-studio').classList.add('active');
@@ -301,19 +286,17 @@ function closeSettingsModal() {
 
 function saveSettingsModal() {
   state.defaultProvider = document.getElementById('modal-provider-select').value;
-  state.maxCuts = parseInt(document.getElementById('modal-maxcuts-input').value) || 5;
+  state.maxCuts = parseInt(document.getElementById('modal-maxcuts-input').value, 10) || 5;
   document.getElementById('select-hero-provider').value = state.defaultProvider;
   closeSettingsModal();
   showToast('Configurações salvas!');
 }
 
 // =========================================================
-// ESTEIRA DE ANÁLISE (HERO / INPUT)
+// ESTEIRA DE ANÁLISE & POLLING
 // =========================================================
 async function startAnalysis() {
-  if (state.isAnalyzing) {
-    return; // Impede pedidos duplicados em paralelo
-  }
+  if (state.isAnalyzing) return;
 
   const urlInput = document.getElementById('input-yt-url');
   let url = urlInput ? urlInput.value.trim() : '';
@@ -324,13 +307,11 @@ async function startAnalysis() {
     return;
   }
 
-  // Previne erros caso a URL venha sem http(s)://
   if (!url.startsWith('http://') && !url.startsWith('https://')) {
     url = 'https://' + url;
     if (urlInput) urlInput.value = url;
   }
 
-  // Desativa imediatamente o botão para impedir envios simultâneos
   state.isAnalyzing = true;
   const btnAnalyze = document.getElementById('btn-analyze');
   if (btnAnalyze) {
@@ -352,13 +333,7 @@ async function startAnalysis() {
   updateStepTracker(1);
 
   try {
-    const res = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, provider, max_cuts: state.maxCuts })
-    });
-    const data = await res.json();
-
+    const { res, data } = await apiStartAnalyze(url, provider, state.maxCuts);
     if (res.ok && data.job_id) {
       state.activeJobId = data.job_id;
       pollJob(data.job_id, onAnalysisSuccess, onAnalysisError);
@@ -392,7 +367,7 @@ function pollJob(jobId, onSuccess, onError) {
   state.jobPoller = setInterval(async () => {
     if (isStopped) return;
     try {
-      const res = await fetch(`/api/jobs/${jobId}`);
+      const { res, data: job } = await apiGetJob(jobId);
       if (!res.ok) {
         if (res.status === 404) {
           stopPolling();
@@ -403,10 +378,8 @@ function pollJob(jobId, onSuccess, onError) {
       }
 
       consecutiveErrors = 0;
-      const job = await res.json();
-      if (isStopped) return;
+      if (isStopped || !job) return;
 
-      // Exibe na barra de progresso (Análise e Renderização) o texto real de job.step retornado pelo backend
       const stepLabel = job.step || 'Processando...';
       const pct = typeof job.progress === 'number' ? job.progress : 0;
 
@@ -424,7 +397,6 @@ function pollJob(jobId, onSuccess, onError) {
       if (renderPct) renderPct.textContent = `${pct}%`;
       if (renderFill) renderFill.style.width = `${pct}%`;
 
-      // Atualiza passos visuais
       if (pct < 30) updateStepTracker(1);
       else if (pct < 55) updateStepTracker(2);
       else if (pct < 80) updateStepTracker(3);
@@ -436,8 +408,7 @@ function pollJob(jobId, onSuccess, onError) {
         onSuccess(job.result);
       } else if (status === 'error' || status === 'failed') {
         stopPolling();
-        const errMsg = job.error || job.step || 'Erro durante o processamento.';
-        onError(errMsg);
+        onError(job.error || job.step || 'Erro durante o processamento.');
       }
     } catch (err) {
       consecutiveErrors += 1;
@@ -466,7 +437,6 @@ function onAnalysisSuccess(result) {
   state.activeCutIndex = 0;
   state.isAnalyzing = false;
 
-  // Reativa o botão para futuras análises caso o usuário volte
   const btnAnalyze = document.getElementById('btn-analyze');
   if (btnAnalyze) {
     btnAnalyze.disabled = false;
@@ -476,7 +446,6 @@ function onAnalysisSuccess(result) {
   const progressCard = document.getElementById('progress-card');
   if (progressCard) progressCard.style.display = 'none';
 
-  // Transição suave para o Workspace Master-Detail
   document.getElementById('hero-section').style.display = 'none';
   document.getElementById('workspace-section').style.display = 'grid';
 
@@ -514,10 +483,11 @@ function resetToHero() {
 // WORKSPACE MASTER-DETAIL
 // =========================================================
 function initWorkspaceData() {
-  // Inicializa parâmetros geométricos para cada corte caso não existam
-  state.cuts.forEach((c, idx) => {
+  state.cuts.forEach((c) => {
     if (!c.layout_params) c.layout_params = {};
-    if (!c.layout_mode) c.layout_mode = (c.tipo === 'longo' || c.duration >= 180) ? 'horizontal_16_9' : 'vertical_blur';
+    if (!c.layout_mode) {
+      c.layout_mode = (c.tipo === 'longo' || c.duration >= 180) ? 'horizontal_16_9' : 'vertical_blur';
+    }
   });
 
   updateCutsSidebarUI();
@@ -605,7 +575,7 @@ function toggleCutSelection(idx, isSelected) {
 }
 
 function updateRenderButtonState() {
-  const count = state.cuts.filter(c => c.selected).length;
+  const count = state.cuts.filter((c) => c.selected).length;
   const btn = document.getElementById('btn-render-selected');
   btn.disabled = (count === 0 || state.isRendering);
   btn.innerHTML = `
@@ -620,7 +590,6 @@ function selectCut(idx) {
 
   stopAndResetClipPreview();
 
-  // Atualiza classe ativa na sidebar
   const cards = document.querySelectorAll('.cut-item-card');
   cards.forEach((c, i) => {
     c.classList.toggle('active', i === idx);
@@ -653,8 +622,7 @@ function updateActiveCutToolbar() {
   document.getElementById('active-cut-end').value = c.end_time.toFixed(1);
   document.getElementById('toggle-burn-subs').checked = !!c.burn_subtitles;
 
-  // Atualiza botões de Layout
-  document.querySelectorAll('.layout-btn').forEach(btn => {
+  document.querySelectorAll('.layout-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.mode === c.layout_mode);
   });
 
@@ -666,7 +634,7 @@ function updateSubcontrolsBar(cut) {
   const mode = cut.layout_mode;
 
   if (mode === 'vertical_blur') {
-    const zoom = cut.layout_params?.zoom_factor || 1.0;
+    const zoom = Number(cut.layout_params?.zoom_factor) || 1.0;
     bar.innerHTML = `
       <div style="display: flex; align-items: center; gap: 1rem; width: 100%;">
         <span>Canvas 9:16 com fundo desfocado e vídeo 16:9 nítido centralizado.</span>
@@ -691,7 +659,6 @@ function updateSubcontrolsBar(cut) {
       </div>
     `;
   } else {
-    // horizontal_16_9
     bar.innerHTML = `
       <span>Modo Widescreen 16:9 Nativo. Sem corte ou distorção. Renderização limpa e ultrarrápida.</span>
     `;
@@ -704,14 +671,11 @@ function setLayoutMode(mode) {
 
   c.layout_mode = mode;
   if (!c.layout_params) c.layout_params = {};
-
   if (mode === 'vertical_blur' && !c.layout_params.zoom_factor) {
     c.layout_params.zoom_factor = 1.0;
   }
 
-  // Inicializa caixas se necessário
-  initCutGeometry(c);
-
+  initCutGeometry(c, canvasState);
   updateActiveCutToolbar();
   renderAllCanvases();
   schedulePersistCutEdits(c);
@@ -728,7 +692,7 @@ function onZoomSliderChange(val) {
 }
 
 // =========================================================
-// CARREGAMENTO E ATUALIZAÇÃO DE FRAME
+// FRAME & PLAYER DE CLIPE AO VIVO
 // =========================================================
 function updateCanvasPlaceholderUI(show) {
   const overlay = document.getElementById('canvas-placeholder-overlay');
@@ -741,8 +705,8 @@ function loadCutFrame(cut) {
   if (!cut) return;
 
   canvasState.imgLoaded = false;
+  invalidateBlurCache(canvasState);
 
-  // Se o frame_url for vazio ou nulo, utiliza thumbnail do vídeo como fallback antes de exibir placeholder
   if (!cut.frame_url) {
     if (state.currentVideo && state.currentVideo.thumbnail) {
       cut.frame_url = state.currentVideo.thumbnail;
@@ -752,7 +716,7 @@ function loadCutFrame(cut) {
       canvasState.imgNaturalH = 1080;
       canvasState.editorCanvas.width = 1920;
       canvasState.editorCanvas.height = 1080;
-      initCutGeometry(cut);
+      initCutGeometry(cut, canvasState);
       updateCanvasPlaceholderUI(true);
       renderAllCanvases();
       return;
@@ -768,14 +732,12 @@ function loadCutFrame(cut) {
     canvasState.imgNaturalW = img.naturalWidth || 1920;
     canvasState.imgNaturalH = img.naturalHeight || 1080;
     canvasState.imgLoaded = true;
+    invalidateBlurCache(canvasState);
 
-    // Ajusta resolução do Editor Canvas
     canvasState.editorCanvas.width = canvasState.imgNaturalW;
     canvasState.editorCanvas.height = canvasState.imgNaturalH;
 
-    // Inicializa geometria se necessário
-    initCutGeometry(cut);
-
+    initCutGeometry(cut, canvasState);
     updateCanvasPlaceholderUI(false);
     renderAllCanvases();
   };
@@ -788,7 +750,7 @@ function loadCutFrame(cut) {
     canvasState.imgNaturalH = 1080;
     canvasState.editorCanvas.width = 1920;
     canvasState.editorCanvas.height = 1080;
-    initCutGeometry(cut);
+    initCutGeometry(cut, canvasState);
     updateCanvasPlaceholderUI(true);
     renderAllCanvases();
   };
@@ -813,12 +775,7 @@ async function refreshCutFrame() {
   const ts = Math.max(0, c.start_time + 0.5);
 
   try {
-    const res = await fetch('/api/frame', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ video_id: videoId, source, timestamp_sec: ts })
-    });
-    const data = await res.json();
+    const { res, data } = await apiExtractFrame(videoId, source, ts);
     if (res.ok && data.success && data.frame_url) {
       c.frame_url = data.frame_url;
       loadCutFrame(c);
@@ -834,74 +791,6 @@ async function refreshCutFrame() {
   }
 }
 
-function initCutGeometry(cut) {
-  const W = canvasState.imgNaturalW || 1920;
-  const H = canvasState.imgNaturalH || 1080;
-
-  if (!cut.layout_params) cut.layout_params = {};
-
-  // Se já existia uma referência de resolução diferente (ex: placeholder 1920x1080 -> frame/vídeo 1280x720), reescala as caixas proporcionalmente
-  const prevW = cut.layout_params.ref_w;
-  const prevH = cut.layout_params.ref_h;
-  if (prevW && prevH && (prevW !== W || prevH !== H)) {
-    const sx = W / prevW;
-    const sy = H / prevH;
-    if (cut.layout_params.crop_w && cut.layout_params.crop_h) {
-      cut.layout_params.crop_h = makeEven(Math.min(H, Math.round(cut.layout_params.crop_h * sy)));
-      cut.layout_params.crop_w = makeEven(Math.min(W, Math.round(cut.layout_params.crop_h * (9 / 16))));
-      cut.layout_params.crop_x = makeEven(clamp(Math.round((cut.layout_params.crop_x || 0) * sx), 0, W - cut.layout_params.crop_w));
-      cut.layout_params.crop_y = makeEven(clamp(Math.round((cut.layout_params.crop_y || 0) * sy), 0, H - cut.layout_params.crop_h));
-    }
-    if (cut.layout_params.box_top && cut.layout_params.box_bottom) {
-      const target_ar = 1080 / 960;
-      ['box_top', 'box_bottom'].forEach((k) => {
-        const b = cut.layout_params[k];
-        const nh = makeEven(Math.min(H, Math.round(b.h * sy)));
-        const nw = makeEven(Math.min(W, Math.round(nh * target_ar)));
-        b.w = nw;
-        b.h = nh;
-        b.x = makeEven(clamp(Math.round(b.x * sx), 0, W - nw));
-        b.y = makeEven(clamp(Math.round(b.y * sy), 0, H - nh));
-      });
-    }
-  }
-
-  cut.layout_params.ref_w = W;
-  cut.layout_params.ref_h = H;
-
-  // 1. Manual Crop: 9:16
-  if (!cut.layout_params.crop_w || !cut.layout_params.crop_h) {
-    const crop_h = Math.round(H * 0.96);
-    const crop_w = makeEven(Math.round(crop_h * (9 / 16)));
-    const crop_x = makeEven(Math.round((W - crop_w) / 2));
-    const crop_y = makeEven(Math.round((H - crop_h) / 2));
-    cut.layout_params.crop_w = crop_w;
-    cut.layout_params.crop_h = crop_h;
-    cut.layout_params.crop_x = crop_x;
-    cut.layout_params.crop_y = crop_y;
-  }
-
-  // 2. Split Screen: 9:8 (1080/960 = 1.125)
-  if (!cut.layout_params.box_top || !cut.layout_params.box_bottom) {
-    const target_ar = 1080 / 960; // 1.125
-    const max_h = Math.min(H, Math.round(W / target_ar));
-    const bh = makeEven(Math.round(max_h * 0.85));
-    const bw = makeEven(Math.round(bh * target_ar));
-
-    // Topo à esquerda, Base à direita
-    const tx = makeEven(Math.max(0, Math.round(W * 0.1)));
-    const ty = makeEven(Math.round((H - bh) / 2));
-    const bx = makeEven(Math.min(W - bw, Math.round(W * 0.5)));
-    const by = ty;
-
-    cut.layout_params.box_top = { x: tx, y: ty, w: bw, h: bh };
-    cut.layout_params.box_bottom = { x: bx, y: by, w: bw, h: bh };
-  }
-}
-
-// =========================================================
-// PLAYER DE VÍDEO AO VIVO DO CORTE & PAINEL DE CONTEXTO
-// =========================================================
 function getCutSegments(cut) {
   if (!cut) return [];
   const allSegs = state.currentVideo?.transcript_segments || cut.segments || [];
@@ -918,9 +807,7 @@ function updateCutContextPanel(cut) {
   justBox.replaceChildren();
   transBox.replaceChildren();
 
-  if (!cut) {
-    return;
-  }
+  if (!cut) return;
 
   const labelStrong = document.createElement('strong');
   if (cut.justification) {
@@ -961,7 +848,6 @@ function updateCutContextPanel(cut) {
     transBox.appendChild(item);
   });
 
-  // Atualiza display de tempo inicial na barra do player
   const timeDisp = document.getElementById('clip-time-display');
   if (timeDisp && !canvasState.isVideoReady) {
     timeDisp.textContent = `0:00 / ${formatSecondsMMSS(cut.duration)}`;
@@ -1000,7 +886,6 @@ async function togglePlayClipPreview() {
   const vid = canvasState.videoEl;
   const clipKey = `${state.currentVideo.video_id}_${cut.start_time.toFixed(1)}_${cut.end_time.toFixed(1)}`;
 
-  // Se o vídeo deste corte já está carregado, apenas alterna Play / Pause
   if (canvasState.isVideoReady && canvasState.loadedClipKey === clipKey && vid) {
     if (vid.paused) {
       vid.play().catch((err) => console.warn('Falha ao reproduzir vídeo:', err));
@@ -1010,24 +895,18 @@ async function togglePlayClipPreview() {
     return;
   }
 
-  // Caso contrário, solicita a geração rápida do clipe de prévia (.mp4 com áudio) ao backend
   canvasState.isLoadingClip = true;
   updateClipPlayerButtonsUI();
   showToast('Preparando prévia em vídeo e áudio do corte...');
 
   try {
-    const res = await fetch('/api/preview-clip', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_id: state.currentVideo.video_id,
-        source: state.currentVideo.url,
-        start_time: cut.start_time,
-        end_time: cut.end_time,
-      }),
-    });
+    const { res, data } = await apiExtractPreviewClip(
+      state.currentVideo.video_id,
+      state.currentVideo.url,
+      cut.start_time,
+      cut.end_time
+    );
 
-    const data = await res.json();
     if (!res.ok || !data.success || !data.clip_url) {
       throw new Error(data.detail || 'Não foi possível carregar o vídeo de prévia deste corte.');
     }
@@ -1053,13 +932,12 @@ async function togglePlayClipPreview() {
     canvasState.isVideoReady = true;
     canvasState.isLoadingClip = false;
 
-    // Se ainda não tínhamos frame estático carregado, ajusta dimensões do canvas pelo vídeo
     if (!canvasState.imgLoaded && vid.videoWidth && vid.videoHeight) {
       canvasState.imgNaturalW = vid.videoWidth;
       canvasState.imgNaturalH = vid.videoHeight;
       canvasState.editorCanvas.width = vid.videoWidth;
       canvasState.editorCanvas.height = vid.videoHeight;
-      initCutGeometry(cut);
+      initCutGeometry(cut, canvasState);
       updateCanvasPlaceholderUI(false);
     }
 
@@ -1166,7 +1044,6 @@ function updateClipPlayerTimelineUI() {
     timeDisp.textContent = `${formatSecondsMMSS(cur)} / ${formatSecondsMMSS(tot)}`;
   }
 
-  // Destaca a frase ativa na caixa de transcrição lateral
   const absSec = cut.start_time + cur;
   const segs = getCutSegments(cut);
   const items = document.querySelectorAll('.cut-seg-item');
@@ -1177,327 +1054,15 @@ function updateClipPlayerTimelineUI() {
   });
 }
 
-function formatSecondsMMSS(sec) {
-  const s = Math.max(0, Math.floor(sec || 0));
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}:${r.toString().padStart(2, '0')}`;
-}
-
-function getActiveMediaSource() {
-  if (canvasState.isVideoReady && canvasState.videoEl && canvasState.videoEl.readyState >= 2) {
-    return {
-      el: canvasState.videoEl,
-      srcW: canvasState.videoEl.videoWidth || canvasState.imgNaturalW || 1920,
-      srcH: canvasState.videoEl.videoHeight || canvasState.imgNaturalH || 1080,
-    };
-  }
-  if (canvasState.imgLoaded && canvasState.currentImg) {
-    return {
-      el: canvasState.currentImg,
-      srcW: canvasState.currentImg.naturalWidth || canvasState.imgNaturalW || 1920,
-      srcH: canvasState.currentImg.naturalHeight || canvasState.imgNaturalH || 1080,
-    };
-  }
-  return null;
-}
-
-// =========================================================
-// RENDERIZAÇÃO 60FPS NOS CANVASES
-// =========================================================
 function renderAllCanvases() {
-  renderEditorCanvas();
-  renderMockupCanvas();
-}
-
-// 1. PALCO PRINCIPAL (EDITOR)
-function renderEditorCanvas() {
-  const ctx = canvasState.editorCtx;
   const cut = getActiveCut();
-  const media = getActiveMediaSource();
-
-  // Se nem o vídeo nem o frame estiverem carregados, desenha placeholder limpo no Canvas
-  if (!media) {
-    const W = canvasState.editorCanvas.width || 1920;
-    const H = canvasState.editorCanvas.height || 1080;
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = '#10141D';
-    ctx.fillRect(0, 0, W, H);
-    ctx.strokeStyle = '#232938';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(20, 20, W - 40, H - 40);
-
-    ctx.fillStyle = '#6B7280';
-    ctx.font = 'bold 34px Inter, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('Frame de prévia pendente', W / 2, H / 2 - 25);
-
-    ctx.fillStyle = '#6366F1';
-    ctx.font = '22px Inter, sans-serif';
-    ctx.fillText('Clique em "Assistir Corte" ou "Carregar Frame" para visualizar', W / 2, H / 2 + 25);
-    return;
-  }
-
-  const { el: srcEl, srcW, srcH } = media;
-  const W = canvasState.imgNaturalW || 1920;
-  const H = canvasState.imgNaturalH || 1080;
-  const scaleX = srcW / W;
-  const scaleY = srcH / H;
-
-  ctx.clearRect(0, 0, W, H);
-
-  // Desenha imagem ou frame do vídeo ao vivo
-  ctx.drawImage(srcEl, 0, 0, W, H);
-
-  if (!cut) return;
-  const mode = cut.layout_mode;
-
-  if (mode === 'manual_crop') {
-    const p = cut.layout_params;
-    const { crop_x: x, crop_y: y, crop_w: w, crop_h: h } = p;
-
-    // Máscara escura fora do corte
-    ctx.fillStyle = 'rgba(11, 13, 18, 0.7)';
-    ctx.fillRect(0, 0, W, y);                     // Topo
-    ctx.fillRect(0, y + h, W, H - (y + h));         // Base
-    ctx.fillRect(0, y, x, h);                     // Esquerda
-    ctx.fillRect(x + w, y, W - (x + w), h);         // Direita
-
-    // Borda da Caixa 9:16
-    ctx.strokeStyle = '#6366F1';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(x, y, w, h);
-
-    // Alças nos 4 cantos
-    drawHandle(ctx, x, y);
-    drawHandle(ctx, x + w, y);
-    drawHandle(ctx, x, y + h);
-    drawHandle(ctx, x + w, y + h);
-
-    // Badge de proporção
-    drawBadge(ctx, `9:16 (${w}×${h})`, x + 10, y + 26, '#6366F1');
-
-  } else if (mode === 'split_screen') {
-    const top = cut.layout_params.box_top;
-    const bot = cut.layout_params.box_bottom;
-
-    // Escurecimento suave geral
-    ctx.fillStyle = 'rgba(11, 13, 18, 0.55)';
-    ctx.fillRect(0, 0, W, H);
-
-    // Redesenha as duas regiões nítidas escalando da fonte (vídeo ou imagem)
-    ctx.drawImage(srcEl, top.x * scaleX, top.y * scaleY, top.w * scaleX, top.h * scaleY, top.x, top.y, top.w, top.h);
-    ctx.drawImage(srcEl, bot.x * scaleX, bot.y * scaleY, bot.w * scaleX, bot.h * scaleY, bot.x, bot.y, bot.w, bot.h);
-
-    // Caixa Topo (Índigo)
-    ctx.strokeStyle = '#6366F1';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(top.x, top.y, top.w, top.h);
-    drawHandle(ctx, top.x, top.y, '#6366F1');
-    drawHandle(ctx, top.x + top.w, top.y, '#6366F1');
-    drawHandle(ctx, top.x, top.y + top.h, '#6366F1');
-    drawHandle(ctx, top.x + top.w, top.y + top.h, '#6366F1');
-    drawBadge(ctx, 'TOPO (1080×960)', top.x + 10, top.y + 26, '#6366F1');
-
-    // Caixa Base (Âmbar)
-    ctx.strokeStyle = '#F59E0B';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(bot.x, bot.y, bot.w, bot.h);
-    drawHandle(ctx, bot.x, bot.y, '#F59E0B');
-    drawHandle(ctx, bot.x + bot.w, bot.y, '#F59E0B');
-    drawHandle(ctx, bot.x, bot.y + bot.h, '#F59E0B');
-    drawHandle(ctx, bot.x + bot.w, bot.y + bot.h, '#F59E0B');
-    drawBadge(ctx, 'BASE (1080×960)', bot.x + 10, bot.y + 26, '#F59E0B');
-
-  } else if (mode === 'vertical_blur') {
-    // Guia central suave 9:16 indicando a área central
-    const centerW = Math.round(H * (9 / 16));
-    const centerX = Math.round((W - centerW) / 2);
-    ctx.strokeStyle = 'rgba(99, 102, 241, 0.4)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([8, 8]);
-    ctx.strokeRect(centerX, 0, centerW, H);
-    ctx.setLineDash([]);
-  }
-}
-
-function drawHandle(ctx, x, y, color = '#6366F1') {
-  const size = 16;
-  ctx.fillStyle = '#FFFFFF';
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.rect(x - size / 2, y - size / 2, size, size);
-  ctx.fill();
-  ctx.stroke();
-}
-
-function drawBadge(ctx, text, x, y, bgColor = '#6366F1') {
-  ctx.save();
-  ctx.font = 'bold 16px Inter, sans-serif';
-  const textW = ctx.measureText(text).width;
-  ctx.fillStyle = bgColor;
-  ctx.beginPath();
-  ctx.roundRect(x, y - 18, textW + 16, 26, 4);
-  ctx.fill();
-  ctx.fillStyle = '#FFFFFF';
-  ctx.fillText(text, x + 8, y);
-  ctx.restore();
-}
-
-// 2. PRÉVIA FINAL AO VIVO (MOCKUP 9:16 EM TEMPO REAL)
-function renderMockupCanvas() {
-  const ctx = canvasState.mockupCtx;
-  const mW = canvasState.mockupCanvas.width || 1080;
-  const mH = canvasState.mockupCanvas.height || 1920;
-  const cut = getActiveCut();
-  const media = getActiveMediaSource();
-
-  ctx.clearRect(0, 0, mW, mH);
-  if (!cut) return;
-
-  if (!media) {
-    ctx.fillStyle = '#10141D';
-    ctx.fillRect(0, 0, mW, mH);
-    ctx.strokeStyle = '#232938';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(16, 16, mW - 32, mH - 32);
-
-    ctx.fillStyle = '#4B5563';
-    ctx.font = 'bold 36px Inter, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('Prévia Pendente', mW / 2, mH / 2);
-    return;
-  }
-
-  const { el: srcEl, srcW, srcH } = media;
-  const W = canvasState.imgNaturalW || 1920;
-  const H = canvasState.imgNaturalH || 1080;
-  const scaleX = srcW / W;
-  const scaleY = srcH / H;
-  const mode = cut.layout_mode;
-
-  if (mode === 'manual_crop') {
-    const { crop_x: x, crop_y: y, crop_w: w, crop_h: h } = cut.layout_params;
-    // Espelha o recorte do canvas exatamente para 1080x1920
-    ctx.drawImage(srcEl, x * scaleX, y * scaleY, w * scaleX, h * scaleY, 0, 0, mW, mH);
-
-  } else if (mode === 'split_screen') {
-    const top = cut.layout_params.box_top;
-    const bot = cut.layout_params.box_bottom;
-
-    // Metade Superior (0 -> 960)
-    ctx.drawImage(srcEl, top.x * scaleX, top.y * scaleY, top.w * scaleX, top.h * scaleY, 0, 0, mW, 960);
-    // Metade Inferior (960 -> 1920)
-    ctx.drawImage(srcEl, bot.x * scaleX, bot.y * scaleY, bot.w * scaleX, bot.h * scaleY, 0, 960, mW, 960);
-
-    // Divisória sutil entre as duas metades
-    ctx.fillStyle = '#232938';
-    ctx.fillRect(0, 958, mW, 4);
-
-  } else if (mode === 'vertical_blur') {
-    const zoom = cut.layout_params.zoom_factor || 1.0;
-
-    // Fundo desfocado cobrindo todo o 1080x1920
-    ctx.save();
-    ctx.filter = 'blur(25px) brightness(0.8)';
-    const scale = Math.max(mW / srcW, mH / srcH);
-    const bgW = srcW * scale;
-    const bgH = srcH * scale;
-    ctx.drawImage(srcEl, (mW - bgW) / 2, (mH - bgH) / 2, bgW, bgH);
-    ctx.restore();
-
-    // Primeiro plano 16:9 nítido centralizado com zoom_factor
-    const fgW = mW * zoom;
-    const fgH = (mW * (srcH / srcW)) * zoom;
-    const fgX = (mW - fgW) / 2;
-    const fgY = (mH - fgH) / 2;
-    ctx.drawImage(srcEl, fgX, fgY, fgW, fgH);
-
-  } else {
-    // horizontal_16_9 no mockup 9:16 (letterbox limpo)
-    ctx.fillStyle = '#0B0D12';
-    ctx.fillRect(0, 0, mW, mH);
-    const scale = mW / srcW;
-    const h = srcH * scale;
-    ctx.drawImage(srcEl, 0, (mH - h) / 2, mW, h);
-  }
-
-  // Legendas sincronizadas ao vivo caso ativadas
-  if (cut.burn_subtitles) {
-    drawMockupSubtitles(ctx, mW, mH, cut);
-  }
-}
-
-function drawMockupSubtitles(ctx, mW, mH, cut) {
-  let activeText = 'EXEMPLO DE LEGENDA DINÂMICA';
-  const segs = getCutSegments(cut);
-
-  if (segs.length > 0) {
-    if (canvasState.isVideoReady && canvasState.videoEl) {
-      const absSec = cut.start_time + (canvasState.videoEl.currentTime || 0);
-      const found = segs.find((s) => absSec >= s.start && absSec <= s.end);
-      activeText = found ? found.text : '';
-    } else {
-      activeText = segs[0].text;
-    }
-  }
-
-  if (!activeText) return;
-
-  ctx.save();
-  ctx.font = 'bold 38px Inter, Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 9;
-  ctx.fillStyle = '#FFFFFF';
-
-  // Quebra automática em até 2 linhas para caber perfeitamente na largura 1080px do Mockup
-  const words = activeText.toUpperCase().split(/\s+/);
-  const lines = [];
-  let currentLine = '';
-  const maxWidth = mW - 120;
-
-  for (const word of words) {
-    const testLine = currentLine ? `${currentLine} ${word}` : word;
-    if (ctx.measureText(testLine).width > maxWidth && currentLine) {
-      lines.push(currentLine);
-      currentLine = word;
-    } else {
-      currentLine = testLine;
-    }
-  }
-  if (currentLine) lines.push(currentLine);
-
-  const visibleLines = lines.slice(0, 3);
-  const baseY = mH - 220;
-  const lineHeight = 48;
-
-  visibleLines.forEach((line, i) => {
-    const y = baseY + i * lineHeight;
-    ctx.strokeText(line, mW / 2, y);
-    ctx.fillText(line, mW / 2, y);
-  });
-
-  ctx.restore();
+  renderEditorCanvas(canvasState, cut);
+  renderMockupCanvas(canvasState, cut, getCutSegments);
 }
 
 // =========================================================
-// INTERAÇÃO DO MOUSE NO CANVAS (DRAG & RESIZE 60FPS)
+// INTERAÇÃO DO MOUSE NO CANVAS
 // =========================================================
-function getCanvasMouseCoords(e) {
-  const canvas = canvasState.editorCanvas;
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  return {
-    x: (e.clientX - rect.left) * scaleX,
-    y: (e.clientY - rect.top) * scaleY,
-  };
-}
-
 function onCanvasMouseDown(e) {
   if (!canvasState.imgLoaded && !canvasState.isVideoReady) return;
   const cut = getActiveCut();
@@ -1506,7 +1071,7 @@ function onCanvasMouseDown(e) {
   const mode = cut.layout_mode;
   if (mode !== 'manual_crop' && mode !== 'split_screen') return;
 
-  const { x, y } = getCanvasMouseCoords(e);
+  const { x, y } = getCanvasMouseCoords(canvasState.editorCanvas, e);
   canvasState.dragStartX = x;
   canvasState.dragStartY = y;
 
@@ -1514,7 +1079,6 @@ function onCanvasMouseDown(e) {
     const p = cut.layout_params;
     const box = { x: p.crop_x, y: p.crop_y, w: p.crop_w, h: p.crop_h };
 
-    // Checa clique nas 4 alças
     const handle = checkHandleHit(x, y, box);
     if (handle) {
       canvasState.isDragging = true;
@@ -1524,18 +1088,15 @@ function onCanvasMouseDown(e) {
       return;
     }
 
-    // Checa clique dentro da caixa para arrastar
     if (isPointInsideBox(x, y, box)) {
       canvasState.isDragging = true;
       canvasState.dragTarget = 'manual_box';
       canvasState.initialBox = { ...box };
     }
-
   } else if (mode === 'split_screen') {
     const top = cut.layout_params.box_top;
     const bot = cut.layout_params.box_bottom;
 
-    // Alças do Topo
     const topHandle = checkHandleHit(x, y, top);
     if (topHandle) {
       canvasState.isDragging = true;
@@ -1545,7 +1106,6 @@ function onCanvasMouseDown(e) {
       return;
     }
 
-    // Alças da Base
     const botHandle = checkHandleHit(x, y, bot);
     if (botHandle) {
       canvasState.isDragging = true;
@@ -1555,7 +1115,6 @@ function onCanvasMouseDown(e) {
       return;
     }
 
-    // Arrastar caixa do Topo
     if (isPointInsideBox(x, y, top)) {
       canvasState.isDragging = true;
       canvasState.dragTarget = 'top_box';
@@ -1563,7 +1122,6 @@ function onCanvasMouseDown(e) {
       return;
     }
 
-    // Arrastar caixa da Base
     if (isPointInsideBox(x, y, bot)) {
       canvasState.isDragging = true;
       canvasState.dragTarget = 'bot_box';
@@ -1578,15 +1136,13 @@ function onCanvasMouseMove(e) {
   if (!cut) return;
 
   const mode = cut.layout_mode;
-  const { x, y } = getCanvasMouseCoords(e);
+  const { x, y } = getCanvasMouseCoords(canvasState.editorCanvas, e);
 
-  // Atualização do Cursor quando não estiver arrastando
   if (!canvasState.isDragging) {
-    updateCanvasCursor(x, y, mode, cut);
+    updateCanvasCursor(canvasState.editorCanvas, x, y, mode, cut);
     return;
   }
 
-  // Execução do Arraste / Redimensionamento
   const dx = x - canvasState.dragStartX;
   const dy = y - canvasState.dragStartY;
   const init = canvasState.initialBox;
@@ -1594,31 +1150,18 @@ function onCanvasMouseMove(e) {
   const H = canvasState.imgNaturalH;
 
   if (canvasState.dragTarget === 'manual_box') {
-    // Move a caixa 9:16 dentro dos limites do frame
-    const newX = clamp(init.x + dx, 0, W - init.w);
-    const newY = clamp(init.y + dy, 0, H - init.h);
-    cut.layout_params.crop_x = makeEven(Math.round(newX));
-    cut.layout_params.crop_y = makeEven(Math.round(newY));
-
+    cut.layout_params.crop_x = makeEven(Math.round(clamp(init.x + dx, 0, W - init.w)));
+    cut.layout_params.crop_y = makeEven(Math.round(clamp(init.y + dy, 0, H - init.h)));
   } else if (canvasState.dragTarget === 'manual_handle') {
-    // Redimensiona mantendo a proporção 9:16 travada
     resizeBoxWithAspectRatio(cut.layout_params, init, dx, dy, 9 / 16, canvasState.activeHandle, W, H, true);
-
   } else if (canvasState.dragTarget === 'top_box') {
-    const newX = clamp(init.x + dx, 0, W - init.w);
-    const newY = clamp(init.y + dy, 0, H - init.h);
-    cut.layout_params.box_top.x = makeEven(Math.round(newX));
-    cut.layout_params.box_top.y = makeEven(Math.round(newY));
-
+    cut.layout_params.box_top.x = makeEven(Math.round(clamp(init.x + dx, 0, W - init.w)));
+    cut.layout_params.box_top.y = makeEven(Math.round(clamp(init.y + dy, 0, H - init.h)));
   } else if (canvasState.dragTarget === 'top_handle') {
     resizeBoxWithAspectRatio(cut.layout_params.box_top, init, dx, dy, 1080 / 960, canvasState.activeHandle, W, H, false);
-
   } else if (canvasState.dragTarget === 'bot_box') {
-    const newX = clamp(init.x + dx, 0, W - init.w);
-    const newY = clamp(init.y + dy, 0, H - init.h);
-    cut.layout_params.box_bottom.x = makeEven(Math.round(newX));
-    cut.layout_params.box_bottom.y = makeEven(Math.round(newY));
-
+    cut.layout_params.box_bottom.x = makeEven(Math.round(clamp(init.x + dx, 0, W - init.w)));
+    cut.layout_params.box_bottom.y = makeEven(Math.round(clamp(init.y + dy, 0, H - init.h)));
   } else if (canvasState.dragTarget === 'bot_handle') {
     resizeBoxWithAspectRatio(cut.layout_params.box_bottom, init, dx, dy, 1080 / 960, canvasState.activeHandle, W, H, false);
   }
@@ -1636,108 +1179,21 @@ function onCanvasMouseUp() {
   }
 }
 
-// Utilitário de redimensionamento proporcional
-function resizeBoxWithAspectRatio(targetObj, init, dx, dy, aspectWtoH, handle, maxW, maxH, isCropCoords = false) {
-  let newW = init.w;
-  let newH = init.h;
-  let newX = init.x;
-  let newY = init.y;
-
-  if (handle === 'se') {
-    newW = Math.max(120, Math.min(maxW - init.x, init.w + dx));
-    newH = Math.round(newW / aspectWtoH);
-    if (init.y + newH > maxH) {
-      newH = maxH - init.y;
-      newW = Math.round(newH * aspectWtoH);
-    }
-  } else if (handle === 'nw') {
-    newW = Math.max(120, Math.min(init.x + init.w, init.w - dx));
-    newH = Math.round(newW / aspectWtoH);
-    newX = init.x + (init.w - newW);
-    newY = init.y + (init.h - newH);
-    if (newX < 0 || newY < 0) return;
-  } else if (handle === 'ne') {
-    newW = Math.max(120, Math.min(maxW - init.x, init.w + dx));
-    newH = Math.round(newW / aspectWtoH);
-    newY = init.y + (init.h - newH);
-    if (newY < 0) return;
-  } else if (handle === 'sw') {
-    newW = Math.max(120, Math.min(init.x + init.w, init.w - dx));
-    newH = Math.round(newW / aspectWtoH);
-    newX = init.x + (init.w - newW);
-    if (newX < 0 || init.y + newH > maxH) return;
-  }
-
-  newW = makeEven(Math.round(newW));
-  newH = makeEven(Math.round(newH));
-  newX = makeEven(Math.round(newX));
-  newY = makeEven(Math.round(newY));
-
-  if (isCropCoords) {
-    targetObj.crop_w = newW;
-    targetObj.crop_h = newH;
-    targetObj.crop_x = newX;
-    targetObj.crop_y = newY;
-  } else {
-    targetObj.w = newW;
-    targetObj.h = newH;
-    targetObj.x = newX;
-    targetObj.y = newY;
-  }
-}
-
-function updateCanvasCursor(x, y, mode, cut) {
-  const canvas = canvasState.editorCanvas;
-  if (mode === 'manual_crop') {
-    const p = cut.layout_params;
-    const box = { x: p.crop_x, y: p.crop_y, w: p.crop_w, h: p.crop_h };
-    const h = checkHandleHit(x, y, box);
-    if (h === 'nw' || h === 'se') canvas.style.cursor = 'nwse-resize';
-    else if (h === 'ne' || h === 'sw') canvas.style.cursor = 'nesw-resize';
-    else if (isPointInsideBox(x, y, box)) canvas.style.cursor = 'move';
-    else canvas.style.cursor = 'default';
-  } else if (mode === 'split_screen') {
-    const top = cut.layout_params.box_top;
-    const bot = cut.layout_params.box_bottom;
-    const ht = checkHandleHit(x, y, top);
-    const hb = checkHandleHit(x, y, bot);
-    if (ht || hb) canvas.style.cursor = 'pointer';
-    else if (isPointInsideBox(x, y, top) || isPointInsideBox(x, y, bot)) canvas.style.cursor = 'move';
-    else canvas.style.cursor = 'default';
-  } else {
-    canvas.style.cursor = 'default';
-  }
-}
-
-function checkHandleHit(x, y, box) {
-  const hitDist = 24;
-  if (Math.hypot(x - box.x, y - box.y) <= hitDist) return 'nw';
-  if (Math.hypot(x - (box.x + box.w), y - box.y) <= hitDist) return 'ne';
-  if (Math.hypot(x - box.x, y - (box.y + box.h)) <= hitDist) return 'sw';
-  if (Math.hypot(x - (box.x + box.w), y - (box.y + box.h)) <= hitDist) return 'se';
-  return null;
-}
-
-function isPointInsideBox(px, py, box) {
-  return px >= box.x && px <= box.x + box.w && py >= box.y && py <= box.y + box.h;
-}
-
 // =========================================================
-// RENDERIZAÇÃO DE CORTES (POST /api/render)
+// RENDERIZAÇÃO & BIBLIOTECA
 // =========================================================
 async function startRender() {
   if (state.isRendering) return;
   if (canvasState.videoEl && !canvasState.videoEl.paused) {
     canvasState.videoEl.pause();
   }
-  const selecionados = state.cuts.filter(c => c.selected);
+  const selecionados = state.cuts.filter((c) => c.selected);
   if (selecionados.length === 0) {
     alert('Selecione pelo menos um corte para renderizar.');
     return;
   }
 
-  // Garante que cada corte leve a resolução de referência do canvas para reescala exata no FFmpeg
-  selecionados.forEach(c => {
+  selecionados.forEach((c) => {
     if (!c.layout_params) c.layout_params = {};
     if (!c.layout_params.ref_w) c.layout_params.ref_w = canvasState.imgNaturalW || 1920;
     if (!c.layout_params.ref_h) c.layout_params.ref_h = canvasState.imgNaturalH || 1080;
@@ -1746,7 +1202,6 @@ async function startRender() {
   state.isRendering = true;
   updateRenderButtonState();
 
-  // Exibe o modal dedicado de progresso da renderização visível sobre o Workspace
   const overlay = document.getElementById('render-progress-overlay');
   if (overlay) overlay.style.display = 'flex';
   const rStep = document.getElementById('render-progress-step');
@@ -1757,17 +1212,7 @@ async function startRender() {
   if (rFill) rFill.style.width = '5%';
 
   try {
-    const res = await fetch('/api/render', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_id: state.currentVideo.video_id,
-        cuts: selecionados,
-        max_resolution: 1080
-      })
-    });
-    const data = await res.json();
-
+    const { res, data } = await apiStartRender(state.currentVideo.video_id, selecionados, 1080);
     if (res.ok && data.job_id) {
       pollJob(data.job_id, onRenderSuccess, onRenderError);
     } else {
@@ -1781,14 +1226,13 @@ async function startRender() {
   }
 }
 
-function onRenderSuccess(result) {
+function onRenderSuccess() {
   state.isRendering = false;
   updateRenderButtonState();
   const overlay = document.getElementById('render-progress-overlay');
   if (overlay) overlay.style.display = 'none';
 
   showToast('Cortes renderizados com sucesso!');
-  // Transfere o usuário diretamente para a Biblioteca para visualizar os clipes
   switchTab('library');
 }
 
@@ -1800,16 +1244,12 @@ function onRenderError(errorMsg) {
   alert('Erro durante a renderização: ' + errorMsg);
 }
 
-// =========================================================
-// BIBLIOTECA (HISTÓRICO)
-// =========================================================
 async function loadLibraryHistory() {
   const search = document.getElementById('lib-search-input')?.value || '';
   const minScore = parseFloat(document.getElementById('lib-score-slider')?.value) || 0;
 
   try {
-    const res = await fetch(`/api/history?search=${encodeURIComponent(search)}&min_score=${minScore}`);
-    const videos = await res.json();
+    const { data: videos } = await apiGetHistory(search, minScore, 50, 0);
     const container = document.getElementById('library-cards-container');
     container.replaceChildren();
 
@@ -1828,7 +1268,7 @@ async function loadLibraryHistory() {
       return;
     }
 
-    videos.forEach(v => {
+    videos.forEach((v) => {
       const card = document.createElement('div');
       card.className = 'video-card-hist';
 
@@ -1862,7 +1302,7 @@ async function loadLibraryHistory() {
       body.appendChild(metaDiv);
 
       if (v.cortes && v.cortes.length > 0) {
-        v.cortes.forEach(c => {
+        v.cortes.forEach((c) => {
           const cutRow = document.createElement('div');
           cutRow.className = 'cut-row-hist';
 
@@ -1929,7 +1369,6 @@ async function loadLibraryHistory() {
       card.append(header, body);
       container.appendChild(card);
     });
-
   } catch (err) {
     console.error('Erro ao carregar histórico:', err);
   }
@@ -1938,8 +1377,7 @@ async function loadLibraryHistory() {
 async function deleteVideoItem(videoId) {
   const deleteFiles = confirm('Deseja também apagar os arquivos físicos (.mp4/.mp3) do disco?');
   try {
-    const res = await fetch(`/api/history/${videoId}?delete_files=${deleteFiles}`, { method: 'DELETE' });
-    const data = await res.json();
+    const { data } = await apiDeleteVideo(videoId, deleteFiles);
     if (data.success) {
       showToast('Registro excluído com sucesso!');
       loadLibraryHistory();
@@ -1954,8 +1392,7 @@ async function deleteVideoItem(videoId) {
 async function deleteCorteItem(corteId) {
   const deleteFile = confirm('Excluir este corte? Clique em OK para apagar também o arquivo .mp4 do disco (ou Cancelar para manter o arquivo).');
   try {
-    const res = await fetch(`/api/cortes/${corteId}?delete_file=${deleteFile}`, { method: 'DELETE' });
-    const data = await res.json();
+    const { res, data } = await apiDeleteCorte(corteId, deleteFile);
     if (res.ok && data.success) {
       showToast('Corte excluído com sucesso!');
       loadLibraryHistory();
@@ -1973,98 +1410,28 @@ const schedulePersistCutEdits = debounce(async (cut) => {
     return;
   }
   try {
-    await fetch(`/api/cortes/${cut.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: cut.title,
-        start_time: cut.start_time,
-        end_time: cut.end_time,
-        layout_mode: cut.layout_mode,
-        layout_params: cut.layout_params || {},
-        burn_subtitles: Boolean(cut.burn_subtitles),
-      }),
+    await apiPatchCorte(cut.id, {
+      title: cut.title,
+      start_time: cut.start_time,
+      end_time: cut.end_time,
+      layout_mode: cut.layout_mode,
+      layout_params: cut.layout_params || {},
+      burn_subtitles: Boolean(cut.burn_subtitles),
     });
   } catch (err) {
     console.warn('Falha ao salvar edição do corte em segundo plano:', err);
   }
 }, 500);
 
-// =========================================================
-// HELPERS & UTILITÁRIOS
-// =========================================================
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function getSafeCutDownloadUrl(url) {
-  if (typeof url !== 'string') return null;
-  const trimmed = url.trim();
-  if (!trimmed.startsWith('/data/cortes/')) return null;
-  if (trimmed.includes('..') || /[\r\n\x00]/.test(trimmed)) return null;
-  return trimmed;
-}
-
-function makeEven(val) {
-  const n = Math.round(val);
-  return n % 2 === 0 ? n : n - 1;
-}
-
-function clamp(val, min, max) {
-  return Math.max(min, Math.min(max, val));
-}
-
-function formatTimeRange(start, end) {
-  const sMin = Math.floor(start / 60);
-  const sSec = Math.floor(start % 60);
-  const eMin = Math.floor(end / 60);
-  const eSec = Math.floor(end % 60);
-  return `${sMin}:${sSec.toString().padStart(2, '0')} - ${eMin}:${eSec.toString().padStart(2, '0')}`;
-}
-
-function showToast(msg) {
-  const existing = document.getElementById('easykut-toast');
-  if (existing) existing.remove();
-
-  const toast = document.createElement('div');
-  toast.id = 'easykut-toast';
-  toast.style.cssText = `
-    position: fixed;
-    bottom: 24px;
-    right: 24px;
-    background: #141821;
-    color: #F3F4F6;
-    border: 1px solid #6366F1;
-    padding: 10px 18px;
-    border-radius: 8px;
-    font-size: 0.85rem;
-    font-weight: 600;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-    z-index: 999;
-    transition: opacity 0.3s;
-  `;
-  toast.textContent = msg;
-  document.body.appendChild(toast);
-
-  setTimeout(() => {
-    toast.style.opacity = '0';
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
-}
-
-function debounce(func, wait) {
-  let timeout;
-  return function executedFunction(...args) {
-    const later = () => {
-      clearTimeout(timeout);
-      func(...args);
-    };
-    clearTimeout(timeout);
-    timeout = setTimeout(later, wait);
-  };
-}
+// Expõe handlers chamados por atributos inline no HTML (retrocompatibilidade com index.html)
+Object.assign(window, {
+  resetToHero,
+  startAnalysis,
+  refreshCutFrame,
+  togglePlayClipPreview,
+  onClipSeekInput,
+  toggleMuteClipPreview,
+  onZoomSliderChange,
+  escapeHtml,
+  getSafeCutDownloadUrl,
+});
