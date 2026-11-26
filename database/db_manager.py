@@ -8,7 +8,7 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = (BASE_DIR / "data").resolve()
 DEFAULT_DB_PATH = (DATA_DIR / "cortador.db").resolve()
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_LAYOUT_MODES = {
     "horizontal_16_9",
     "vertical_blur",
@@ -106,8 +106,9 @@ def get_connection(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connectio
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """
-    Executa migrations idempotentes baseadas em PRAGMA user_version,
-    adicionando colunas da V3 em bancos legados sem perda de dados.
+    Executa migrations idempotentes baseadas em PRAGMA user_version:
+    - v2: colunas V3 em 'cortes' (tipo, layout_mode, layout_params, burn_subtitles, updated_at).
+    - v3: índices secundários de performance em 'videos' e 'cortes'.
     """
     cursor = conn.cursor()
     current_version = int(cursor.execute("PRAGMA user_version;").fetchone()[0])
@@ -132,6 +133,14 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
                     added_updated_at = True
         if added_updated_at:
             cursor.execute("UPDATE cortes SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL;")
+
+    if current_version < 3:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cortes_video_id ON cortes (video_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cortes_virality_score ON cortes (virality_score);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos (created_at DESC, id DESC);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_url ON videos (url);")
+
+    if current_version < SCHEMA_VERSION:
         cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
 
@@ -279,6 +288,63 @@ def list_videos(
         else:
             cursor.execute("SELECT * FROM videos ORDER BY created_at DESC, id DESC")
         return [dict(row) for row in cursor.fetchall()]
+
+
+def list_videos_with_cortes(
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    db_path: Optional[Path] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Lista vídeos paginados junto com todos os seus cortes em 1 única conexão (sem N+1),
+    executando 1 consulta paginada em 'videos' + 1 consulta em lote (WHERE video_id IN (...)) em 'cortes'.
+    Retorna (lista_de_videos_com_cortes, total_de_videos_correspondentes).
+    """
+    safe_limit = max(1, min(200, int(limit)))
+    safe_offset = max(0, int(offset))
+
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            total_count = int(
+                cursor.execute(
+                    "SELECT COUNT(*) FROM videos WHERE title LIKE ? OR url LIKE ?",
+                    (term, term),
+                ).fetchone()[0]
+            )
+            video_rows = cursor.execute(
+                "SELECT * FROM videos WHERE title LIKE ? OR url LIKE ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (term, term, safe_limit, safe_offset),
+            ).fetchall()
+        else:
+            total_count = int(cursor.execute("SELECT COUNT(*) FROM videos").fetchone()[0])
+            video_rows = cursor.execute(
+                "SELECT * FROM videos ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (safe_limit, safe_offset),
+            ).fetchall()
+
+        videos = [dict(row) for row in video_rows]
+        if not videos:
+            return [], total_count
+
+        video_ids = [int(v["id"]) for v in videos]
+        placeholders = ",".join("?" for _ in video_ids)
+        corte_rows = cursor.execute(
+            f"SELECT * FROM cortes WHERE video_id IN ({placeholders}) ORDER BY video_id ASC, start_time ASC",  # nosec B608
+            video_ids,
+        ).fetchall()
+
+        cortes_by_video: Dict[int, List[Dict[str, Any]]] = {vid: [] for vid in video_ids}
+        for row in corte_rows:
+            item = _deserialize_corte_row(row)
+            cortes_by_video[int(item["video_id"])].append(item)
+
+        for v in videos:
+            v["cortes"] = cortes_by_video.get(int(v["id"]), [])
+
+        return videos, total_count
 
 
 def delete_video(video_id: int, delete_files: bool = False, db_path: Optional[Path] = None) -> bool:
