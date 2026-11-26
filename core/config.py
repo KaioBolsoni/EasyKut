@@ -31,12 +31,14 @@ DATA_DIR = BASE_DIR / "data"
 DOWNLOADS_DIR = DATA_DIR / "downloads"
 CUTS_DIR = DATA_DIR / "cortes"
 CACHE_DIR = DATA_DIR / "cache"
+LOGS_DIR = DATA_DIR / "logs"
 PROMPTS_DIR = BASE_DIR / "prompts"
 
 # Cria diretórios essenciais caso não existam
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 CUTS_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Procura e carrega arquivo .env de forma determinística
