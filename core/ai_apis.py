@@ -18,6 +18,7 @@ from google import genai
 from google.genai import types
 
 from core.config import GROQ_API_KEY, GEMINI_API_KEY, PROMPTS_DIR
+from core.media_utils import normalize_virality_score
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,13 @@ def transcribe_audio_groq(
         )
         compressed = path.parent / f"{path.stem}_groq_opt.mp3"
         try:
-            import subprocess
+            import subprocess  # nosec B404
             cmd = [
                 "ffmpeg", "-nostdin", "-y", "-i", str(path),
                 "-vn", "-ac", "1", "-ar", "16000", "-b:a", "24k",
                 str(compressed)
             ]
-            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=120)
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=120)  # nosec B603
             if compressed.exists() and compressed.stat().st_size > 0:
                 target_audio_path = compressed
                 logger.info("Áudio recomprimido com sucesso para %.2f MB.", compressed.stat().st_size / (1024 * 1024))
@@ -248,10 +249,7 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
             end = float(c.get("end_time", 0.0))
             dur = end - start
             if end > start and dur >= 5.0:
-                raw_score = float(c.get("virality_score", c.get("score", 85.0)))
-                # Se o modelo retornar na escala 0-10 legada, converte suavemente para 0-100
-                if 0.0 < raw_score <= 10.0:
-                    raw_score = raw_score * 10.0
+                raw_score = normalize_virality_score(c.get("virality_score", c.get("score", 85.0)), default=85.0)
 
                 tipo_val = str(c.get("tipo", "short" if dur <= 180.0 else "longo")).strip().lower()
                 if tipo_val not in ("short", "longo"):
