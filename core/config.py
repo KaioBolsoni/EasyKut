@@ -3,11 +3,14 @@ Módulo de Configuração e Gerenciamento de Variáveis de Ambiente (EasyKut)
 Carrega e valida chaves de API e caminhos de diretórios do projeto.
 """
 
+import logging
 import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Configuração e descoberta automática do FFmpeg no sistema
 FFMPEG_KNOWN_PATHS = [
@@ -27,11 +30,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DOWNLOADS_DIR = DATA_DIR / "downloads"
 CUTS_DIR = DATA_DIR / "cortes"
+CACHE_DIR = DATA_DIR / "cache"
 PROMPTS_DIR = BASE_DIR / "prompts"
 
 # Cria diretórios essenciais caso não existam
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 CUTS_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Procura e carrega arquivo .env de forma determinística
@@ -40,6 +45,16 @@ if env_file.exists():
     load_dotenv(dotenv_path=env_file)
 else:
     load_dotenv(find_dotenv())
+
+# Alerta preventivo caso existam arquivos de credenciais duplicados fora da pasta do projeto
+for stray_name in ("APIS.txt", ".env"):
+    stray_path = BASE_DIR.parent / stray_name
+    if stray_path.exists() and stray_path.is_file():
+        logger.warning(
+            "Aviso de segurança: arquivo '%s' detectado fora de cortador_automatico/. "
+            "Consolide suas chaves apenas em cortador_automatico/.env e remova o arquivo redundante.",
+            stray_name
+        )
 
 # Chaves de API
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
