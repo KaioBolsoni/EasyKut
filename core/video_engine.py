@@ -5,24 +5,99 @@ e horizontal 16:9 (vídeos longos), com sincronização e queima de legendas (.s
 """
 
 from collections import deque
+import ipaddress
 import json
 import logging
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 import uuid
 
 import cv2
 import numpy as np
 
-from core.config import CUTS_DIR, DATA_DIR, DOWNLOADS_DIR, FFMPEG_AVAILABLE
+from core.config import CUTS_DIR, DATA_DIR, DOWNLOADS_DIR
 
 logger = logging.getLogger(__name__)
 
-TEMP_DIR = DATA_DIR / "temp"
+TEMP_DIR = (DATA_DIR / "temp").resolve()
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_DIR_RESOLVED = DATA_DIR.resolve()
+FFMPEG_ALLOWED_PROTOCOLS = "file,http,https,tcp,tls"
+
+
+def _is_path_within(path: Path, base_dir: Path) -> bool:
+    """Verifica estritamente se um caminho resolvido está confinado dentro de base_dir."""
+    try:
+        return path.resolve().is_relative_to(base_dir.resolve())
+    except Exception:
+        return False
+
+
+def _validate_ffmpeg_input_target(target: str, require_within_data_dir: bool = True) -> str:
+    """
+    Valida alvos de entrada passados ao FFmpeg contra argument injection (prefixo '-'),
+    protocolos perigosos, SSRF para IPs internos e leitura de arquivos locais fora de DATA_DIR.
+    """
+    if not target or not isinstance(target, str):
+        raise ValueError("Alvo de entrada FFmpeg vazio ou inválido.")
+    clean = target.strip()
+    if not clean or clean.startswith("-") or any(ch in clean for ch in ("\x00", "\r", "\n")):
+        raise ValueError("Alvo de entrada FFmpeg contém caracteres ou prefixo proibidos.")
+
+    if clean.startswith(("http://", "https://")):
+        parsed = urlparse(clean)
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not host or host in ("localhost", "localhost.localdomain"):
+            raise ValueError("URL remota com host local não permitida no FFmpeg.")
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                raise ValueError("URL remota apontando para IP interno não permitida no FFmpeg.")
+        except ValueError as ip_exc:
+            if "não permitida" in str(ip_exc):
+                raise
+            # Hostname DNS: verifica se resolve para IP proibido
+            try:
+                for info in socket.getaddrinfo(host, None):
+                    sockaddr = info[4]
+                    if sockaddr:
+                        ip_obj = ipaddress.ip_address(sockaddr[0].split("%")[0])
+                        if (
+                            ip_obj.is_private
+                            or ip_obj.is_loopback
+                            or ip_obj.is_link_local
+                            or ip_obj.is_multicast
+                            or ip_obj.is_reserved
+                            or ip_obj.is_unspecified
+                        ):
+                            raise ValueError("Host remoto resolve para endereço interno proibido.")
+            except OSError:
+                pass
+        return clean
+
+    # Bloqueia esquemas/protocolos arbitrários (ex: concat:, subfile:, file:, crypto:, ftp:)
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]{1,}:", clean) and not re.match(r"^[a-zA-Z]:[\\/]", clean):
+        raise ValueError("Protocolo não permitido no FFmpeg.")
+
+    resolved = Path(clean).resolve()
+    if require_within_data_dir and not _is_path_within(resolved, DATA_DIR_RESOLVED):
+        raise PermissionError("Acesso negado: arquivo local fora do diretório de dados permitido.")
+    if not resolved.exists() or not resolved.is_file():
+        raise FileNotFoundError(f"Arquivo de entrada não encontrado: {resolved.name}")
+    return str(resolved)
 
 MODELS_DIR = DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,7 +135,7 @@ def get_video_metadata(video_path: str) -> Dict[str, Any]:
         str(path)
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=True)
     probe_data = json.loads(result.stdout)
 
     video_stream = next(
@@ -315,7 +390,7 @@ class _FaceDetectorWrapper:
                 detections = self.backend.forward()
                 best_face = None
                 max_area = 0.0
-                for i in range(detections.shape2 if hasattr(detections, "shape2") else detections.shape[2]):
+                for i in range(detections.shape[2]):
                     confidence = float(detections[0, 0, i, 2])
                     if confidence > 0.6:
                         box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
@@ -364,55 +439,56 @@ def detect_smooth_face_crop_x(
             logger.warning("Não foi possível abrir o vídeo para detecção facial: %s", video_path)
             return None
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_step = max(1, int(fps * sample_rate_sec))
-        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
-
         history_x: deque = deque(maxlen=window_size)
         smoothed_x_list: List[float] = []
-
-        current_sec = start_time
         max_crop_x = max(0, orig_w - crop_w)
-        scale_factor = 0.5
 
-        while current_sec < end_time:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            frame_step = max(1, int(fps * sample_rate_sec))
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
 
-            face = detector.detect_largest_face(frame, scale_factor=scale_factor)
+            current_sec = start_time
+            scale_factor = 0.5
 
-            if face is not None:
-                fx, fy, fw, fh = face
-                face_center_x = fx + (fw / 2.0)
-
-                # Posição X da janela 9:16 para centralizar o rosto
-                target_x = face_center_x - (crop_w / 2.0)
-                target_x = max(0.0, min(float(max_crop_x), target_x))
-
-                # Estabilidade em múltiplos rostos: se houver salto brusco entre falantes,
-                # limita o passo máximo por amostra para garantir transição suave (damping)
-                if history_x:
-                    last_pos = history_x[-1]
-                    max_step = float(crop_w * 0.25)
-                    if abs(target_x - last_pos) > max_step:
-                        if target_x > last_pos:
-                            target_x = last_pos + max_step
-                        else:
-                            target_x = last_pos - max_step
-
-                # Atualiza Média Móvel nos últimos 10 frames
-                history_x.append(target_x)
-                moving_avg = sum(history_x) / len(history_x)
-                smoothed_x_list.append(moving_avg)
-
-            # Salta frames intermediários com grab rápido (otimização de decodificação sequencial)
-            for _ in range(frame_step - 1):
-                if not cap.grab():
+            while current_sec < end_time:
+                ret, frame = cap.read()
+                if not ret:
                     break
-            current_sec += sample_rate_sec
 
-        cap.release()
+                face = detector.detect_largest_face(frame, scale_factor=scale_factor)
+
+                if face is not None:
+                    fx, fy, fw, fh = face
+                    face_center_x = fx + (fw / 2.0)
+
+                    # Posição X da janela 9:16 para centralizar o rosto
+                    target_x = face_center_x - (crop_w / 2.0)
+                    target_x = max(0.0, min(float(max_crop_x), target_x))
+
+                    # Estabilidade em múltiplos rostos: se houver salto brusco entre falantes,
+                    # limita o passo máximo por amostra para garantir transição suave (damping)
+                    if history_x:
+                        last_pos = history_x[-1]
+                        max_step = float(crop_w * 0.25)
+                        if abs(target_x - last_pos) > max_step:
+                            if target_x > last_pos:
+                                target_x = last_pos + max_step
+                            else:
+                                target_x = last_pos - max_step
+
+                    # Atualiza Média Móvel nos últimos 10 frames
+                    history_x.append(target_x)
+                    moving_avg = sum(history_x) / len(history_x)
+                    smoothed_x_list.append(moving_avg)
+
+                # Salta frames intermediários com grab rápido (otimização de decodificação sequencial)
+                for _ in range(frame_step - 1):
+                    if not cap.grab():
+                        break
+                current_sec += sample_rate_sec
+        finally:
+            cap.release()
 
         if not smoothed_x_list:
             logger.info("Nenhum rosto detectado no trecho %.2fs -> %.2fs. Fallback para center crop.", start_time, end_time)
@@ -450,9 +526,9 @@ def _format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> 
         rest = clean_path[2:]
         clean_path = f"{drive}\\:{rest}"
 
-    # Escapa caracteres especiais do parser de filtros do FFmpeg: ', [, ], ,, ;
+    # Escapa caracteres especiais para o parser libavfilter do FFmpeg no Windows/Linux
     clean_path = (
-        clean_path.replace("'", "'\\''")
+        clean_path.replace("'", "\\'")
         .replace("[", "\\[")
         .replace("]", "\\]")
         .replace(",", "\\,")
@@ -522,27 +598,36 @@ def extract_preview_frame(
                 logger.warning("Falha ao obter stream URL direto com yt-dlp: %s. Tentando URL original.", exc)
                 input_target = src_str
         else:
-            local_p = Path(src_str)
-            if not local_p.exists():
-                logger.warning("Arquivo fonte não encontrado para extração de frame: %s", src_str)
+            local_p = Path(src_str).resolve()
+            if not _is_path_within(local_p, DATA_DIR_RESOLVED) or not local_p.exists() or not local_p.is_file():
+                logger.warning("Arquivo fonte inválido ou fora de DATA_DIR para extração de frame: %s", src_str)
                 return None
-            input_target = str(local_p.resolve())
+            input_target = str(local_p)
 
         ua_header = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
 
         def _run_ffmpeg_extract(target: str) -> bool:
-            cmd = ["ffmpeg", "-nostdin", "-y"]
-            if target.startswith("http://") or target.startswith("https://"):
+            try:
+                safe_target = _validate_ffmpeg_input_target(target, require_within_data_dir=True)
+            except Exception as val_exc:
+                logger.warning("Alvo bloqueado na extração de frame: %s", val_exc)
+                return False
+
+            cmd = [
+                "ffmpeg", "-nostdin", "-y",
+                "-protocol_whitelist", FFMPEG_ALLOWED_PROTOCOLS,
+            ]
+            if safe_target.startswith(("http://", "https://")):
                 cmd.extend(["-headers", ua_header])
             cmd.extend([
                 "-ss", str(max(0.0, float(timestamp_sec))),
-                "-i", target,
+                "-i", safe_target,
                 "-vframes", "1",
                 "-q:v", "2",
                 str(dest)
             ])
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
                 return proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0
             except Exception as exc_cmd:
                 logger.debug("Erro na execução do FFmpeg para frame: %s", exc_cmd)
@@ -625,29 +710,44 @@ def extract_preview_clip(
                 logger.warning("Falha ao obter stream URL para clipe de prévia: %s", exc)
                 input_target = src_str
         else:
-            local_p = Path(src_str)
-            if not local_p.exists():
+            local_p = Path(src_str).resolve()
+            if not _is_path_within(local_p, DATA_DIR_RESOLVED) or not local_p.exists() or not local_p.is_file():
+                logger.warning("Arquivo fonte inválido ou fora de DATA_DIR para clipe de prévia: %s", src_str)
                 return None
-            input_target = str(local_p.resolve())
+            input_target = str(local_p)
 
-        has_local_audio = bool(local_audio_path and Path(local_audio_path).exists())
+        safe_local_audio: Optional[str] = None
+        if local_audio_path:
+            audio_p = Path(local_audio_path).resolve()
+            if _is_path_within(audio_p, DATA_DIR_RESOLVED) and audio_p.exists() and audio_p.is_file():
+                safe_local_audio = str(audio_p)
+
         ua_header = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
 
         def _run_ffmpeg_clip(target: str) -> bool:
-            cmd = ["ffmpeg", "-nostdin", "-y"]
-            if target.startswith("http://") or target.startswith("https://"):
+            try:
+                safe_target = _validate_ffmpeg_input_target(target, require_within_data_dir=True)
+            except Exception as val_exc:
+                logger.warning("Alvo bloqueado na extração de clipe de prévia: %s", val_exc)
+                return False
+
+            cmd = [
+                "ffmpeg", "-nostdin", "-y",
+                "-protocol_whitelist", FFMPEG_ALLOWED_PROTOCOLS,
+            ]
+            if safe_target.startswith(("http://", "https://")):
                 cmd.extend(["-headers", ua_header])
             cmd.extend([
                 "-ss", str(round(s_time, 2)),
                 "-t", str(round(duration, 2)),
-                "-i", target,
+                "-i", safe_target,
             ])
 
-            if has_local_audio:
+            if safe_local_audio:
                 cmd.extend([
                     "-ss", str(round(s_time, 2)),
                     "-t", str(round(duration, 2)),
-                    "-i", str(Path(local_audio_path).resolve()),
+                    "-i", safe_local_audio,
                     "-map", "0:v:0",
                     "-map", "1:a:0",
                 ])
@@ -670,7 +770,7 @@ def extract_preview_clip(
                 str(dest)
             ])
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
                 return proc.returncode == 0 and dest.exists() and dest.stat().st_size > 2048
             except Exception as exc_cmd:
                 logger.debug("Erro na execução do FFmpeg para clipe de prévia: %s", exc_cmd)
@@ -715,24 +815,32 @@ def draw_framing_preview(
     - horizontal_16_9: devolve o frame original em formato widescreen.
     Retorna o caminho absoluto da imagem JPG resultante.
     """
-    p = Path(frame_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Frame não encontrado para preview: {frame_path}")
+    p = Path(frame_path).resolve()
+    if not _is_path_within(p, DATA_DIR_RESOLVED):
+        raise PermissionError("Acesso negado: frame_path fora do diretório de dados permitido.")
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"Frame não encontrado para preview: {p.name}")
 
-    img = cv2.imread(str(p.resolve()))
+    img = cv2.imread(str(p))
     if img is None:
-        raise ValueError(f"Não foi possível decodificar o arquivo de imagem: {frame_path}")
+        raise ValueError(f"Não foi possível decodificar o arquivo de imagem: {p.name}")
 
     H, W = img.shape[:2]
     cfg = params or {}
 
-    if output_path:
-        dest = Path(output_path)
-    else:
-        dest = TEMP_DIR / f"framing_{p.stem}_{mode}.jpg"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
     mode_clean = str(mode).lower().strip()
+    safe_mode = re.sub(r"[^a-zA-Z0-9_-]", "", mode_clean)[:32] or "preview"
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", p.stem)[:40] or "frame"
+
+    if output_path:
+        dest = Path(output_path).resolve()
+        if not _is_path_within(dest, DATA_DIR_RESOLVED):
+            raise PermissionError("Acesso negado: output_path fora do diretório de dados permitido.")
+    else:
+        dest = (TEMP_DIR / f"framing_{safe_stem}_{safe_mode}.jpg").resolve()
+        if not _is_path_within(dest, TEMP_DIR):
+            raise PermissionError("Caminho de destino inválido para preview.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     if mode_clean in ("manual_crop", "crop_center", "crop", "face_tracking_9_16", "face_tracking"):
         # 1. Modo manual_crop: Desenha o retângulo da área 9:16 selecionada
@@ -960,7 +1068,7 @@ def cut_video(
                 str(dest)
             ])
             logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             if proc.returncode != 0:
                 logger.error("Falha no FFmpeg stream copy: %s", proc.stderr)
                 raise RuntimeError(f"Erro ao processar corte horizontal: {proc.stderr[:350]}")
@@ -1162,7 +1270,7 @@ def cut_video(
     logger.info("Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
                 start_time, end_time, effective_mode, bool(srt_file_path), dest.name)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     if proc.returncode != 0:
         logger.error("Falha no FFmpeg: %s", proc.stderr)
         raise RuntimeError(f"Erro ao processar corte de vídeo: {proc.stderr[:350]}")
