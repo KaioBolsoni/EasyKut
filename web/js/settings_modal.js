@@ -44,7 +44,17 @@ export function updateConfigModalUI(data, health) {
   }
 
   if (health) {
-    setStatusTag('cfg-status-db', Boolean(health.db_ok), 'Online (WAL v3)', 'Degradado');
+    setStatusTag('cfg-status-db', Boolean(health.db_ok), 'Online (WAL v4)', 'Degradado');
+    const gpuEl = document.getElementById('cfg-status-gpu');
+    if (gpuEl) {
+      if (health.gpu_encoder) {
+        gpuEl.className = 'status-tag-ok';
+        gpuEl.textContent = `GPU (${health.gpu_encoder})`;
+      } else {
+        gpuEl.className = 'status-tag-off';
+        gpuEl.textContent = 'CPU (libx264)';
+      }
+    }
     const diskEl = document.getElementById('cfg-status-disk');
     if (diskEl) {
       const mb = Number(health.disk_free_mb);

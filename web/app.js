@@ -1,9 +1,9 @@
 /**
- * EasyKut Studio V3.2 — Bootstrap Modular (ES Module Entry Point)
+ * EasyKut Studio V4.0 — Bootstrap Modular (ES Module Entry Point)
  * Conecta eventos do DOM aos sub-módulos especializados sem poluir `window`.
  */
 
-import { apiOpenFolder } from './js/api.js';
+import { apiCancelJob, apiOpenFolder } from './js/api.js';
 import { initBlurBuffer } from './js/canvas_engine.js';
 import { bindCanvasInteractions } from './js/canvas_interactions.js';
 import {
@@ -13,6 +13,7 @@ import {
   togglePlayClipPreview,
 } from './js/clip_player.js';
 import { initLibraryView, loadLibraryHistory } from './js/library_view.js';
+import { bindProPanelsEvents, refreshProResources } from './js/pro_panels.js';
 import {
   closeSettingsModal,
   fetchConfigAndHealth,
@@ -68,6 +69,18 @@ async function openCutsFolder() {
   }
 }
 
+async function cancelActiveRenderJob() {
+  if (!state.activeJobId) return;
+  try {
+    const { res } = await apiCancelJob(state.activeJobId);
+    if (res.ok) {
+      showToast('Solicitação de cancelamento enviada ao FFmpeg...');
+    }
+  } catch (err) {
+    console.warn('Erro ao cancelar job:', err);
+  }
+}
+
 function initCanvas() {
   canvasState.editorCanvas = document.getElementById('editor-canvas');
   canvasState.editorCtx = canvasState.editorCanvas.getContext('2d');
@@ -80,6 +93,31 @@ function initCanvas() {
   initBlurBuffer(canvasState);
   initClipPlayer({ renderAllCanvases, updateCanvasPlaceholderUI });
   bindCanvasInteractions(renderAllCanvases);
+}
+
+function bindProControls() {
+  document.getElementById('select-sub-preset')?.addEventListener('change', (e) => {
+    state.subtitlePreset = e.target.value || 'hormozi';
+  });
+  document.getElementById('toggle-jump-cuts')?.addEventListener('change', (e) => {
+    state.removeSilences = e.target.checked;
+  });
+  document.getElementById('toggle-punch-zoom')?.addEventListener('change', (e) => {
+    state.punchInZoom = e.target.checked;
+  });
+  document.getElementById('toggle-loudnorm')?.addEventListener('change', (e) => {
+    state.normalizeAudio = e.target.checked;
+  });
+  document.getElementById('toggle-use-gpu')?.addEventListener('change', (e) => {
+    state.useGpu = e.target.checked;
+  });
+  document.getElementById('select-brand-kit')?.addEventListener('change', (e) => {
+    state.brandKitId = e.target.value ? Number(e.target.value) : null;
+  });
+  document.getElementById('select-bgm-track')?.addEventListener('change', (e) => {
+    state.musicFilename = e.target.value || '';
+  });
+  document.getElementById('btn-cancel-active-job')?.addEventListener('click', cancelActiveRenderJob);
 }
 
 function bindDOMEvents() {
@@ -151,7 +189,7 @@ function bindDOMEvents() {
     }
   });
 
-  // 5 Modos de Layout (inclui Face Tracking IA)
+  // 6 Modos de Layout (inclui Face Tracking IA e 1:1 Quadrado)
   document.querySelectorAll('.layout-btn').forEach((btn) => {
     btn.addEventListener('click', () => setLayoutMode(btn.dataset.mode));
   });
@@ -168,6 +206,9 @@ function bindDOMEvents() {
     loadLibraryHistory(false);
   });
   document.getElementById('btn-library-load-more')?.addEventListener('click', () => loadLibraryHistory(true));
+
+  bindProControls();
+  bindProPanelsEvents();
 }
 
 function boot() {
@@ -181,6 +222,7 @@ function boot() {
   });
   bindDOMEvents();
   fetchConfigAndHealth();
+  refreshProResources();
 }
 
 if (document.readyState === 'loading') {

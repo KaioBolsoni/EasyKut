@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EasyKut Studio V3.2 — Editor Profissional de Cortes Virais</title>
+  <title>EasyKut Studio V4.0 — Plataforma Profissional de Cortes Virais</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -21,7 +21,7 @@
         <line x1="8.12" y1="8.12" x2="12" y2="12"/>
       </svg>
       <div class="brand-title">EasyKut <span>Studio</span></div>
-      <span class="brand-tag">V3.2</span>
+      <span class="brand-tag">V4.0</span>
     </div>
 
     <!-- TABS CENTRAIS (ESTÚDIO | BIBLIOTECA) -->
@@ -38,6 +38,10 @@
 
     <!-- AÇÕES DIREITA -->
     <div class="topbar-actions">
+      <button id="btn-pro-hub-modal" class="action-btn" title="Gerenciar Brand Kit, Trilhas Auto-Ducking e B-Roll">
+        🎨 Brand Kit & Pro
+      </button>
+
       <button id="btn-open-folder" class="action-btn" title="Abrir pasta data/cortes no Windows Explorer">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
         Pasta de Cortes
@@ -192,15 +196,58 @@
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="18" x="3" y="3" rx="2"/><line x1="3" x2="21" y1="12" y2="12"/></svg>
                   Split-Screen
                 </button>
-                <button class="layout-btn" data-mode="face_tracking_9_16" title="Enquadramento automático 9:16 com detecção facial OpenCV">
+                <button class="layout-btn" data-mode="face_tracking_9_16" title="Enquadramento automático 9:16 com detecção facial dinâmica OpenCV">
                   🤖 Face Tracking
+                </button>
+                <button class="layout-btn" data-mode="square_1_1" title="Formato quadrado 1:1 (1080×1080) para Feed">
+                  ⬜ 1:1 Feed
                 </button>
               </div>
 
-              <label class="toggle-subs-label">
-                <input type="checkbox" id="toggle-burn-subs" checked>
-                <span>🔥 Queimar Legendas (.srt)</span>
+              <div class="subs-controls-group">
+                <label class="toggle-subs-label">
+                  <input type="checkbox" id="toggle-burn-subs" checked>
+                  <span>🔥 Karaoke (.ass)</span>
+                </label>
+                <select id="select-sub-preset" class="provider-select pro-select-xs" title="Estilo visual das legendas Karaoke">
+                  <option value="hormozi">Hormozi</option>
+                  <option value="neon">Neon</option>
+                  <option value="boxed">Caixa</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="classic">Clássico</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- LINHA 3: CONTROLES PRO V4.0 (JUMP CUTS, PUNCH ZOOM, ÁUDIO, GPU, BRAND KIT, MULTI-EXPORT) -->
+            <div class="pro-studio-bar">
+              <label class="pro-pill-toggle" title="Remove pausas e silêncios longos mantendo legendas sincronizadas">
+                <input type="checkbox" id="toggle-jump-cuts">
+                <span>⚡ Jump Cuts</span>
               </label>
+              <label class="pro-pill-toggle" title="Aplica micro-zoom dinâmico periódico (1.0x → 1.07x) para retenção">
+                <input type="checkbox" id="toggle-punch-zoom">
+                <span>🔍 Punch Zoom</span>
+              </label>
+              <label class="pro-pill-toggle" title="Normaliza áudio para -14 LUFS (padrão Reels/Shorts/TikTok)">
+                <input type="checkbox" id="toggle-loudnorm">
+                <span>🎚️ -14 LUFS</span>
+              </label>
+              <label class="pro-pill-toggle" title="Acelera renderização via NVENC/QSV/AMF com fallback automático para CPU">
+                <input type="checkbox" id="toggle-use-gpu">
+                <span>🚀 GPU</span>
+              </label>
+              <select id="select-brand-kit" class="provider-select pro-select-xs" title="Brand Kit aplicado na renderização">
+                <option value="">Sem Brand Kit</option>
+              </select>
+              <select id="select-bgm-track" class="provider-select pro-select-xs" title="Trilha sonora com Auto-Ducking">
+                <option value="">Sem trilha</option>
+              </select>
+              <span class="pro-export-group" title="Gerar formatos extras além do layout atual">
+                <span>+Export:</span>
+                <label><input type="checkbox" class="chk-export-format" value="1:1">1:1</label>
+                <label><input type="checkbox" class="chk-export-format" value="16:9">16:9</label>
+              </span>
             </div>
           </div>
 
@@ -364,6 +411,10 @@
               <span id="cfg-status-db" class="status-tag-off">Verificando...</span>
             </div>
             <div class="status-row">
+              <span>Encoder Hardware (GPU):</span>
+              <span id="cfg-status-gpu" class="status-tag-off">Verificando...</span>
+            </div>
+            <div class="status-row">
               <span>Espaço Livre em Disco:</span>
               <span id="cfg-status-disk" class="status-tag-off">Verificando...</span>
             </div>
@@ -395,12 +446,12 @@
   </div>
 
   <!-- =========================================================
-       MODAL DE PROGRESSO DA RENDERIZAÇÃO (FFMPEG)
+       MODAL DE PROGRESSO DA RENDERIZAÇÃO (COM CANCELAMENTO)
        ========================================================= -->
   <div id="render-progress-overlay" class="modal-backdrop" style="display: none; z-index: 200;">
     <div class="modal-dialog" style="max-width: 480px;">
       <div class="modal-header">
-        <h3 class="modal-title">Renderizando Cortes no Estúdio</h3>
+        <h3 class="modal-title">Renderizando no Estúdio</h3>
       </div>
       <div class="modal-body" style="padding: 1.5rem;">
         <div class="progress-line-track" style="margin-bottom: 1rem;">
@@ -410,6 +461,155 @@
           <span id="render-progress-step">Preparando renderização com FFmpeg...</span>
           <span id="render-progress-pct">5%</span>
         </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-cancel-active-job" type="button" class="action-btn" style="color: var(--accent-red);">
+          ⏹ Cancelar Job
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL HUB PRO (BRAND KIT + MÚSICAS + B-ROLL)
+       ========================================================= -->
+  <div id="pro-hub-modal" class="modal-backdrop">
+    <div class="modal-dialog" style="max-width: 620px; max-height: 88vh; overflow-y: auto;">
+      <div class="modal-header">
+        <h3 class="modal-title">🎨 Brand Kit, Trilhas Auto-Ducking & B-Roll</h3>
+        <button id="pro-hub-close-btn" class="icon-btn" style="border: none; background: transparent;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="pro-card-section">
+          <div class="pro-section-label">1. Brand Kit (Identidade Visual Reutilizável)</div>
+          <div class="pro-form-grid">
+            <input type="text" id="bk-name-input" class="cut-title-input" placeholder="Nome do Brand Kit (ex.: Canal Principal)">
+            <select id="bk-sub-preset" class="provider-select">
+              <option value="hormozi">Karaoke Hormozi</option>
+              <option value="neon">Karaoke Neon</option>
+              <option value="boxed">Caixa Destaque</option>
+              <option value="minimal">Minimalista</option>
+              <option value="classic">Clássico</option>
+            </select>
+            <select id="bk-logo-pos" class="provider-select">
+              <option value="top_right">Logo: Topo Direita</option>
+              <option value="top_left">Logo: Topo Esquerda</option>
+              <option value="bottom_right">Logo: Base Direita</option>
+              <option value="bottom_left">Logo: Base Esquerda</option>
+            </select>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <input type="color" id="bk-progress-color" value="#6366F1" title="Cor da barra de progresso">
+              <input type="range" id="bk-logo-opacity" min="0.2" max="1" step="0.05" value="0.85" title="Opacidade da logo">
+            </div>
+          </div>
+          <div class="pro-inline-row" style="margin-top: 0.5rem;">
+            <input type="file" id="bk-logo-file" accept=".png,.jpg,.jpeg,.webp" style="display: none;">
+            <button id="btn-upload-logo" type="button" class="action-btn" style="height: 30px; font-size: 0.78rem;">🖼️ Enviar Logo</button>
+            <span id="bk-logo-status" class="pro-row-meta">Opcional (.png/.webp)</span>
+            <label class="pro-pill-toggle"><input type="checkbox" id="bk-progress-bar" checked><span>Barra Progresso</span></label>
+            <label class="pro-pill-toggle"><input type="checkbox" id="bk-hook-banner"><span>Hook Banner (3s)</span></label>
+            <button id="btn-save-brand-kit" type="button" class="btn-primary" style="padding: 0.35rem 0.9rem; font-size: 0.78rem;">Salvar Kit</button>
+          </div>
+          <div id="brand-kits-list" class="pro-list-container"></div>
+        </div>
+
+        <div class="pro-card-section">
+          <div class="pro-section-label">2. Trilhas de Fundo (Auto-Ducking com sidechaincompress)</div>
+          <div class="pro-inline-row">
+            <input type="file" id="music-file-input" accept=".mp3,.wav,.m4a,.aac,.ogg" style="display: none;">
+            <button id="btn-upload-music" type="button" class="action-btn" style="height: 30px; font-size: 0.78rem;">🎵 Enviar Trilha (.mp3/.wav)</button>
+          </div>
+          <div id="music-tracks-list" class="pro-list-container"></div>
+        </div>
+
+        <div class="pro-card-section">
+          <div class="pro-section-label">3. B-Roll Automático (Pexels / Pixabay / Biblioteca Local)</div>
+          <div class="pro-inline-row">
+            <input type="text" id="broll-query-input" class="cut-title-input" style="flex: 1;" placeholder="Palavra-chave (ou deixe vazio para extrair da transcrição do corte ativo)">
+            <button id="btn-search-broll" type="button" class="action-btn" style="height: 32px; font-size: 0.8rem;">🔎 Sugerir B-Roll</button>
+          </div>
+          <div id="broll-results-box" class="pro-list-container"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL KIT DE PUBLICAÇÃO SEO IA
+       ========================================================= -->
+  <div id="seo-kit-modal" class="modal-backdrop">
+    <div class="modal-dialog" style="max-width: 540px;">
+      <div class="modal-header">
+        <h3 class="modal-title">✨ Kit de Publicação SEO IA</h3>
+        <button id="seo-kit-close-btn" class="icon-btn" style="border: none; background: transparent;">✕</button>
+      </div>
+      <div id="seo-kit-content" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL HIGHLIGHT REEL (XFADE)
+       ========================================================= -->
+  <div id="highlight-reel-modal" class="modal-backdrop">
+    <div class="modal-dialog" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🎞️ Compilar Highlight Reel (xfade)</h3>
+        <button id="reel-close-btn" class="icon-btn" style="border: none; background: transparent;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="pro-form-grid" style="margin-bottom: 0.75rem;">
+          <div>
+            <label class="pro-section-label">Transição:</label>
+            <select id="reel-transition-select" class="provider-select" style="width: 100%;">
+              <option value="fade">Fade Suave</option>
+              <option value="dissolve">Dissolve</option>
+              <option value="wipeleft">Wipe Left</option>
+              <option value="slideright">Slide Right</option>
+              <option value="smoothleft">Smooth Left</option>
+            </select>
+          </div>
+          <div>
+            <label class="pro-section-label">Duração (s):</label>
+            <input type="number" id="reel-transition-dur" class="cut-title-input" value="0.5" min="0.2" max="2.0" step="0.1" style="width: 100%;">
+          </div>
+        </div>
+        <div class="pro-section-label">Cortes Renderizados Incluídos:</div>
+        <div id="reel-cuts-checklist" class="pro-list-container"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-confirm-reel" type="button" class="btn-primary" style="padding: 0.5rem 1.2rem;">Compilar Highlight Reel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL PUBLICAÇÃO & AGENDAMENTO MULTIPLATAFORMA
+       ========================================================= -->
+  <div id="publish-modal" class="modal-backdrop">
+    <div class="modal-dialog" style="max-width: 560px; max-height: 88vh; overflow-y: auto;">
+      <div class="modal-header">
+        <h3 class="modal-title">🚀 Publicação & Agendamento</h3>
+        <button id="pub-close-btn" class="icon-btn" style="border: none; background: transparent;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="pub-providers-status" class="pro-inline-row" style="margin-bottom: 0.75rem;"></div>
+        <div class="pro-form-grid">
+          <select id="pub-platform-select" class="provider-select">
+            <option value="youtube_shorts">YouTube Shorts</option>
+            <option value="tiktok">TikTok</option>
+            <option value="instagram_reels">Instagram Reels</option>
+          </select>
+          <input type="datetime-local" id="pub-date-input" class="cut-title-input">
+        </div>
+        <input type="text" id="pub-title-input" class="cut-title-input" style="width: 100%; margin-top: 0.5rem;" placeholder="Título viral do post">
+        <textarea id="pub-caption-input" class="pro-textarea" rows="3" style="margin-top: 0.5rem;" placeholder="Descrição / legenda..."></textarea>
+        <input type="text" id="pub-hashtags-input" class="cut-title-input" style="width: 100%; margin-top: 0.5rem;" placeholder="#shorts #reels #tiktok">
+        <div class="pro-inline-row" style="margin-top: 0.75rem; justify-content: flex-end;">
+          <button id="btn-submit-schedule" type="button" class="action-btn" style="height: 34px;">📅 Agendar na Fila</button>
+          <button id="btn-submit-publish-now" type="button" class="btn-primary" style="padding: 0.45rem 1rem;">🚀 Publicar Agora</button>
+        </div>
+        <div class="pro-section-label" style="margin-top: 1rem;">Fila de Publicações Agendadas:</div>
+        <div id="pub-schedule-list" class="pro-list-container"></div>
       </div>
     </div>
   </div>

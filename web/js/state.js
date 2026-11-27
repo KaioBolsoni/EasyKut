@@ -1,5 +1,5 @@
 /**
- * Estado centralizado, polling resiliente de jobs e auto-save com debounce.
+ * Estado centralizado V4.0, polling resiliente com suporte a cancelamento e auto-save com debounce.
  */
 
 import { apiGetJob, apiPatchCorte } from './api.js';
@@ -23,6 +23,21 @@ export const state = {
   maxCuts: 5,
   renderResolution: 1080,
 
+  // Opções Pro (Ondas 2, 3 e 4)
+  subtitlePreset: 'hormozi',
+  karaokeSubtitles: true,
+  removeSilences: false,
+  punchInZoom: false,
+  useGpu: false,
+  normalizeAudio: false,
+  denoiseAudio: false,
+  brandKitId: null,
+  musicFilename: '',
+  musicVolume: 0.18,
+  exportFormats: [],
+  brandKits: [],
+  musicTracks: [],
+
   // Paginação da Biblioteca
   libraryVideos: [],
   libraryTotalCount: 0,
@@ -38,6 +53,10 @@ export function getActiveCut() {
 
 export function getCutSegments(cut) {
   if (!cut) return [];
+  const overrides = cut.layout_params?.subtitle_overrides;
+  if (Array.isArray(overrides) && overrides.length > 0) {
+    return overrides.filter((s) => (s.text || '').trim().length > 0);
+  }
   const allSegs = state.currentVideo?.transcript_segments || cut.segments || [];
   return allSegs.filter(
     (s) => s.end > cut.start_time && s.start < cut.end_time && (s.text || '').trim().length > 0
@@ -60,12 +79,14 @@ export function pollJob(jobId, onSuccess, onError) {
     state.jobPoller = null;
   }
 
+  state.activeJobId = jobId;
   let isStopped = false;
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 5;
 
   const stopPolling = () => {
     isStopped = true;
+    state.activeJobId = null;
     if (state.jobPoller) {
       clearInterval(state.jobPoller);
       state.jobPoller = null;
@@ -114,6 +135,9 @@ export function pollJob(jobId, onSuccess, onError) {
       if (status === 'completed' || status === 'done') {
         stopPolling();
         onSuccess(job.result);
+      } else if (status === 'cancelled' || status === 'interrupted') {
+        stopPolling();
+        onError(job.step || 'Job cancelado pelo usuário.');
       } else if (status === 'error' || status === 'failed') {
         stopPolling();
         onError(job.error || job.step || 'Erro durante o processamento.');

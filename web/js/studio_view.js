@@ -784,17 +784,51 @@ export function updateCutContextPanel(cut) {
     item.className = 'cut-seg-item';
     item.dataset.segIdx = String(i);
     item.dataset.relSec = relSec.toFixed(2);
-    item.title = 'Clique para pular o vídeo para este trecho';
-    item.addEventListener('click', () => seekClipToRelativeSec(Number(relSec.toFixed(2))));
+    item.title = 'Clique para pular o vídeo · Clique no lápis para corrigir a legenda';
 
     const timeSpan = document.createElement('span');
     timeSpan.className = 'cut-seg-time';
     timeSpan.textContent = `[${formatSecondsMMSS(s.start)}]`;
+    timeSpan.addEventListener('click', () => seekClipToRelativeSec(Number(relSec.toFixed(2))));
 
     const textSpan = document.createElement('span');
+    textSpan.style.flex = '1';
     textSpan.textContent = String(s.text || '');
+    textSpan.addEventListener('click', () => seekClipToRelativeSec(Number(relSec.toFixed(2))));
 
-    item.append(timeSpan, document.createTextNode(' '), textSpan);
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'cut-seg-edit-btn';
+    editBtn.title = 'Editar texto desta legenda antes de renderizar';
+    editBtn.textContent = '✏️';
+    editBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'cut-seg-inline-input';
+      input.value = String(s.text || '');
+      const commitEdit = () => {
+        const nextText = input.value.trim();
+        const updatedSegs = segs.map((segItem, idx) =>
+          idx === i ? { ...segItem, text: nextText || segItem.text } : { ...segItem }
+        );
+        if (!cut.layout_params) cut.layout_params = {};
+        cut.layout_params.subtitle_overrides = updatedSegs;
+        schedulePersistCutEdits(cut);
+        updateCutContextPanel(cut);
+        renderAllCanvases();
+        showToast('Legenda corrigida para renderização!');
+      };
+      input.addEventListener('blur', commitEdit);
+      input.addEventListener('keydown', (ke) => {
+        if (ke.key === 'Enter') input.blur();
+        if (ke.key === 'Escape') updateCutContextPanel(cut);
+      });
+      item.replaceChildren(timeSpan, input);
+      input.focus();
+    });
+
+    item.append(timeSpan, document.createTextNode(' '), textSpan, editBtn);
     transBox.appendChild(item);
   });
 
@@ -818,11 +852,22 @@ export async function startRender() {
     return;
   }
 
-  selecionados.forEach((c) => {
+  const cutsPayload = selecionados.map((c) => {
     if (!c.layout_params) c.layout_params = {};
     if (!c.layout_params.ref_w) c.layout_params.ref_w = canvasState.imgNaturalW || 1920;
     if (!c.layout_params.ref_h) c.layout_params.ref_h = canvasState.imgNaturalH || 1080;
+    return {
+      ...c,
+      subtitle_preset: state.subtitlePreset || 'hormozi',
+      karaoke_subtitles: Boolean(state.karaokeSubtitles),
+      dynamic_face_tracking: true,
+      remove_silences: Boolean(state.removeSilences),
+      punch_in_zoom: Boolean(state.punchInZoom),
+      subtitle_overrides: c.layout_params.subtitle_overrides || null,
+    };
   });
+
+  const exportFormats = Array.from(document.querySelectorAll('.chk-export-format:checked')).map((el) => el.value);
 
   const resSel = document.getElementById('select-render-resolution');
   const targetRes = parseInt(resSel?.value || String(state.renderResolution), 10) === 720 ? 720 : 1080;
@@ -841,7 +886,15 @@ export async function startRender() {
   if (rFill) rFill.style.width = '5%';
 
   try {
-    const { res, data } = await apiStartRender(state.currentVideo.video_id, selecionados, targetRes);
+    const { res, data } = await apiStartRender(state.currentVideo.video_id, cutsPayload, targetRes, {
+      use_gpu: state.useGpu,
+      brand_kit_id: state.brandKitId,
+      normalize_audio: state.normalizeAudio,
+      denoise_audio: state.denoiseAudio,
+      music_filename: state.musicFilename || null,
+      music_volume: state.musicVolume,
+      export_formats: exportFormats,
+    });
     if (res.ok && data.job_id) {
       pollJob(data.job_id, onRenderSuccess, onRenderError);
     } else {

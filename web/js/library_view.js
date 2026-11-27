@@ -3,6 +3,7 @@
  */
 
 import { apiDeleteCorte, apiDeleteVideo, apiGetHistory, apiGetWorkspace } from './api.js';
+import { openHighlightReelModal, openPublishModal, openSeoKitModal } from './pro_panels.js';
 import { state } from './state.js';
 import { getSafeCutDownloadUrl, showToast } from './utils.js';
 
@@ -101,6 +102,32 @@ function renderLibraryCards() {
     reopenBtn.textContent = '🎬 Editar';
     reopenBtn.addEventListener('click', () => reopenVideoInStudio(Number(v.id)));
 
+    const renderedCount = (v.cortes || []).filter((c) => c.file_exists).length;
+    if (renderedCount > 0) {
+      const zipLink = document.createElement('a');
+      zipLink.className = 'action-btn';
+      zipLink.style.height = '28px';
+      zipLink.style.padding = '0 8px';
+      zipLink.style.fontSize = '0.72rem';
+      zipLink.href = `/api/videos/${Number(v.id)}/export-zip`;
+      zipLink.setAttribute('download', '');
+      zipLink.title = 'Baixar todos os cortes renderizados deste vídeo em um arquivo .zip';
+      zipLink.textContent = '📦 ZIP';
+      headerActions.appendChild(zipLink);
+    }
+
+    if (renderedCount >= 2) {
+      const reelBtn = document.createElement('button');
+      reelBtn.className = 'action-btn';
+      reelBtn.style.height = '28px';
+      reelBtn.style.padding = '0 8px';
+      reelBtn.style.fontSize = '0.72rem';
+      reelBtn.title = 'Compilar melhores momentos em 1 vídeo com transições xfade';
+      reelBtn.textContent = '🎞️ Reel';
+      reelBtn.addEventListener('click', () => openHighlightReelModal(v));
+      headerActions.appendChild(reelBtn);
+    }
+
     const delBtn = document.createElement('button');
     delBtn.className = 'icon-btn';
     delBtn.style.color = 'var(--accent-red)';
@@ -165,6 +192,28 @@ function renderLibraryCards() {
         }
 
         if (c.id) {
+          const seoBtn = document.createElement('button');
+          seoBtn.className = 'action-btn';
+          seoBtn.style.height = '28px';
+          seoBtn.style.padding = '0 8px';
+          seoBtn.style.fontSize = '0.72rem';
+          seoBtn.title = 'Gerar 3 títulos A/B, descrição e hashtags com IA';
+          seoBtn.textContent = '✨ SEO';
+          seoBtn.addEventListener('click', () => openSeoKitModal(c));
+          actionsDiv.appendChild(seoBtn);
+
+          if (safeVideoUrl) {
+            const pubBtn = document.createElement('button');
+            pubBtn.className = 'action-btn';
+            pubBtn.style.height = '28px';
+            pubBtn.style.padding = '0 8px';
+            pubBtn.style.fontSize = '0.72rem';
+            pubBtn.title = 'Agendar ou publicar em YouTube Shorts, TikTok ou Instagram Reels';
+            pubBtn.textContent = '🚀 Publicar';
+            pubBtn.addEventListener('click', () => openPublishModal(c));
+            actionsDiv.appendChild(pubBtn);
+          }
+
           const delCutBtn = document.createElement('button');
           delCutBtn.className = 'icon-btn';
           delCutBtn.style.color = 'var(--accent-red)';

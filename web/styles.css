@@ -1337,3 +1337,159 @@ body {
   border-radius: var(--radius-sm);
   padding: 0.75rem;
 }
+
+
+/* =========================================================
+   CONTROLES PRO V4.0 (ONDAS 2, 3 E 4)
+   ========================================================= */
+.subs-controls-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.pro-studio-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  padding-top: 0.45rem;
+  border-top: 1px dashed var(--border-subtle);
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.pro-pill-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  font-size: 0.73rem;
+  user-select: none;
+}
+
+.pro-select-xs {
+  padding: 2px 6px;
+  font-size: 0.73rem;
+  height: 26px;
+  max-width: 145px;
+}
+
+.pro-export-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: auto;
+  font-size: 0.72rem;
+}
+
+.pro-export-group label {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.cut-seg-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+.cut-seg-edit-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.55;
+  font-size: 0.72rem;
+  padding: 0 3px;
+}
+
+.cut-seg-edit-btn:hover {
+  opacity: 1;
+}
+
+.cut-seg-inline-input {
+  flex: 1;
+  background: var(--bg-base);
+  color: var(--text-main);
+  border: 1px solid var(--primary);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.78rem;
+}
+
+.pro-card-section {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.pro-section-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 0.45rem;
+}
+
+.pro-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.pro-inline-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.pro-list-container {
+  margin-top: 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 170px;
+  overflow-y: auto;
+}
+
+.pro-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-size: 0.78rem;
+}
+
+.pro-row-meta {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.pro-empty-hint {
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  padding: 0.4rem 0;
+}
+
+.pro-textarea {
+  width: 100%;
+  background: var(--bg-base);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem;
+  font-family: inherit;
+  font-size: 0.8rem;
+  resize: vertical;
+}
