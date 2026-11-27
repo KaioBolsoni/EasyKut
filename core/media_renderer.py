@@ -10,17 +10,83 @@ from pathlib import Path
 import re
 import subprocess  # nosec B404
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from core import media_utils
+from core.audio_mastering import build_audio_mastering_filters, resolve_confined_music_path
+from core.brand_overlay import build_brand_overlay_filters, resolve_confined_logo_path
 from core.downloader import get_direct_stream_url
+from core.hw_accel import build_video_encoder_args
+from core.jump_cuts import (
+    build_jump_cut_filter_graph,
+    compute_speech_intervals_from_transcript,
+    detect_speech_intervals_ffmpeg,
+    remap_timestamps_for_intervals,
+)
 from core.layout_filters import build_layout_ffmpeg_args, normalize_effective_mode
-from core.subtitles import format_ffmpeg_subtitles_filter, generate_srt_for_segment
+from core.subtitles import (
+    format_ffmpeg_ass_filter,
+    format_ffmpeg_subtitles_filter,
+    generate_ass_karaoke_for_segment,
+    generate_srt_for_segment,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class JobCancelledError(RuntimeError):
+    """Exceção dedicada disparada quando um job FFmpeg é cancelado pelo usuário."""
+
+
+def run_cancellable_ffmpeg(
+    cmd: List[str],
+    *,
+    timeout: int = 300,
+    job_id: Optional[str] = None,
+    cancel_check: Optional[Any] = None,
+    register_proc: Optional[Any] = None,
+    unregister_proc: Optional[Any] = None,
+) -> Tuple[int, str]:
+    """
+    Executa FFmpeg via subprocess.Popen com suporte a cancelamento cooperativo em tempo real,
+    timeout explícito e encerramento seguro do processo filho.
+    """
+    if cancel_check and cancel_check():
+        raise JobCancelledError(f"Job '{job_id}' cancelado antes de iniciar FFmpeg.")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )  # nosec B603
+    if register_proc:
+        register_proc(proc)
+
+    deadline = time.monotonic() + float(timeout)
+    try:
+        while proc.poll() is None:
+            if cancel_check and cancel_check():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise JobCancelledError(f"Job '{job_id}' cancelado pelo usuário.")
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+            time.sleep(0.15)
+        _, stderr = proc.communicate(timeout=5)
+        return int(proc.returncode or 0), stderr or ""
+    finally:
+        if unregister_proc:
+            unregister_proc(proc)
 
 
 def get_video_metadata(video_path: str) -> Dict[str, Any]:
@@ -445,6 +511,118 @@ def draw_framing_preview(
     return str(dest.resolve())
 
 
+def _build_subtitle_filter_for_cut(
+    *,
+    burn_subtitles: bool,
+    segments: Optional[List[Dict[str, Any]]],
+    words: Optional[List[Dict[str, Any]]],
+    start_time: float,
+    end_time: float,
+    effective_mode: str,
+    target_width: int,
+    target_height: int,
+    karaoke_subtitles: bool,
+    subtitle_preset: str,
+    prefer_segments: bool,
+) -> Optional[str]:
+    if not burn_subtitles or (not segments and not words):
+        return None
+
+    is_vertical = effective_mode not in ("horizontal_16_9",)
+    if karaoke_subtitles:
+        ass_path = generate_ass_karaoke_for_segment(
+            segments=segments,
+            words=words,
+            start_time=start_time,
+            end_time=end_time,
+            preset=subtitle_preset,
+            is_vertical=is_vertical,
+            play_res_x=target_width,
+            play_res_y=target_height,
+            prefer_segments=prefer_segments,
+        )
+        if ass_path:
+            return format_ffmpeg_ass_filter(ass_path)
+
+    srt_path = generate_srt_for_segment(segments or [], start_time, end_time)
+    return format_ffmpeg_subtitles_filter(srt_path, is_vertical=is_vertical) if srt_path else None
+
+
+def _compose_pro_filter_complex(
+    *,
+    layout_args: List[str],
+    intervals: List[Tuple[float, float]],
+    brand_kit: Optional[Dict[str, Any]],
+    hook_title: str,
+    effective_duration: float,
+    target_width: int,
+    target_height: int,
+    sub_filter: Optional[str],
+    punch_in_zoom: bool,
+    logo_input_index: Optional[int],
+    music_input_index: Optional[int],
+    normalize_audio: bool,
+    denoise_audio: bool,
+    music_volume: float,
+) -> List[str]:
+    """Compõe um único -filter_complex integrando Jump Cuts, Layout, Punch-in Zoom, Legendas, Brand Kit e Áudio Pro."""
+    parts: List[str] = []
+    v_in, a_in = "[0:v]", "[0:a]"
+
+    if intervals:
+        jc_graph, v_in, a_in = build_jump_cut_filter_graph(intervals, video_in=v_in, audio_in=a_in)
+        if jc_graph:
+            parts.append(jc_graph)
+
+    if layout_args and layout_args[0] == "-filter_complex":
+        raw_fc = layout_args[1]
+        if v_in != "[0:v]":
+            raw_fc = raw_fc.replace("[0:v]", v_in)
+        parts.append(raw_fc)
+        v_cur = layout_args[3] if len(layout_args) > 3 else "[merged]"
+    elif layout_args and layout_args[0] == "-vf":
+        parts.append(f"{v_in}{layout_args[1]}[v_lay]")
+        v_cur = "[v_lay]"
+    else:
+        parts.append(f"{v_in}scale=trunc(iw/2)*2:trunc(ih/2)*2[v_lay]")
+        v_cur = "[v_lay]"
+
+    if punch_in_zoom:
+        # Efeito de retenção suave: alterna micro-zoom 1.00x -> 1.07x a cada 6 segundos mantendo dimensões finais
+        parts.append(
+            f"{v_cur}scale='iw*(1+0.07*gt(mod(t,12),6))':'ih*(1+0.07*gt(mod(t,12),6))':eval=frame,"
+            f"crop={target_width}:{target_height}[v_punch]"
+        )
+        v_cur = "[v_punch]"
+
+    if sub_filter:
+        parts.append(f"{v_cur}{sub_filter}[v_sub]")
+        v_cur = "[v_sub]"
+
+    if brand_kit:
+        b_filters, v_cur, _ = build_brand_overlay_filters(
+            brand_kit=brand_kit,
+            duration=effective_duration,
+            target_width=target_width,
+            target_height=target_height,
+            hook_title=hook_title,
+            input_video_label=v_cur,
+            logo_input_index=logo_input_index,
+        )
+        parts.extend(b_filters)
+
+    a_filters, a_cur = build_audio_mastering_filters(
+        normalize_audio=normalize_audio,
+        denoise_audio=denoise_audio,
+        music_input_index=music_input_index,
+        music_volume=music_volume,
+        input_audio_label=a_in,
+    )
+    parts.extend(a_filters)
+    a_map = a_cur if a_cur != "[0:a]" else "0:a?"
+    return ["-filter_complex", ";".join(parts), "-map", v_cur, "-map", a_map]
+
+
 def cut_video(
     input_path: str,
     start_time: float,
@@ -454,14 +632,36 @@ def cut_video(
     target_width: int = 1080,
     target_height: int = 1920,
     segments: Optional[List[Dict[str, Any]]] = None,
+    words: Optional[List[Dict[str, Any]]] = None,
     burn_subtitles: bool = False,
+    subtitle_preset: str = "hormozi",
+    karaoke_subtitles: bool = True,
+    prefer_segment_subtitles: bool = False,
     face_tracking: bool = False,
+    dynamic_face_tracking: bool = True,
     layout_mode: Optional[str] = None,
     layout_params: Optional[Dict[str, Any]] = None,
+    remove_silences: bool = False,
+    min_silence_sec: float = 0.6,
+    brand_kit: Optional[Dict[str, Any]] = None,
+    hook_title: str = "",
+    punch_in_zoom: bool = False,
+    use_gpu: bool = False,
+    normalize_audio: bool = False,
+    denoise_audio: bool = False,
+    music_path: Optional[str] = None,
+    music_volume: float = 0.18,
+    job_id: Optional[str] = None,
+    cancel_check: Optional[Any] = None,
+    register_proc: Optional[Any] = None,
+    unregister_proc: Optional[Any] = None,
 ) -> str:
     """
-    Recorta um trecho do vídeo e renderiza nos modos suportados (horizontal_16_9,
-    vertical_blur, manual_crop, split_screen e face_tracking_9_16) via builders de layout.
+    Recorta um trecho do vídeo e renderiza com suporte completo a:
+    - 5 layouts (horizontal_16_9, vertical_blur, manual_crop, face_tracking_9_16 dinâmico, split_screen, square_1_1)
+    - Legendas Karaoke .ass (5 presets) ou .srt sincronizadas (inclusive pós-Jump Cut)
+    - Remoção automática de silêncios (Jump Cuts), Brand Kit (logo/barra/hook), Punch-in Zoom
+    - GPU (NVENC/QSV/AMF com fallback libx264), Masterização de áudio (-14 LUFS + Auto-Ducking) e cancelamento.
     """
     media_utils.check_ffmpeg()
     src = Path(input_path)
@@ -479,22 +679,80 @@ def cut_video(
     orig_w, orig_h = int(meta["width"]), int(meta["height"])
     effective_mode, face_tracking = normalize_effective_mode(mode, layout_mode, face_tracking)
 
-    target_width -= target_width % 2
-    target_height -= target_height % 2
+    if effective_mode == "square_1_1":
+        target_height = target_width
+    elif effective_mode == "horizontal_16_9":
+        target_width, target_height = orig_w, orig_h
 
-    srt_file_path = generate_srt_for_segment(segments, start_time, end_time) if (burn_subtitles and segments) else None
-    sub_filter = (
-        format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=(effective_mode != "horizontal_16_9"))
-        if srt_file_path
-        else None
+    target_width = max(2, target_width - (target_width % 2))
+    target_height = max(2, target_height - (target_height % 2))
+
+    # Jump Cuts (Onda 2): calcula intervalos de fala e remapeia timestamps de legendas
+    intervals: List[Tuple[float, float]] = []
+    sub_segments = segments
+    sub_words = words
+    sub_start, sub_end = start_time, end_time
+    effective_duration = duration
+
+    if remove_silences:
+        intervals = compute_speech_intervals_from_transcript(
+            segments=segments,
+            words=words,
+            start_time=start_time,
+            end_time=end_time,
+            min_silence_sec=min_silence_sec,
+        )
+        if not intervals:
+            intervals = detect_speech_intervals_ffmpeg(
+                video_path=str(src),
+                start_time=start_time,
+                end_time=end_time,
+                min_silence_sec=min_silence_sec,
+            )
+        if intervals:
+            effective_duration = sum(e - s for s, e in intervals)
+            sub_segments = remap_timestamps_for_intervals(segments or [], intervals, base_start=start_time)
+            sub_words = remap_timestamps_for_intervals(words or [], intervals, base_start=start_time)
+            sub_start, sub_end = 0.0, effective_duration
+
+    effective_preset = (brand_kit or {}).get("subtitle_preset") or subtitle_preset
+    sub_filter = _build_subtitle_filter_for_cut(
+        burn_subtitles=burn_subtitles,
+        segments=sub_segments,
+        words=sub_words,
+        start_time=sub_start,
+        end_time=sub_end,
+        effective_mode=effective_mode,
+        target_width=target_width,
+        target_height=target_height,
+        karaoke_subtitles=karaoke_subtitles,
+        subtitle_preset=effective_preset,
+        prefer_segments=prefer_segment_subtitles,
     )
 
-    cmd = [
+    valid_logo = resolve_confined_logo_path((brand_kit or {}).get("logo_path")) if brand_kit else None
+    valid_music = resolve_confined_music_path(music_path)
+    has_brand_fx = bool(brand_kit and (valid_logo or brand_kit.get("progress_bar_enabled") or brand_kit.get("hook_banner_enabled")))
+    has_pro_pipeline = bool(intervals or has_brand_fx or punch_in_zoom or valid_music or normalize_audio or denoise_audio)
+
+    cmd_prefix = [
         "ffmpeg", "-nostdin", "-y",
         "-ss", str(round(start_time, 2)),
         "-i", str(src),
         "-t", str(round(duration, 2)),
     ]
+
+    next_input_idx = 1
+    logo_input_idx: Optional[int] = None
+    music_input_idx: Optional[int] = None
+    if has_pro_pipeline and valid_logo:
+        cmd_prefix.extend(["-i", valid_logo])
+        logo_input_idx = next_input_idx
+        next_input_idx += 1
+    if has_pro_pipeline and valid_music:
+        cmd_prefix.extend(["-stream_loop", "-1", "-i", valid_music])
+        music_input_idx = next_input_idx
+        next_input_idx += 1
 
     layout_args, is_stream_copy = build_layout_ffmpeg_args(
         effective_mode=effective_mode,
@@ -507,29 +765,63 @@ def cut_video(
         target_height=target_height,
         cfg=layout_params or {},
         face_tracking=face_tracking,
-        sub_filter=sub_filter,
+        sub_filter=None if has_pro_pipeline else sub_filter,
+        dynamic_face_tracking=dynamic_face_tracking,
     )
-    cmd.extend(layout_args)
 
-    if is_stream_copy:
-        cmd.append(str(dest))
-        logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
-    else:
-        cmd.extend([
-            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-            "-c:a", "aac", "-b:a", "128k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            str(dest),
-        ])
-        logger.info(
-            "Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
-            start_time, end_time, effective_mode, bool(srt_file_path), dest.name,
+    if has_pro_pipeline:
+        is_stream_copy = False
+        filter_args = _compose_pro_filter_complex(
+            layout_args=layout_args,
+            intervals=intervals,
+            brand_kit=brand_kit if has_brand_fx else None,
+            hook_title=hook_title,
+            effective_duration=effective_duration,
+            target_width=target_width,
+            target_height=target_height,
+            sub_filter=sub_filter,
+            punch_in_zoom=punch_in_zoom,
+            logo_input_index=logo_input_idx,
+            music_input_index=music_input_idx,
+            normalize_audio=normalize_audio,
+            denoise_audio=denoise_audio,
+            music_volume=music_volume,
         )
+    else:
+        filter_args = layout_args
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)  # nosec B603
-    if proc.returncode != 0:
-        logger.error("Falha no FFmpeg: %s", proc.stderr)
-        raise RuntimeError(f"Erro ao processar corte de vídeo: {proc.stderr[:350]}")
+    def _run_with_encoder(try_gpu: bool) -> Tuple[int, str, str]:
+        cmd = list(cmd_prefix) + list(filter_args)
+        if is_stream_copy:
+            cmd.append(str(dest))
+            enc_name = "copy"
+        else:
+            v_args, enc_name = build_video_encoder_args(use_gpu=try_gpu)
+            cmd.extend(v_args)
+            cmd.extend(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dest)])
+
+        logger.info(
+            "Executando corte FFmpeg (%s -> %ss, layout=%s, enc=%s, jump_cuts=%s, brand=%s): %s",
+            start_time, end_time, effective_mode, enc_name, bool(intervals), has_brand_fx, dest.name,
+        )
+        rc, stderr = run_cancellable_ffmpeg(
+            cmd,
+            timeout=300,
+            job_id=job_id,
+            cancel_check=cancel_check,
+            register_proc=register_proc,
+            unregister_proc=unregister_proc,
+        )
+        return rc, stderr, enc_name
+
+    rc, stderr, used_enc = _run_with_encoder(try_gpu=use_gpu)
+    if rc != 0 and use_gpu and used_enc != "libx264":
+        logger.warning("Encoder GPU '%s' falhou; acionando fallback automático para libx264 CPU.", used_enc)
+        rc, stderr, _ = _run_with_encoder(try_gpu=False)
+
+    if rc != 0:
+        logger.error("Falha no FFmpeg: %s", stderr)
+        raise RuntimeError(f"Erro ao processar corte de vídeo: {stderr[:350]}")
 
     logger.info("Corte finalizado com sucesso: %s", dest)
     return str(dest.resolve())

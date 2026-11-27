@@ -1,13 +1,17 @@
 """
-Builders de filtros FFmpeg por modo de layout (Strategy Pattern).
-Desacopla a construção de filtros (horizontal_16_9, vertical_blur, manual_crop, split_screen)
-de core/media_renderer.py, reduzindo complexidade ciclomática e facilitando novos layouts.
+Builders de filtros FFmpeg por modo de layout (Strategy Pattern — V4.0).
+Suporta horizontal_16_9, vertical_blur, manual_crop, face_tracking_9_16 (estático e dinâmico),
+split_screen e square_1_1 (multi-export 1080x1080).
 """
 
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from core.face_tracker import detect_smooth_face_crop_x
+from core.face_tracker import (
+    build_ffmpeg_dynamic_crop_x_expr,
+    detect_dynamic_face_crop_keyframes,
+    detect_smooth_face_crop_x,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +21,7 @@ def normalize_effective_mode(
     layout_mode: Optional[str],
     face_tracking: bool,
 ) -> Tuple[str, bool]:
-    """Normaliza aliases legados de layout para um dos 4 builders canônicos."""
+    """Normaliza aliases legados de layout para um dos 5 builders canônicos."""
     effective_mode = (layout_mode or mode).lower().strip()
     if effective_mode in ("blur_background", "blur"):
         return "vertical_blur", face_tracking
@@ -27,6 +31,8 @@ def normalize_effective_mode(
         return "horizontal_16_9", face_tracking
     if effective_mode in ("face_tracking_9_16", "vertical_face"):
         return "manual_crop", True
+    if effective_mode in ("square_1_1", "square", "1:1"):
+        return "square_1_1", face_tracking
     return effective_mode, face_tracking
 
 
@@ -48,6 +54,7 @@ def build_vertical_blur_args(
     target_width: int,
     target_height: int,
     sub_filter: Optional[str],
+    input_video_label: str = "[0:v]",
     **_: Any,
 ) -> Tuple[List[str], bool]:
     """Retorna argumentos FFmpeg para canvas 9:16 com fundo desfocado e zoom opcional."""
@@ -57,14 +64,14 @@ def build_vertical_blur_args(
         fg_w += 1
 
     bg_filter = (
-        f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+        f"{input_video_label}scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
         f"crop={target_width}:{target_height},boxblur=20:5,eq=brightness=-0.15[bg]"
     )
     if zoom_factor <= 1.0:
-        fg_filter = f"[0:v]scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
+        fg_filter = f"{input_video_label}scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
     else:
         fg_filter = (
-            f"[0:v]scale={fg_w}:-2:force_original_aspect_ratio=decrease,"
+            f"{input_video_label}scale={fg_w}:-2:force_original_aspect_ratio=decrease,"
             f"crop=min({target_width},iw):min({target_height},ih)[fg]"
         )
 
@@ -87,32 +94,72 @@ def build_manual_crop_args(
     cfg: Dict[str, Any],
     face_tracking: bool,
     sub_filter: Optional[str],
+    dynamic_face_tracking: bool = False,
     **_: Any,
 ) -> Tuple[List[str], bool]:
-    """Retorna argumentos FFmpeg para recorte 9:16 manual ou guiado por Face Tracking."""
+    """Retorna argumentos FFmpeg para recorte 9:16 manual ou guiado por Face Tracking (estático/dinâmico)."""
     def_crop_w = int(orig_h * (9.0 / 16.0))
     if def_crop_w % 2 != 0:
         def_crop_w -= 1
 
-    if face_tracking:
-        face_x = None
-        try:
-            face_x = detect_smooth_face_crop_x(
-                video_path=src_path,
-                start_time=start_time,
-                end_time=end_time,
-                orig_w=orig_w,
-                orig_h=orig_h,
-                crop_w=def_crop_w,
-            )
-        except Exception as exc:
-            logger.warning("Preset Face Tracking falhou: %s. Utilizando fallback central.", exc)
-            face_x = None
+    dynamic_x_expr: Optional[str] = None
 
-        if face_x is None:
-            face_x = max(0, (orig_w - def_crop_w) // 2)
-            face_x -= face_x % 2
-        crop_x, crop_y, crop_w, crop_h = face_x, 0, def_crop_w, orig_h
+    if face_tracking:
+        max_crop_x = max(0, orig_w - def_crop_w)
+        if dynamic_face_tracking:
+            try:
+                keyframes = detect_dynamic_face_crop_keyframes(
+                    video_path=src_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                    crop_w=def_crop_w,
+                )
+                if keyframes:
+                    expr = build_ffmpeg_dynamic_crop_x_expr(keyframes, max_crop_x=max_crop_x)
+                    if not expr.isdigit():
+                        dynamic_x_expr = expr
+                        crop_x, crop_y, crop_w, crop_h = 0, 0, def_crop_w, orig_h
+                    else:
+                        crop_x, crop_y, crop_w, crop_h = int(expr), 0, def_crop_w, orig_h
+                else:
+                    face_x = detect_smooth_face_crop_x(
+                        video_path=src_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        orig_w=orig_w,
+                        orig_h=orig_h,
+                        crop_w=def_crop_w,
+                    )
+                    if face_x is None:
+                        face_x = max(0, (orig_w - def_crop_w) // 2)
+                        face_x -= face_x % 2
+                    crop_x, crop_y, crop_w, crop_h = face_x, 0, def_crop_w, orig_h
+            except Exception as exc:
+                logger.warning("Face tracking dinâmico falhou: %s. Fallback central.", exc)
+                fallback_x = max(0, (orig_w - def_crop_w) // 2)
+                fallback_x -= fallback_x % 2
+                crop_x, crop_y, crop_w, crop_h = fallback_x, 0, def_crop_w, orig_h
+        else:
+            face_x = None
+            try:
+                face_x = detect_smooth_face_crop_x(
+                    video_path=src_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                    crop_w=def_crop_w,
+                )
+            except Exception as exc:
+                logger.warning("Preset Face Tracking falhou: %s. Utilizando fallback central.", exc)
+                face_x = None
+
+            if face_x is None:
+                face_x = max(0, (orig_w - def_crop_w) // 2)
+                face_x -= face_x % 2
+            crop_x, crop_y, crop_w, crop_h = face_x, 0, def_crop_w, orig_h
     else:
         ref_w = float(cfg.get("ref_w", 0) or 0)
         ref_h = float(cfg.get("ref_h", 0) or 0)
@@ -146,7 +193,40 @@ def build_manual_crop_args(
     crop_w = max(2, crop_w - (crop_w % 2))
     crop_h = max(2, crop_h - (crop_h % 2))
 
-    video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={target_width}:{target_height}"
+    if dynamic_x_expr:
+        video_filter = f"crop={crop_w}:{crop_h}:x='{dynamic_x_expr}':y={crop_y},scale={target_width}:{target_height}"
+    else:
+        video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={target_width}:{target_height}"
+
+    if sub_filter:
+        video_filter += f",{sub_filter}"
+    return ["-vf", video_filter], False
+
+
+def build_square_1_1_args(
+    *,
+    orig_w: int,
+    orig_h: int,
+    target_width: int,
+    cfg: Dict[str, Any],
+    sub_filter: Optional[str],
+    **_: Any,
+) -> Tuple[List[str], bool]:
+    """Retorna argumentos FFmpeg para formato quadrado 1:1 (1080x1080 — Instagram/LinkedIn Feed)."""
+    side = min(orig_w, orig_h)
+    side = max(2, side - (side % 2))
+    out_side = max(2, target_width - (target_width % 2))
+
+    ref_w = float(cfg.get("ref_w", 0) or 0)
+    sx = (orig_w / ref_w) if ref_w > 0 else 1.0
+    raw_x = cfg.get("crop_x", cfg.get("x"))
+    crop_x = int(round(float(raw_x) * sx)) if raw_x is not None else (orig_w - side) // 2
+    crop_x = max(0, min(orig_w - side, crop_x))
+    crop_x -= crop_x % 2
+    crop_y = max(0, (orig_h - side) // 2)
+    crop_y -= crop_y % 2
+
+    video_filter = f"crop={side}:{side}:{crop_x}:{crop_y},scale={out_side}:{out_side}"
     if sub_filter:
         video_filter += f",{sub_filter}"
     return ["-vf", video_filter], False
@@ -190,6 +270,7 @@ def build_split_screen_args(
     target_height: int,
     cfg: Dict[str, Any],
     sub_filter: Optional[str],
+    input_video_label: str = "[0:v]",
     **_: Any,
 ) -> Tuple[List[str], bool]:
     """Retorna argumentos FFmpeg para empilhamento vertical 2x (1080x960 cada)."""
@@ -230,8 +311,8 @@ def build_split_screen_args(
     )
 
     filter_complex = (
-        f"[0:v]crop={top_w}:{top_h}:{top_x}:{top_y},scale={target_width}:{half_h}[top];"
-        f"[0:v]crop={bot_w}:{bot_h}:{bot_x}:{bot_y},scale={target_width}:{half_h}[bot];"
+        f"{input_video_label}crop={top_w}:{top_h}:{top_x}:{top_y},scale={target_width}:{half_h}[top];"
+        f"{input_video_label}crop={bot_w}:{bot_h}:{bot_x}:{bot_y},scale={target_width}:{half_h}[bot];"
         f"[top][bot]vstack=inputs=2[stacked]"
     )
     if sub_filter:
@@ -247,6 +328,7 @@ LAYOUT_FILTER_BUILDERS: Dict[str, Callable[..., Tuple[List[str], bool]]] = {
     "crop": build_manual_crop_args,
     "split_screen": build_split_screen_args,
     "split": build_split_screen_args,
+    "square_1_1": build_square_1_1_args,
 }
 
 
@@ -263,6 +345,8 @@ def build_layout_ffmpeg_args(
     cfg: Dict[str, Any],
     face_tracking: bool,
     sub_filter: Optional[str],
+    dynamic_face_tracking: bool = False,
+    input_video_label: str = "[0:v]",
 ) -> Tuple[List[str], bool]:
     """Despacha a construção dos argumentos FFmpeg para o builder do layout selecionado."""
     builder = LAYOUT_FILTER_BUILDERS.get(effective_mode, build_vertical_blur_args)
@@ -277,4 +361,6 @@ def build_layout_ffmpeg_args(
         cfg=cfg,
         face_tracking=face_tracking,
         sub_filter=sub_filter,
+        dynamic_face_tracking=dynamic_face_tracking,
+        input_video_label=input_video_label,
     )
