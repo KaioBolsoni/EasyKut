@@ -97,7 +97,15 @@ function initCanvas() {
 
 function bindProControls() {
   document.getElementById('select-sub-preset')?.addEventListener('change', (e) => {
-    state.subtitlePreset = e.target.value || 'hormozi';
+    const nextPreset = e.target.value || 'hormozi';
+    state.subtitlePreset = nextPreset;
+    const c = getActiveCut();
+    if (c) {
+      if (!c.layout_params) c.layout_params = {};
+      c.layout_params.subtitle_preset = nextPreset;
+      schedulePersistCutEdits(c);
+    }
+    renderAllCanvases();
   });
   document.getElementById('toggle-jump-cuts')?.addEventListener('change', (e) => {
     state.removeSilences = e.target.checked;
@@ -113,6 +121,19 @@ function bindProControls() {
   });
   document.getElementById('select-brand-kit')?.addEventListener('change', (e) => {
     state.brandKitId = e.target.value ? Number(e.target.value) : null;
+    const chosenKit = state.brandKits.find((k) => k.id === state.brandKitId);
+    if (chosenKit && chosenKit.subtitle_preset) {
+      state.subtitlePreset = chosenKit.subtitle_preset;
+      const presetSel = document.getElementById('select-sub-preset');
+      if (presetSel) presetSel.value = chosenKit.subtitle_preset;
+      const c = getActiveCut();
+      if (c) {
+        if (!c.layout_params) c.layout_params = {};
+        c.layout_params.subtitle_preset = chosenKit.subtitle_preset;
+        schedulePersistCutEdits(c);
+      }
+      renderAllCanvases();
+    }
   });
   document.getElementById('select-bgm-track')?.addEventListener('change', (e) => {
     state.musicFilename = e.target.value || '';

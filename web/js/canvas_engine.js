@@ -312,7 +312,65 @@ function drawOptimizedBlurredBackground(ctx, canvasState, media, mW, mH) {
   ctx.restore();
 }
 
-export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn) {
+export const KARAOKE_PREVIEW_PRESETS = {
+  hormozi: {
+    font: '900 62px "Arial Black", Impact, Arial, sans-serif',
+    primary: '#FFFFFF',
+    highlight: '#FFEA00',
+    stroke: '#000000',
+    strokeWidth: 12,
+    shadowColor: 'rgba(0, 0, 0, 0.85)',
+    shadowBlur: 10,
+    boxBg: null,
+    uppercase: true,
+  },
+  neon: {
+    font: '900 60px "Arial Black", Impact, Arial, sans-serif',
+    primary: '#FFFFFF',
+    highlight: '#00EFFF',
+    stroke: '#001644',
+    strokeWidth: 10,
+    shadowColor: 'rgba(0, 239, 255, 0.8)',
+    shadowBlur: 20,
+    boxBg: null,
+    uppercase: true,
+  },
+  boxed: {
+    font: '800 54px Inter, Arial, sans-serif',
+    primary: '#FFFFFF',
+    highlight: '#00FF80',
+    stroke: '#000000',
+    strokeWidth: 6,
+    shadowColor: 'rgba(0, 0, 0, 0.4)',
+    shadowBlur: 4,
+    boxBg: 'rgba(16, 16, 36, 0.82)',
+    uppercase: false,
+  },
+  minimal: {
+    font: '700 48px Inter, Arial, sans-serif',
+    primary: '#E5E7EB',
+    highlight: '#FFFFFF',
+    stroke: '#18181B',
+    strokeWidth: 7,
+    shadowColor: 'rgba(0, 0, 0, 0.5)',
+    shadowBlur: 6,
+    boxBg: null,
+    uppercase: false,
+  },
+  classic: {
+    font: '700 50px Arial, sans-serif',
+    primary: '#FFFFFF',
+    highlight: '#FFD455',
+    stroke: '#000000',
+    strokeWidth: 8,
+    shadowColor: 'rgba(0, 0, 0, 0.65)',
+    shadowBlur: 6,
+    boxBg: null,
+    uppercase: false,
+  },
+};
+
+export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn, options = {}) {
   const ctx = canvasState.mockupCtx;
   if (!ctx) return;
   const mW = canvasState.mockupCanvas.width || 1080;
@@ -386,57 +444,113 @@ export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn) {
   }
 
   if (cut.burn_subtitles) {
-    drawMockupSubtitles(ctx, mW, mH, cut, canvasState, getCutSegmentsFn);
+    drawMockupSubtitles(ctx, mW, mH, cut, canvasState, getCutSegmentsFn, options);
   }
 }
 
-function drawMockupSubtitles(ctx, mW, mH, cut, canvasState, getCutSegmentsFn) {
-  let activeText = 'EXEMPLO DE LEGENDA DINÂMICA';
-  const segs = getCutSegmentsFn(cut);
+function groupWordsIntoChunks(words, maxPerChunk = 3) {
+  const chunks = [];
+  let cur = [];
+  for (const w of words) {
+    if (cur.length > 0 && (cur.length >= maxPerChunk || (w.start - cur[cur.length - 1].end) > 0.45)) {
+      chunks.push(cur);
+      cur = [];
+    }
+    cur.push(w);
+  }
+  if (cur.length > 0) chunks.push(cur);
+  return chunks;
+}
 
-  if (segs.length > 0) {
+function drawMockupSubtitles(ctx, mW, mH, cut, canvasState, getCutSegmentsFn, options = {}) {
+  const presetKey = (cut.layout_params?.subtitle_preset || options.subtitlePreset || 'hormozi').toLowerCase();
+  const style = KARAOKE_PREVIEW_PRESETS[presetKey] || KARAOKE_PREVIEW_PRESETS.hormozi;
+
+  const cutWords = typeof options.getCutWordsFn === 'function' ? options.getCutWordsFn(cut) : [];
+  let activeChunk = null;
+  let activeWordIdx = 0;
+
+  if (cutWords.length > 0) {
+    const chunks = groupWordsIntoChunks(cutWords, 3);
     if (canvasState.isVideoReady && canvasState.videoEl) {
       const absSec = cut.start_time + (canvasState.videoEl.currentTime || 0);
-      const found = segs.find((s) => absSec >= s.start && absSec <= s.end);
-      activeText = found ? found.text : '';
+      for (const chunk of chunks) {
+        const chunkStart = chunk[0].start;
+        const chunkEnd = chunk[chunk.length - 1].end + 0.15;
+        if (absSec >= chunkStart && absSec <= chunkEnd) {
+          activeChunk = chunk;
+          activeWordIdx = chunk.findIndex((w, idx) => {
+            const nextStart = idx + 1 < chunk.length ? chunk[idx + 1].start : chunkEnd;
+            return absSec >= w.start && absSec < nextStart;
+          });
+          if (activeWordIdx < 0) activeWordIdx = chunk.length - 1;
+          break;
+        }
+      }
+      if (!activeChunk) return;
     } else {
-      activeText = segs[0].text;
+      activeChunk = chunks[0];
+      activeWordIdx = 0;
     }
+  } else {
+    const segs = getCutSegmentsFn(cut);
+    const fallbackText = segs.length > 0 ? segs[0].text : 'EXEMPLO KARAOKE VIRAL';
+    const fallbackTokens = String(fallbackText).trim().split(/\s+/).filter(Boolean).slice(0, 3);
+    if (fallbackTokens.length === 0) return;
+    activeChunk = fallbackTokens.map((word) => ({ word }));
+    activeWordIdx = 0;
   }
 
-  if (!activeText) return;
+  const labels = activeChunk.map((w) => (style.uppercase ? String(w.word).toUpperCase() : String(w.word)));
+  if (labels.length === 0) return;
 
   ctx.save();
-  ctx.font = 'bold 38px Inter, Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 9;
-  ctx.fillStyle = '#FFFFFF';
+  ctx.font = style.font;
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.miterLimit = 2;
 
-  const words = activeText.toUpperCase().split(/\s+/);
-  const lines = [];
-  let currentLine = '';
-  const maxWidth = mW - 120;
+  const spaceW = ctx.measureText(' ').width * 1.15;
+  const tokenWidths = labels.map((lbl, idx) => ctx.measureText(lbl).width * (idx === activeWordIdx ? 1.12 : 1.0));
+  const totalWidth = tokenWidths.reduce((acc, w) => acc + w, 0) + spaceW * Math.max(0, labels.length - 1);
+  const maxWidth = mW - 100;
+  const fitScale = totalWidth > maxWidth ? maxWidth / totalWidth : 1.0;
 
-  for (const word of words) {
-    const testLine = currentLine ? `${currentLine} ${word}` : word;
-    if (ctx.measureText(testLine).width > maxWidth && currentLine) {
-      lines.push(currentLine);
-      currentLine = word;
-    } else {
-      currentLine = testLine;
-    }
+  const centerY = mH - 250;
+  ctx.translate(mW / 2, centerY);
+  ctx.scale(fitScale, fitScale);
+
+  if (style.boxBg) {
+    const padX = 28;
+    const padY = 24;
+    const boxW = totalWidth + padX * 2;
+    const boxH = 74 + padY;
+    ctx.fillStyle = style.boxBg;
+    ctx.beginPath();
+    ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, 18);
+    ctx.fill();
   }
-  if (currentLine) lines.push(currentLine);
 
-  const visibleLines = lines.slice(0, 3);
-  const baseY = mH - 220;
-  const lineHeight = 48;
+  let cursorX = -totalWidth / 2;
+  labels.forEach((lbl, idx) => {
+    const isActive = idx === activeWordIdx;
+    const w = tokenWidths[idx];
+    const cx = cursorX + w / 2;
 
-  visibleLines.forEach((line, i) => {
-    const y = baseY + i * lineHeight;
-    ctx.strokeText(line, mW / 2, y);
-    ctx.fillText(line, mW / 2, y);
+    ctx.save();
+    ctx.translate(cx, 0);
+    if (isActive) ctx.scale(1.12, 1.12);
+    ctx.textAlign = 'center';
+    ctx.shadowColor = isActive ? style.shadowColor : 'rgba(0,0,0,0.65)';
+    ctx.shadowBlur = isActive ? style.shadowBlur : 6;
+    ctx.strokeStyle = style.stroke;
+    ctx.lineWidth = style.strokeWidth;
+    ctx.strokeText(lbl, 0, 0);
+    ctx.fillStyle = isActive ? style.highlight : style.primary;
+    ctx.fillText(lbl, 0, 0);
+    ctx.restore();
+
+    cursorX += w + spaceW;
   });
 
   ctx.restore();

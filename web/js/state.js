@@ -63,6 +63,43 @@ export function getCutSegments(cut) {
   );
 }
 
+export function getCutWords(cut) {
+  if (!cut) return [];
+  const hasOverrides = Array.isArray(cut.layout_params?.subtitle_overrides) && cut.layout_params.subtitle_overrides.length > 0;
+  const rawWords = !hasOverrides ? (state.currentVideo?.transcript_words || []) : [];
+
+  if (rawWords.length > 0) {
+    const filtered = rawWords
+      .filter((w) => Number(w.end) > cut.start_time && Number(w.start) < cut.end_time && String(w.word || w.text || '').trim())
+      .map((w) => ({
+        word: String(w.word || w.text || '').trim(),
+        start: Math.max(cut.start_time, Number(w.start) || 0),
+        end: Math.min(cut.end_time, Math.max((Number(w.start) || 0) + 0.06, Number(w.end) || 0)),
+      }))
+      .sort((a, b) => a.start - b.start);
+    if (filtered.length > 0) return filtered;
+  }
+
+  // Fallback / edição inline: interpola palavras uniformemente por segmento
+  const segs = getCutSegments(cut);
+  const interpolated = [];
+  segs.forEach((seg) => {
+    const s = Math.max(cut.start_time, Number(seg.start) || 0);
+    const e = Math.min(cut.end_time, Number(seg.end) || s);
+    const tokens = String(seg.text || '').trim().split(/\s+/).filter(Boolean);
+    if (e <= s || tokens.length === 0) return;
+    const step = (e - s) / tokens.length;
+    tokens.forEach((tok, idx) => {
+      interpolated.push({
+        word: tok,
+        start: s + idx * step,
+        end: s + (idx + 1) * step,
+      });
+    });
+  });
+  return interpolated;
+}
+
 export function updateStepTracker(activeStepNum) {
   for (let i = 1; i <= 4; i++) {
     const item = document.getElementById(`step-track-${i}`);

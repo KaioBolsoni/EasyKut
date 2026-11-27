@@ -26,6 +26,7 @@ import {
   canvasState,
   getActiveCut,
   getCutSegments,
+  getCutWords,
   pollJob,
   schedulePersistCutEdits,
   state,
@@ -44,7 +45,10 @@ export function initStudioView({ switchTab }) {
 export function renderAllCanvases() {
   const cut = getActiveCut();
   renderEditorCanvas(canvasState, cut);
-  renderMockupCanvas(canvasState, cut, getCutSegments);
+  renderMockupCanvas(canvasState, cut, getCutSegments, {
+    getCutWordsFn: getCutWords,
+    subtitlePreset: cut?.layout_params?.subtitle_preset || state.subtitlePreset || 'hormozi',
+  });
 }
 
 export function updateCanvasPlaceholderUI(show) {
@@ -399,6 +403,10 @@ export function updateActiveCutToolbar() {
   document.getElementById('active-cut-start').value = c.start_time.toFixed(1);
   document.getElementById('active-cut-end').value = c.end_time.toFixed(1);
   document.getElementById('toggle-burn-subs').checked = Boolean(c.burn_subtitles);
+  const presetSel = document.getElementById('select-sub-preset');
+  if (presetSel) {
+    presetSel.value = c.layout_params?.subtitle_preset || state.subtitlePreset || 'hormozi';
+  }
 
   document.querySelectorAll('.layout-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.mode === c.layout_mode);
@@ -858,7 +866,7 @@ export async function startRender() {
     if (!c.layout_params.ref_h) c.layout_params.ref_h = canvasState.imgNaturalH || 1080;
     return {
       ...c,
-      subtitle_preset: state.subtitlePreset || 'hormozi',
+      subtitle_preset: c.layout_params?.subtitle_preset || state.subtitlePreset || 'hormozi',
       karaoke_subtitles: Boolean(state.karaokeSubtitles),
       dynamic_face_tracking: true,
       remove_silences: Boolean(state.removeSilences),
