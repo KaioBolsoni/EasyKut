@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 
 PROMPT_FILE = PROMPTS_DIR / "diretor_cortes.txt"
 
-# Modelos ativos recomendados para produção e fallback
+# Modelos ativos recomendados para produção e fallback (prioriza baixa latência e alta disponibilidade)
 GEMINI_MODELS = [
-    "gemini-3.8-flash",       # Padrão atual para produção (tem tier gratuito)
-    "gemini-3.5-flash-lite",  # Mais rápido e barato, ideal para extração/curadoria
-    "gemini-3.1-flash-lite",  # Fallback mais econômico
+    "gemini-3.5-flash-lite",  # 1M tokens, mais rápido e estável para extração/curadoria JSON
+    "gemini-4-hydrogen",      # 1M tokens, alta qualidade e equilíbrio
+    "gemini-3.1-flash-lite",  # Fallback econômico ultrarrápido
+    "gemini-3.8-flash",       # Fallback secundário
 ]
 
 GROQ_MODELS = [
@@ -189,8 +190,8 @@ def transcribe_audio_groq(
 
 def format_transcript_with_timestamps(transcript_data: Dict[str, Any]) -> str:
     """
-    Formata os segmentos da transcrição em blocos de texto legíveis com marcas temporais.
-    Exemplo: [00:15 - 00:32] Texto falado pelo autor...
+    Formata os segmentos da transcrição de forma compacta com timestamps exatos em segundos.
+    Exemplo: [15.0-32.4] Texto falado pelo autor...
     """
     segments = transcript_data.get("segments", [])
     if not segments:
@@ -198,12 +199,11 @@ def format_transcript_with_timestamps(transcript_data: Dict[str, Any]) -> str:
 
     lines = []
     for seg in segments:
-        start_sec = seg["start"]
-        end_sec = seg["end"]
-        start_min, start_s = divmod(int(start_sec), 60)
-        end_min, end_s = divmod(int(end_sec), 60)
-        timestamp_str = f"[{start_min:02d}:{start_s:02d} - {end_min:02d}:{end_s:02d} ({start_sec:.1f}s -> {end_sec:.1f}s)]"
-        lines.append(f"{timestamp_str} {seg['text']}")
+        start_sec = float(seg.get("start", 0.0))
+        end_sec = float(seg.get("end", start_sec))
+        text = str(seg.get("text", "")).strip()
+        if text:
+            lines.append(f"[{start_sec:.1f}-{end_sec:.1f}] {text}")
 
     return "\n".join(lines)
 
@@ -299,24 +299,44 @@ def _clean_and_parse_json(raw_text: str) -> List[Dict[str, Any]]:
     return sanitized
 
 
+def _should_fast_fail_model(err_str: str) -> bool:
+    """Retorna True para erros que justificam trocar imediatamente para o próximo modelo (sem repetir espera longa)."""
+    low = (err_str or "").lower()
+    fast_fail_tokens = (
+        "404",
+        "not_found",
+        "not found",
+        "504",
+        "deadline_exceeded",
+        "deadline expired",
+        "503",
+        "unavailable",
+        "high demand",
+        "429",
+        "resource_exhausted",
+        "timed out",
+        "timeout",
+    )
+    return any(tok in low for tok in fast_fail_tokens)
+
+
 def analyze_viral_cuts_gemini(
     transcript_text: str,
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-3.5-flash-lite",
     max_retries: int = 2,
     base_delay: float = 2.0
 ) -> List[Dict[str, Any]]:
     """
-    Analisa a transcrição com Google Gemini utilizando cadeia de fallback de modelos ativos
-    e retry automático com backoff exponencial. Registra e reporta erros individuais por modelo.
+    Analisa a transcrição com Google Gemini utilizando cadeia de fallback de modelos ativos,
+    system_instruction dedicado e fast-fail imediato em 404/429/503/504 para evitar travamentos longos.
     """
     client = get_gemini_client()
     system_instruction = load_director_prompt()
 
-    prompt = (
-        f"{system_instruction}\n\n"
-        "--- TRANSCRIÇÃO COM TIMESTAMPS DO VÍDEO ---\n"
+    user_prompt = (
+        "--- TRANSCRIÇÃO COM TIMESTAMPS EM SEGUNDOS [inicio-fim] ---\n"
         f"{transcript_text}\n\n"
-        "Analise cuidadosamente a transcrição acima e selecione os melhores cortes virais."
+        "Analise a transcrição acima e retorne o JSON com os melhores cortes virais."
     )
 
     model_candidates = []
@@ -335,10 +355,11 @@ def analyze_viral_cuts_gemini(
 
                 response = client.models.generate_content(
                     model=current_model,
-                    contents=prompt,
+                    contents=user_prompt,
                     config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
                         response_mime_type="application/json",
-                        temperature=0.3
+                        temperature=0.3,
                     )
                 )
 
@@ -350,9 +371,11 @@ def analyze_viral_cuts_gemini(
                 logger.warning("Falha no modelo Gemini %s [Tentativa %d/%d]: %s",
                                current_model, attempt + 1, max_retries, exc)
 
-                # Se o modelo não existir/não estiver habilitado (404/NOT_FOUND), avança imediatamente para o próximo
-                if "404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower():
-                    logger.warning("Modelo Gemini %s indisponível (404). Testando próximo da lista...", current_model)
+                if _should_fast_fail_model(err_str):
+                    logger.warning(
+                        "Modelo Gemini %s sobrecarregado/indisponível (%s). Avançando imediatamente para o próximo...",
+                        current_model, err_str[:80],
+                    )
                     break
                 wait_time = base_delay * (2 ** attempt)
                 if attempt < max_retries - 1:

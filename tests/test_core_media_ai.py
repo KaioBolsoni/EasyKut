@@ -73,6 +73,29 @@ def test_detect_viral_moments_provider_fallback_and_aggregated_errors(monkeypatc
     assert "Groq 429" in str(exc_info.value)
 
 
+def test_analyze_viral_cuts_gemini_fast_fails_on_504_and_503(monkeypatch):
+    calls = []
+
+    def _fake_generate(model, contents, config):
+        calls.append(model)
+        if model == "gemini-3.5-flash-lite":
+            raise RuntimeError("504 DEADLINE_EXCEEDED: Deadline expired")
+        if model == "gemini-4-hydrogen":
+            raise RuntimeError("503 UNAVAILABLE: high demand")
+        return SimpleNamespace(
+            text='{"cortes": [{"title": "Recuperado Rápido", "start_time": 5.0, "end_time": 20.0, "virality_score": 90}]}'
+        )
+
+    fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate))
+    monkeypatch.setattr(ai_apis, "get_gemini_client", lambda: fake_client)
+
+    cuts = ai_apis.analyze_viral_cuts_gemini("[5.0-20.0] Fala viral", max_retries=2, base_delay=0.0)
+    assert len(cuts) == 1
+    assert cuts[0]["title"] == "Recuperado Rápido"
+    # Cada modelo congestionado (504/503) deve ser tentado apenas 1 vez (fast-fail imediato!)
+    assert calls == ["gemini-3.5-flash-lite", "gemini-4-hydrogen", "gemini-3.1-flash-lite"]
+
+
 def test_ai_clients_configure_explicit_timeouts(monkeypatch):
     groq_ctor = MagicMock(return_value="groq_instance")
     gemini_ctor = MagicMock(return_value="gemini_instance")
