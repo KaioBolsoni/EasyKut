@@ -25,11 +25,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from core.ai_apis import detect_viral_moments, transcribe_audio_groq
+from core.ai_apis import detect_viral_moments, generate_seo_publish_kit, transcribe_audio_groq
+from core.broll_engine import suggest_broll_assets
 from core.config import (
+    BRANDS_DIR,
+    BROLL_DIR,
     CACHE_DIR,
     DATA_DIR,
     FFMPEG_AVAILABLE,
+    MUSIC_DIR,
     validate_config,
 )
 from core.downloader import (
@@ -37,8 +41,11 @@ from core.downloader import (
     download_video,
     is_valid_video_url,
 )
+from core.hw_accel import detect_gpu_encoder
 from core.logging_config import configure_logging, request_id_var
 from core.media_utils import normalize_virality_score
+from core.publishers import get_publish_providers_status
+from core.subtitles import SUBTITLE_PRESETS
 from core.video_engine import (
     cleanup_temporary_files,
     cut_video,
@@ -46,6 +53,7 @@ from core.video_engine import (
     extract_preview_frame,
     get_video_metadata,
 )
+from database import platform_repo
 from database.db_manager import (
     add_corte,
     delete_corte,
@@ -60,6 +68,8 @@ from database.db_manager import (
 from schemas.api_schemas import (
     AllowedLayoutMode,
     AnalyzeRequest,
+    BrandKitCreateRequest,
+    BrollSuggestRequest,
     CleanupRequest,
     CleanupResponse,
     ConfigResponse,
@@ -68,12 +78,15 @@ from schemas.api_schemas import (
     FrameRequest,
     FrameResponse,
     HealthResponse,
+    HighlightReelRequest,
     JobAcceptedResponse,
     MessageResponse,
     PreviewClipRequest,
     PreviewClipResponse,
+    PublishScheduleRequest,
     RenderCutItem,
     RenderRequest,
+    SeoKitRequest,
     UpdateCorteRequest,
     WorkspaceResponse,
 )
@@ -85,13 +98,20 @@ from services.media_service import (
     run_local_video_analyze_job as _service_run_local_analyze_job,
     run_render_job as _service_run_render_job,
 )
+from services.platform_service import (
+    build_video_cuts_zip as _service_build_zip,
+    generate_and_save_seo_kit as _service_generate_seo,
+    run_highlight_reel_job as _service_run_reel_job,
+    schedule_or_publish_corte as _service_schedule_post,
+)
 
 # Configuração de Logging Rotativo + Correlation ID
 configure_logging()
 logger = logging.getLogger("easykut_server")
 
-# Inicializa banco de dados SQLite (migrations v1 -> v3)
+# Inicializa banco de dados SQLite (migrations v1 -> v4) e recupera jobs órfãos
 init_db()
+job_manager.recover_orphaned_jobs()
 
 # Pastas de dados e interface web
 TEMP_DIR = (BASE_DIR / "data" / "temp").resolve()
@@ -99,12 +119,42 @@ CUTS_DIR = (BASE_DIR / "data" / "cortes").resolve()
 DOWNLOADS_DIR = (BASE_DIR / "data" / "downloads").resolve()
 WEB_DIR = (BASE_DIR / "web").resolve()
 
-for _d in (TEMP_DIR, CUTS_DIR, DOWNLOADS_DIR, CACHE_DIR, WEB_DIR):
+for _d in (TEMP_DIR, CUTS_DIR, DOWNLOADS_DIR, CACHE_DIR, BRANDS_DIR, MUSIC_DIR, BROLL_DIR, WEB_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+ALLOWED_LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+ALLOWED_MUSIC_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
+MAX_LOGO_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_MUSIC_BYTES = 30 * 1024 * 1024  # 30 MB
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
+def _is_valid_image_magic_bytes(header: bytes, ext: str) -> bool:
+    if len(header) < 8:
+        return False
+    if ext == ".png":
+        return header.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext in (".jpg", ".jpeg"):
+        return header.startswith(b"\xff\xd8\xff")
+    if ext == ".webp":
+        return header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    return False
+
+
+def _is_valid_audio_magic_bytes(header: bytes, ext: str) -> bool:
+    if len(header) < 4:
+        return False
+    if ext == ".mp3":
+        return header.startswith(b"ID3") or (header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)
+    if ext == ".wav":
+        return header.startswith(b"RIFF") and header[8:12] == b"WAVE"
+    if ext == ".ogg":
+        return header.startswith(b"OggS")
+    if ext in (".m4a", ".aac"):
+        return b"ftyp" in header[:16] or (header[0] == 0xFF and (header[1] & 0xF0) == 0xF0)
+    return False
 
 
 def _is_valid_video_magic_bytes(header: bytes, ext: str) -> bool:
@@ -137,8 +187,8 @@ cleanup_temporary_files(temp_dir=TEMP_DIR, remove_raw_downloads=False, max_age_h
 # Instância FastAPI
 app = FastAPI(
     title="EasyKut Studio API",
-    version="3.2.0",
-    description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais.",
+    version="4.0.0",
+    description="Plataforma local completa de curadoria IA, edição viral, Brand Kit, GPU, Highlight Reel e publicação.",
 )
 
 ALLOWED_ORIGINS = [
@@ -259,7 +309,20 @@ def _run_local_analyze_job(job_id: str, video_file_path: str, original_title: st
     )
 
 
-def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_resolution: int) -> None:
+def _run_render_job(
+    job_id: str,
+    video_id: int,
+    cuts: List[RenderCutItem],
+    max_resolution: int,
+    *,
+    use_gpu: bool = False,
+    brand_kit_id: Optional[int] = None,
+    normalize_audio: bool = False,
+    denoise_audio: bool = False,
+    music_path: Optional[str] = None,
+    music_volume: float = 0.18,
+    export_formats: Optional[List[str]] = None,
+) -> None:
     _service_run_render_job(
         job_id=job_id,
         video_id=video_id,
@@ -270,6 +333,13 @@ def _run_render_job(job_id: str, video_id: int, cuts: List[RenderCutItem], max_r
         temp_dir=TEMP_DIR,
         download_video_fn=download_video,
         cut_video_fn=cut_video,
+        use_gpu=use_gpu,
+        brand_kit_id=brand_kit_id,
+        normalize_audio=normalize_audio,
+        denoise_audio=denoise_audio,
+        music_path=music_path,
+        music_volume=music_volume,
+        export_formats=export_formats,
     )
 
 
@@ -304,6 +374,7 @@ def health_check(response: Response):
         ffmpeg_available=bool(FFMPEG_AVAILABLE),
         disk_free_mb=disk_free_mb,
         active_jobs=counts,
+        gpu_encoder=detect_gpu_encoder() if FFMPEG_AVAILABLE else None,
     )
 
 
@@ -425,6 +496,12 @@ def get_video_workspace(video_id: int):
     return WorkspaceResponse(**workspace)
 
 
+@app.get("/api/jobs")
+def list_jobs(limit: int = Query(30, ge=1, le=100)):
+    """Lista jobs recentes em execução e histórico persistido no SQLite."""
+    return {"jobs": job_manager.list_jobs(limit=limit)}
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
     """Retorna cópia profunda segura do estado atual, progresso e resultado/erro de um job."""
@@ -432,6 +509,15 @@ def get_job_status(job_id: str):
     if snapshot is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' não encontrado.")
     return snapshot
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str):
+    """Cancela um job em andamento e encerra com segurança qualquer processo FFmpeg associado."""
+    cancelled = job_manager.cancel_job(job_id)
+    if cancelled is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' não encontrado.")
+    return {"success": True, "job": cancelled}
 
 
 @app.post("/api/frame", response_model=FrameResponse)
@@ -506,6 +592,13 @@ def start_render(req: RenderRequest):
     if not video:
         raise HTTPException(status_code=404, detail=f"Vídeo ID {req.video_id} não encontrado.")
 
+    resolved_music_path: Optional[str] = None
+    if req.music_filename:
+        safe_music_name = Path(req.music_filename).name
+        cand = (MUSIC_DIR / safe_music_name).resolve()
+        if cand.exists() and cand.is_file() and cand.is_relative_to(MUSIC_DIR.resolve()):
+            resolved_music_path = str(cand)
+
     job_id = job_manager.create_job(job_type="render", step=f"Iniciando renderização de {len(req.cuts)} corte(s)...", progress=5)
     if job_id is None:
         raise HTTPException(status_code=429, detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar.")
@@ -513,6 +606,15 @@ def start_render(req: RenderRequest):
     threading.Thread(
         target=_run_render_job,
         args=(job_id, req.video_id, req.cuts, req.max_resolution or 1080),
+        kwargs={
+            "use_gpu": bool(req.use_gpu),
+            "brand_kit_id": req.brand_kit_id,
+            "normalize_audio": bool(req.normalize_audio),
+            "denoise_audio": bool(req.denoise_audio),
+            "music_path": resolved_music_path,
+            "music_volume": float(req.music_volume),
+            "export_formats": req.export_formats,
+        },
         daemon=True,
     ).start()
 
@@ -693,10 +795,213 @@ def open_folder():
 
 
 # ==========================================
+# ROTAS PRO V4.0 (ONDAS 2, 3 E 4)
+# ==========================================
+@app.get("/api/subtitle-presets")
+def list_subtitle_presets():
+    """Retorna catálogo de presets de legendas dinâmicas Karaoke (.ass)."""
+    return {
+        "presets": [
+            {"id": key, "label": cfg["label"], "uppercase": cfg["uppercase"]}
+            for key, cfg in SUBTITLE_PRESETS.items()
+        ]
+    }
+
+
+@app.get("/api/brand-kits")
+def get_brand_kits():
+    return {"brand_kits": platform_repo.list_brand_kits()}
+
+
+@app.post("/api/brand-kits", status_code=status.HTTP_201_CREATED)
+def save_brand_kit(req: BrandKitCreateRequest):
+    safe_logo = ""
+    if req.logo_path:
+        cand = Path(req.logo_path).resolve()
+        if cand.is_relative_to(BRANDS_DIR.resolve()) and cand.exists():
+            safe_logo = str(cand)
+        else:
+            by_name = (BRANDS_DIR / Path(req.logo_path).name).resolve()
+            if by_name.is_relative_to(BRANDS_DIR.resolve()) and by_name.exists():
+                safe_logo = str(by_name)
+    try:
+        kit = platform_repo.upsert_brand_kit(
+            name=req.name,
+            logo_path=safe_logo,
+            logo_position=req.logo_position,
+            logo_opacity=req.logo_opacity,
+            logo_scale=req.logo_scale,
+            subtitle_preset=req.subtitle_preset,
+            progress_bar_enabled=req.progress_bar_enabled,
+            progress_bar_color=req.progress_bar_color,
+            hook_banner_enabled=req.hook_banner_enabled,
+            hook_banner_duration=req.hook_banner_duration,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"success": True, "brand_kit": kit}
+
+
+@app.delete("/api/brand-kits/{kit_id}", response_model=MessageResponse)
+def remove_brand_kit(kit_id: int):
+    if not platform_repo.delete_brand_kit(kit_id):
+        raise HTTPException(status_code=404, detail=f"Brand Kit ID {kit_id} não encontrado.")
+    return MessageResponse(success=True, message=f"Brand Kit ID {kit_id} removido.")
+
+
+@app.post("/api/brand-kits/upload-logo", status_code=status.HTTP_201_CREATED)
+async def upload_brand_logo(file: UploadFile = File(...)):
+    orig_name = Path(file.filename or "logo.png").name
+    ext = Path(orig_name).suffix.lower()
+    if ext not in ALLOWED_LOGO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Logo deve ser PNG, JPG ou WebP.")
+    BRANDS_DIR.mkdir(parents=True, exist_ok=True)
+    content = await file.read(MAX_LOGO_BYTES + 1)
+    await file.close()
+    if not content or len(content) > MAX_LOGO_BYTES:
+        raise HTTPException(status_code=413 if len(content) > MAX_LOGO_BYTES else 400, detail="Logo inválida ou acima de 5 MB.")
+    if not _is_valid_image_magic_bytes(content[:16], ext):
+        raise HTTPException(status_code=400, detail="Assinatura binária de imagem inválida.")
+    dest = (BRANDS_DIR / f"logo_{uuid.uuid4().hex[:10]}{ext}").resolve()
+    dest.write_bytes(content)
+    return {"success": True, "logo_path": dest.name, "logo_url": f"/data/brands/{dest.name}"}
+
+
+@app.get("/api/music")
+def list_music_tracks():
+    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    tracks = [
+        {"filename": f.name, "size_kb": round(f.stat().st_size / 1024, 1)}
+        for f in sorted(MUSIC_DIR.iterdir())
+        if f.is_file() and f.suffix.lower() in ALLOWED_MUSIC_EXTENSIONS
+    ]
+    return {"tracks": tracks}
+
+
+@app.post("/api/music/upload", status_code=status.HTTP_201_CREATED)
+async def upload_music_track(file: UploadFile = File(...)):
+    orig_name = Path(file.filename or "bgm.mp3").name
+    ext = Path(orig_name).suffix.lower()
+    if ext not in ALLOWED_MUSIC_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Formato de trilha inválido. Use MP3, WAV, M4A, AAC ou OGG.")
+    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    content = await file.read(MAX_MUSIC_BYTES + 1)
+    await file.close()
+    if not content or len(content) > MAX_MUSIC_BYTES:
+        raise HTTPException(status_code=413 if len(content) > MAX_MUSIC_BYTES else 400, detail="Trilha vazia ou acima de 30 MB.")
+    if not _is_valid_audio_magic_bytes(content[:16], ext):
+        raise HTTPException(status_code=400, detail="Assinatura binária de áudio inválida.")
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(orig_name).stem)[:40] or "track"
+    dest = (MUSIC_DIR / f"{safe_stem}_{uuid.uuid4().hex[:6]}{ext}").resolve()
+    dest.write_bytes(content)
+    return {"success": True, "filename": dest.name}
+
+
+@app.delete("/api/music/{filename}", response_model=MessageResponse)
+def delete_music_track(filename: str):
+    safe_name = Path(filename).name
+    target = (MUSIC_DIR / safe_name).resolve()
+    if not target.is_relative_to(MUSIC_DIR.resolve()) or not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Trilha de áudio não encontrada.")
+    target.unlink()
+    return MessageResponse(success=True, message=f"Trilha '{safe_name}' removida.")
+
+
+@app.post("/api/cortes/{corte_id}/seo-kit")
+def create_seo_kit(corte_id: int, req: Optional[SeoKitRequest] = None):
+    payload = req or SeoKitRequest()
+    return _service_generate_seo(
+        corte_id=corte_id,
+        provider=payload.provider,
+        cache_dir=CACHE_DIR,
+        temp_dir=TEMP_DIR,
+        manager=job_manager,
+        seo_fn=generate_seo_publish_kit,
+    )
+
+
+@app.get("/api/videos/{video_id}/export-zip")
+def export_video_cuts_zip(video_id: int):
+    zip_bytes, filename = _service_build_zip(video_id)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/videos/{video_id}/highlight-reel", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
+def start_highlight_reel(video_id: int, req: HighlightReelRequest):
+    if not get_video(video_id):
+        raise HTTPException(status_code=404, detail=f"Vídeo ID {video_id} não encontrado.")
+    job_id = job_manager.create_job(job_type="reel", step="Iniciando compilação de Highlight Reel...", progress=5)
+    if job_id is None:
+        raise HTTPException(status_code=429, detail="Limite de compilações simultâneas atingido.")
+    threading.Thread(
+        target=_service_run_reel_job,
+        kwargs={
+            "job_id": job_id,
+            "video_id": video_id,
+            "corte_ids": req.corte_ids,
+            "transition": req.transition,
+            "transition_duration": req.transition_duration,
+            "title": req.title,
+            "use_gpu": req.use_gpu,
+            "manager": job_manager,
+        },
+        daemon=True,
+    ).start()
+    return JobAcceptedResponse(job_id=job_id, message="Compilação de Highlight Reel iniciada.")
+
+
+@app.post("/api/broll/suggest")
+def broll_suggest(req: BrollSuggestRequest):
+    return suggest_broll_assets(
+        query=req.query,
+        transcript_excerpt=req.transcript_excerpt,
+        orientation=req.orientation,
+        max_results=req.max_results,
+        broll_dir=BROLL_DIR,
+    )
+
+
+@app.get("/api/publish/providers")
+def list_publish_providers():
+    return {"providers": get_publish_providers_status()}
+
+
+@app.get("/api/publish/schedule")
+def list_publish_schedule(corte_id: Optional[int] = Query(None), status_filter: Optional[str] = Query(None, alias="status")):
+    return {"posts": platform_repo.list_scheduled_posts(corte_id=corte_id, status=status_filter)}
+
+
+@app.post("/api/publish/schedule", status_code=status.HTTP_201_CREATED)
+def schedule_publish_post(req: PublishScheduleRequest):
+    return _service_schedule_post(
+        corte_id=req.corte_id,
+        platform=req.platform,
+        title=req.title,
+        caption=req.caption,
+        hashtags=req.hashtags,
+        scheduled_at=req.scheduled_at,
+        publish_now=req.publish_now,
+    )
+
+
+@app.delete("/api/publish/schedule/{post_id}", response_model=MessageResponse)
+def cancel_scheduled_post(post_id: int):
+    if not platform_repo.delete_scheduled_post(post_id):
+        raise HTTPException(status_code=404, detail=f"Agendamento ID {post_id} não encontrado.")
+    return MessageResponse(success=True, message=f"Agendamento ID {post_id} removido.")
+
+
+# ==========================================
 # ROTAS ESTÁTICAS PARA MÍDIA E INTERFACE WEB
 # ==========================================
 app.mount("/data/temp", StaticFiles(directory=str(BASE_DIR / "data" / "temp")), name="data_temp")
 app.mount("/data/cortes", StaticFiles(directory=str(BASE_DIR / "data" / "cortes")), name="data_cortes")
+app.mount("/data/brands", StaticFiles(directory=str(BASE_DIR / "data" / "brands")), name="data_brands")
+app.mount("/data/broll", StaticFiles(directory=str(BASE_DIR / "data" / "broll")), name="data_broll")
 app.mount("/", StaticFiles(directory=str(BASE_DIR / "web"), html=True), name="web")
 
 __all__ = ["AllowedLayoutMode", "RenderCutItem", "app"]
