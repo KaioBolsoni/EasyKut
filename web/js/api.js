@@ -1,5 +1,5 @@
 /**
- * Cliente REST modular para a API FastAPI do EasyKut Studio.
+ * Cliente REST modular para a API FastAPI do EasyKut Studio (V3.2).
  */
 
 export async function apiGetConfig() {
@@ -7,8 +7,24 @@ export async function apiGetConfig() {
   return { res, data: await res.json() };
 }
 
+export async function apiGetHealth() {
+  const res = await fetch('/api/health');
+  return { res, data: await res.json() };
+}
+
 export async function apiOpenFolder() {
   const res = await fetch('/api/open-folder', { method: 'POST' });
+  return { res, data: await res.json() };
+}
+
+export async function apiCleanup(removeRawDownloads = false, maxAgeHours = null) {
+  const payload = { remove_raw_downloads: Boolean(removeRawDownloads) };
+  if (maxAgeHours !== null) payload.max_age_hours = maxAgeHours;
+  const res = await fetch('/api/cleanup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
   return { res, data: await res.json() };
 }
 
@@ -18,6 +34,23 @@ export async function apiStartAnalyze(url, provider, maxCuts) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, provider, max_cuts: maxCuts }),
   });
+  return { res, data: await res.json() };
+}
+
+export async function apiUploadVideo(file, provider, maxCuts) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('provider', provider);
+  form.append('max_cuts', String(maxCuts));
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    body: form,
+  });
+  return { res, data: await res.json() };
+}
+
+export async function apiGetWorkspace(videoId) {
+  const res = await fetch(`/api/videos/${videoId}/workspace`);
   return { res, data: await res.json() };
 }
 
@@ -62,13 +95,13 @@ export async function apiStartRender(videoId, cuts, maxResolution = 1080) {
     body: JSON.stringify({
       video_id: videoId,
       cuts,
-      max_resolution: maxResolution,
+      max_resolution: Number(maxResolution) === 720 ? 720 : 1080,
     }),
   });
   return { res, data: await res.json() };
 }
 
-export async function apiGetHistory(search = '', minScore = 0, limit = 50, offset = 0) {
+export async function apiGetHistory(search = '', minScore = 0, limit = 12, offset = 0) {
   const params = new URLSearchParams({
     search,
     min_score: String(minScore),
@@ -83,6 +116,15 @@ export async function apiGetHistory(search = '', minScore = 0, limit = 50, offse
 export async function apiDeleteVideo(videoId, deleteFiles = false) {
   const res = await fetch(`/api/history/${videoId}?delete_files=${Boolean(deleteFiles)}`, {
     method: 'DELETE',
+  });
+  return { res, data: await res.json() };
+}
+
+export async function apiCreateCorte(payload) {
+  const res = await fetch('/api/cortes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
   return { res, data: await res.json() };
 }

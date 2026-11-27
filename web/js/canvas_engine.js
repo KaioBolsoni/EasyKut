@@ -245,6 +245,19 @@ export function renderEditorCanvas(canvasState, cut) {
     drawHandle(ctx, bot.x, bot.y + bot.h, '#F59E0B');
     drawHandle(ctx, bot.x + bot.w, bot.y + bot.h, '#F59E0B');
     drawBadge(ctx, 'BASE (1080×960)', bot.x + 10, bot.y + 26, '#F59E0B');
+  } else if (mode === 'face_tracking_9_16') {
+    const centerW = Math.round(H * (9 / 16));
+    const centerX = Math.round((W - centerW) / 2);
+    ctx.fillStyle = 'rgba(11, 13, 18, 0.55)';
+    ctx.fillRect(0, 0, centerX, H);
+    ctx.fillRect(centerX + centerW, 0, W - (centerX + centerW), H);
+
+    ctx.strokeStyle = '#10B981';
+    ctx.lineWidth = 4;
+    ctx.setLineDash([12, 8]);
+    ctx.strokeRect(centerX, 0, centerW, H);
+    ctx.setLineDash([]);
+    drawBadge(ctx, '🤖 AUTO FACE TRACKING 9:16', centerX + 12, 34, '#10B981');
   } else if (mode === 'vertical_blur') {
     const centerW = Math.round(H * (9 / 16));
     const centerX = Math.round((W - centerW) / 2);
@@ -323,6 +336,11 @@ export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn) {
   if (mode === 'manual_crop') {
     const { crop_x: x, crop_y: y, crop_w: w, crop_h: h } = cut.layout_params;
     ctx.drawImage(srcEl, x * scaleX, y * scaleY, w * scaleX, h * scaleY, 0, 0, mW, mH);
+  } else if (mode === 'face_tracking_9_16') {
+    const cropW = Math.round(srcH * (9 / 16));
+    const cropX = Math.max(0, Math.round((srcW - cropW) / 2));
+    ctx.drawImage(srcEl, cropX, 0, cropW, srcH, 0, 0, mW, mH);
+    drawBadge(ctx, '🤖 Face Tracking IA (OpenCV)', 28, 86, '#10B981');
   } else if (mode === 'split_screen') {
     const top = cut.layout_params.box_top;
     const bot = cut.layout_params.box_bottom;
