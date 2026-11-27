@@ -759,9 +759,21 @@ def run_render_job(
                 raise JobCancelledError(f"Job '{job_id}' cancelado pelo usuário.")
             cut_title = c.get_effective_title(fallback=f"Corte_{idx + 1}")
             pct = 25 + int((idx / max(1, total_cuts)) * 70)
+            fx_tags = []
+            if use_gpu:
+                fx_tags.append("GPU")
+            if getattr(c, "remove_silences", False):
+                fx_tags.append("JumpCuts")
+            if getattr(c, "punch_in_zoom", False):
+                fx_tags.append("PunchZoom")
+            if normalize_audio:
+                fx_tags.append("-14LUFS")
+            if brand_kit:
+                fx_tags.append(f"Brand:{brand_kit['name']}")
+            fx_suffix = f" [{' · '.join(fx_tags)}]" if fx_tags else ""
             manager.update_job(
                 job_id,
-                step=f"Renderizando corte {idx + 1}/{total_cuts}: '{cut_title}' ({c.layout_mode})...",
+                step=f"Renderizando corte {idx + 1}/{total_cuts}: '{cut_title}' ({c.layout_mode}){fx_suffix}...",
                 progress=pct,
             )
             rendered_results.append(

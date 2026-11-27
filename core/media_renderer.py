@@ -578,7 +578,14 @@ def _compose_pro_filter_complex(
     if layout_args and layout_args[0] == "-filter_complex":
         raw_fc = layout_args[1]
         if v_in != "[0:v]":
-            raw_fc = raw_fc.replace("[0:v]", v_in)
+            ref_count = raw_fc.count("[0:v]")
+            if ref_count > 1:
+                split_labels = [f"[jv_s{i}]" for i in range(ref_count)]
+                parts.append(f"{v_in}split={ref_count}{''.join(split_labels)}")
+                for lbl in split_labels:
+                    raw_fc = raw_fc.replace("[0:v]", lbl, 1)
+            else:
+                raw_fc = raw_fc.replace("[0:v]", v_in)
         parts.append(raw_fc)
         v_cur = layout_args[3] if len(layout_args) > 3 else "[merged]"
     elif layout_args and layout_args[0] == "-vf":
@@ -589,9 +596,9 @@ def _compose_pro_filter_complex(
         v_cur = "[v_lay]"
 
     if punch_in_zoom:
-        # Efeito de retenção suave: alterna micro-zoom 1.00x -> 1.07x a cada 6 segundos mantendo dimensões finais
+        # Efeito de retenção visível em Shorts: pulsa zoom 1.00x -> 1.09x a cada 6s (ativa em t=2.5s)
         parts.append(
-            f"{v_cur}scale='iw*(1+0.07*gt(mod(t,12),6))':'ih*(1+0.07*gt(mod(t,12),6))':eval=frame,"
+            f"{v_cur}scale='iw*(1+0.09*gt(mod(t,6),2.5))':'ih*(1+0.09*gt(mod(t,6),2.5))':eval=frame,"
             f"crop={target_width}:{target_height}[v_punch]"
         )
         v_cur = "[v_punch]"

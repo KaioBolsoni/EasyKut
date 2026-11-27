@@ -200,6 +200,44 @@ def test_jump_cuts_intervals_remapping_and_filter_graph():
     assert v_out == "[jcv_out]"
     assert a_out == "[jca_out]"
 
+    # Garante que combinar Jump Cuts com vertical_blur (que consome [0:v] duas vezes) insere split=2
+    from core import media_renderer
+
+    blur_args, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="vertical_blur",
+        src_path="fake.mp4",
+        start_time=0.0,
+        end_time=8.0,
+        orig_w=1920,
+        orig_h=1080,
+        target_width=1080,
+        target_height=1920,
+        cfg={"zoom_factor": 1.0},
+        face_tracking=False,
+        sub_filter=None,
+    )
+    composed = media_renderer._compose_pro_filter_complex(
+        layout_args=blur_args,
+        intervals=intervals,
+        brand_kit=None,
+        hook_title="",
+        effective_duration=2.5,
+        target_width=1080,
+        target_height=1920,
+        sub_filter=None,
+        punch_in_zoom=True,
+        logo_input_index=None,
+        music_input_index=None,
+        normalize_audio=True,
+        denoise_audio=False,
+        music_volume=0.18,
+    )
+    fc_str = composed[1]
+    assert "[jcv_out]split=2[jv_s0][jv_s1]" in fc_str
+    assert "[jv_s0]scale=1080:1920" in fc_str
+    assert "[jv_s1]scale=1080:-2" in fc_str
+    assert "gt(mod(t,6),2.5)" in fc_str
+
 
 def test_brand_overlay_filters_and_logo_confinement(isolated_env, tmp_path: Path):
     valid_logo = isolated_env["brands_dir"] / "logo_ok.png"
