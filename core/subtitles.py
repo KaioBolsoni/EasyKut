@@ -1,9 +1,11 @@
 """
-Módulo de geração, sincronização temporal e formatação FFmpeg de legendas (.srt).
+Módulo de geração, sincronização temporal e formatação FFmpeg de legendas (.srt e Karaoke .ass).
+Suporta presets virais palavra-por-palavra estilo Hormozi / CapCut / Neon / Minimalista / Caixa.
 """
 
 import logging
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -11,11 +13,93 @@ from core import media_utils
 
 logger = logging.getLogger(__name__)
 
+# Presets estilizados em formato ASS (cores em BGR &H00BBGGRR)
+SUBTITLE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "hormozi": {
+        "label": "Hormozi Viral (Amarelo)",
+        "font": "Arial Black",
+        "font_size_v": 68,
+        "font_size_h": 54,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0000EAFF",  # Amarelo vibrante
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_width": 5,
+        "shadow": 2,
+        "uppercase": True,
+        "margin_v_vertical": 240,
+        "margin_v_horizontal": 80,
+    },
+    "neon": {
+        "label": "Neon Cyber (Ciano)",
+        "font": "Arial Black",
+        "font_size_v": 66,
+        "font_size_h": 52,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H00FFEF00",  # Ciano neon
+        "outline": "&H00441100",
+        "back": "&H90000000",
+        "border_style": 1,
+        "outline_width": 4,
+        "shadow": 3,
+        "uppercase": True,
+        "margin_v_vertical": 240,
+        "margin_v_horizontal": 80,
+    },
+    "boxed": {
+        "label": "Caixa Destaque (Roxo)",
+        "font": "Arial",
+        "font_size_v": 60,
+        "font_size_h": 48,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0080FF00",  # Verde-lima destaque
+        "outline": "&H00000000",
+        "back": "&HB0201010",
+        "border_style": 3,
+        "outline_width": 8,
+        "shadow": 0,
+        "uppercase": False,
+        "margin_v_vertical": 230,
+        "margin_v_horizontal": 75,
+    },
+    "minimal": {
+        "label": "Minimalista Clean",
+        "font": "Arial",
+        "font_size_v": 54,
+        "font_size_h": 44,
+        "primary": "&H00F2F2F2",
+        "highlight": "&H00FFFFFF",
+        "outline": "&H00181818",
+        "back": "&H00000000",
+        "border_style": 1,
+        "outline_width": 3,
+        "shadow": 1,
+        "uppercase": False,
+        "margin_v_vertical": 210,
+        "margin_v_horizontal": 65,
+    },
+    "classic": {
+        "label": "Clássico (SRT/ASS)",
+        "font": "Arial",
+        "font_size_v": 56,
+        "font_size_h": 46,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0055D4FF",
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_width": 3,
+        "shadow": 1,
+        "uppercase": False,
+        "margin_v_vertical": 210,
+        "margin_v_horizontal": 65,
+    },
+}
+
 
 def format_srt_time(seconds: float) -> str:
-    """
-    Converte segundos em formato de timestamp padrão SRT: HH:MM:SS,mmm.
-    """
+    """Converte segundos em formato de timestamp padrão SRT: HH:MM:SS,mmm."""
     clamped_sec = max(0.0, seconds)
     millis = int(round((clamped_sec - int(clamped_sec)) * 1000))
     if millis >= 1000:
@@ -28,6 +112,41 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{mins:02d}:{secs:02d},{millis:03d}"
 
 
+def format_ass_time(seconds: float) -> str:
+    """Converte segundos em formato de timestamp ASS: H:MM:SS.cc (centésimos)."""
+    clamped = max(0.0, float(seconds))
+    total_cs = int(round(clamped * 100))
+    cs = total_cs % 100
+    total_sec = total_cs // 100
+    secs = total_sec % 60
+    total_min = total_sec // 60
+    mins = total_min % 60
+    hours = total_min // 60
+    return f"{hours:d}:{mins:02d}:{secs:02d}.{cs:02d}"
+
+
+def escape_libavfilter_path(file_path: str) -> str:
+    """Escapa caminhos Windows/POSIX para uso seguro nos filtros subtitles/ass/movie do FFmpeg."""
+    p = Path(file_path).resolve()
+    clean_path = str(p).replace("\\", "/")
+    if len(clean_path) > 1 and clean_path[1] == ":":
+        clean_path = f"{clean_path[0]}\\:{clean_path[2:]}"
+    return (
+        clean_path.replace("'", "\\'")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def _escape_ass_text(text: str) -> str:
+    """Remove ou escapa tags ASS indesejadas no texto falado."""
+    cleaned = str(text or "").replace("\r", " ").replace("\n", " ")
+    cleaned = cleaned.replace("{", "(").replace("}", ")").replace("\\", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def generate_srt_for_segment(
     segments: List[Dict[str, Any]],
     start_time: float,
@@ -38,7 +157,6 @@ def generate_srt_for_segment(
     """
     Recebe os segmentos com timestamps do Whisper e o intervalo do corte (start_time, end_time),
     ajusta os tempos para iniciarem em 00:00:00,000 e salva um arquivo .srt em data/temp/.
-    Retorna o caminho do arquivo .srt ou None se não houver legendas no trecho.
     """
     if not segments:
         return None
@@ -81,26 +199,168 @@ def generate_srt_for_segment(
     return str(dest_srt.resolve())
 
 
+def extract_words_for_segment(
+    segments: Optional[List[Dict[str, Any]]],
+    words: Optional[List[Dict[str, Any]]],
+    start_time: float,
+    end_time: float,
+    prefer_segments: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Extrai palavras com timestamps relativos ao corte [0, end_time - start_time].
+    Usa word-level timestamps reais do Groq Whisper quando disponíveis; caso ausentes
+    ou quando o usuário editou legendas manualmente (prefer_segments=True), interpola
+    uniformemente as palavras de cada segmento.
+    """
+    clip_dur = max(0.0, float(end_time) - float(start_time))
+    rel_words: List[Dict[str, Any]] = []
+
+    if words and not prefer_segments:
+        for w in words:
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end", ws))
+            txt = _escape_ass_text(w.get("word", w.get("text", "")))
+            if not txt or we <= start_time or ws >= end_time:
+                continue
+            rs = max(0.0, ws - start_time)
+            re_t = min(clip_dur, max(rs + 0.06, we - start_time))
+            if re_t > rs:
+                rel_words.append({"word": txt, "start": rs, "end": re_t})
+
+    if rel_words:
+        return rel_words
+
+    for seg in segments or []:
+        ss = float(seg.get("start", 0.0))
+        se = float(seg.get("end", 0.0))
+        text = _escape_ass_text(seg.get("text", ""))
+        if not text or se <= start_time or ss >= end_time:
+            continue
+        rs = max(0.0, ss - start_time)
+        re_t = min(clip_dur, se - start_time)
+        if re_t <= rs:
+            continue
+        tokens = text.split()
+        step = (re_t - rs) / max(1, len(tokens))
+        for idx, tok in enumerate(tokens):
+            w_s = rs + (idx * step)
+            w_e = rs + ((idx + 1) * step)
+            rel_words.append({"word": tok, "start": w_s, "end": max(w_s + 0.05, w_e)})
+
+    return rel_words
+
+
+def generate_ass_karaoke_for_segment(
+    segments: Optional[List[Dict[str, Any]]],
+    start_time: float,
+    end_time: float,
+    words: Optional[List[Dict[str, Any]]] = None,
+    preset: str = "hormozi",
+    is_vertical: bool = True,
+    play_res_x: int = 1080,
+    play_res_y: int = 1920,
+    max_words_per_chunk: int = 3,
+    prefer_segments: bool = False,
+    output_ass_path: Optional[str] = None,
+    temp_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Gera legenda dinâmica palavra-por-palavra (.ass) estilo Hormozi/CapCut com
+    agrupamento em blocos de 2 a 4 palavras, destaque colorido e animação pop sutil.
+    """
+    rel_words = extract_words_for_segment(
+        segments=segments,
+        words=words,
+        start_time=start_time,
+        end_time=end_time,
+        prefer_segments=prefer_segments,
+    )
+    if not rel_words:
+        return None
+
+    cfg = SUBTITLE_PRESETS.get(str(preset or "hormozi").lower(), SUBTITLE_PRESETS["hormozi"])
+    font_size = cfg["font_size_v"] if is_vertical else cfg["font_size_h"]
+    margin_v = cfg["margin_v_vertical"] if is_vertical else cfg["margin_v_horizontal"]
+    chunk_size = max(2, min(5, int(max_words_per_chunk)))
+
+    header = "\n".join([
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {int(play_res_x)}",
+        f"PlayResY: {int(play_res_y)}",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        (
+            f"Style: Default,{cfg['font']},{font_size},{cfg['primary']},{cfg['highlight']},"
+            f"{cfg['outline']},{cfg['back']},-1,0,0,0,100,100,0,0,{cfg['border_style']},"
+            f"{cfg['outline_width']},{cfg['shadow']},2,60,60,{margin_v},1"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ])
+
+    # Agrupa palavras respeitando pausas > 0.45s ou teto chunk_size
+    chunks: List[List[Dict[str, Any]]] = []
+    cur_chunk: List[Dict[str, Any]] = []
+    for w in rel_words:
+        if cur_chunk and (len(cur_chunk) >= chunk_size or (w["start"] - cur_chunk[-1]["end"]) > 0.45):
+            chunks.append(cur_chunk)
+            cur_chunk = []
+        cur_chunk.append(w)
+    if cur_chunk:
+        chunks.append(cur_chunk)
+
+    events: List[str] = []
+    hl = cfg["highlight"]
+    pri = cfg["primary"]
+    upper = bool(cfg["uppercase"])
+
+    for chunk in chunks:
+        for active_idx, active_word in enumerate(chunk):
+            ev_start = active_word["start"]
+            ev_end = chunk[active_idx + 1]["start"] if active_idx + 1 < len(chunk) else active_word["end"]
+            if ev_end <= ev_start:
+                ev_end = ev_start + 0.08
+
+            rendered_tokens: List[str] = []
+            for idx, tok in enumerate(chunk):
+                label = tok["word"].upper() if upper else tok["word"]
+                if idx == active_idx:
+                    rendered_tokens.append(
+                        f"{{\\c{hl}\\fscx112\\fscy112\\t(0,85,\\fscx100\\fscy100)}}{label}{{\\c{pri}\\fscx100\\fscy100}}"
+                    )
+                else:
+                    rendered_tokens.append(label)
+
+            line_text = " ".join(rendered_tokens)
+            events.append(
+                f"Dialogue: 0,{format_ass_time(ev_start)},{format_ass_time(ev_end)},Default,,0,0,0,,{line_text}"
+            )
+
+    if not events:
+        return None
+
+    if output_ass_path:
+        dest_ass = Path(output_ass_path)
+    else:
+        base_temp = temp_dir or media_utils.TEMP_DIR
+        dest_ass = base_temp / f"karaoke_{preset}_{int(start_time)}_{int(end_time)}_{uuid.uuid4().hex[:6]}.ass"
+
+    dest_ass.parent.mkdir(parents=True, exist_ok=True)
+    dest_ass.write_text(header + "\n" + "\n".join(events) + "\n", encoding="utf-8")
+    logger.info("Legenda Karaoke ASS (%s) gerada com sucesso: %s (%d eventos)", preset, dest_ass.name, len(events))
+    return str(dest_ass.resolve())
+
+
 def format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> str:
     """
     Formata e escapa o caminho do arquivo .srt para o filtro subtitles do FFmpeg (libavfilter)
     no Windows/Linux, aplicando tipografia para Shorts (9:16) ou horizontal (16:9).
     """
-    p = Path(srt_path).resolve()
-    clean_path = str(p).replace("\\", "/")
-
-    if len(clean_path) > 1 and clean_path[1] == ":":
-        drive = clean_path[0]
-        rest = clean_path[2:]
-        clean_path = f"{drive}\\:{rest}"
-
-    clean_path = (
-        clean_path.replace("'", "\\'")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace(",", "\\,")
-        .replace(";", "\\;")
-    )
+    clean_path = escape_libavfilter_path(srt_path)
 
     if is_vertical:
         style = (
@@ -116,6 +376,11 @@ def format_ffmpeg_subtitles_filter(srt_path: str, is_vertical: bool = True) -> s
         )
 
     return f"subtitles='{clean_path}':force_style='{style}'"
+
+
+def format_ffmpeg_ass_filter(ass_path: str) -> str:
+    """Formata e escapa o caminho do arquivo .ass para o filtro ass do FFmpeg (libavfilter)."""
+    return f"ass='{escape_libavfilter_path(ass_path)}'"
 
 
 _format_ffmpeg_subtitles_filter = format_ffmpeg_subtitles_filter

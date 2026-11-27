@@ -298,3 +298,118 @@ def detect_smooth_face_crop_x(
     except Exception as exc:
         logger.warning("Falha durante o face tracking: %s. Fallback seguro para center crop.", exc)
         return None
+
+
+def detect_dynamic_face_crop_keyframes(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    orig_w: int,
+    orig_h: int,
+    crop_w: int,
+    window_sec: float = 1.5,
+    sample_rate_sec: float = 0.25,
+) -> List[Tuple[float, int]]:
+    """
+    Rastreamento facial dinâmico (Active Speaker / Pan Suave por Cena).
+    Amostra centros faciais em janelas de `window_sec` segundos, aplica suavização
+    anti-tremor e retorna keyframes [(t_rel, crop_x), ...] para expressão FFmpeg.
+    """
+    try:
+        detector = _FaceDetectorWrapper(target_size=(int(orig_w * 0.5), int(orig_h * 0.5)))
+        if not detector.is_available():
+            return []
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return []
+
+        max_crop_x = max(0, orig_w - crop_w)
+        buckets: dict[int, List[float]] = {}
+        win = max(0.5, float(window_sec))
+
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            frame_step = max(1, int(fps * sample_rate_sec))
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start_time * 1000.0))
+
+            current_sec = start_time
+            while current_sec < end_time:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                face = detector.detect_largest_face(frame, scale_factor=0.5)
+                if face is not None:
+                    fx, _fy, fw, _fh = face
+                    center_x = fx + (fw / 2.0)
+                    target_x = max(0.0, min(float(max_crop_x), center_x - (crop_w / 2.0)))
+                    b_idx = int((current_sec - start_time) // win)
+                    buckets.setdefault(b_idx, []).append(target_x)
+
+                for _ in range(frame_step - 1):
+                    if not cap.grab():
+                        break
+                current_sec += sample_rate_sec
+        finally:
+            cap.release()
+
+        if not buckets:
+            return []
+
+        raw_kfs: List[Tuple[float, int]] = []
+        last_x: Optional[int] = None
+        max_pan_step = max(40, int(crop_w * 0.35))
+        for b_idx in sorted(buckets.keys()):
+            med_x = int(round(float(np.median(buckets[b_idx]))))
+            if last_x is not None and abs(med_x - last_x) > max_pan_step:
+                med_x = last_x + max_pan_step if med_x > last_x else last_x - max_pan_step
+            med_x = max(0, min(max_crop_x, med_x))
+            med_x -= med_x % 2
+            t_rel = round(b_idx * win, 2)
+            # Evita keyframes redundantes com deslocamento imperceptível
+            if last_x is None or abs(med_x - last_x) >= 16:
+                raw_kfs.append((t_rel, med_x))
+                last_x = med_x
+
+        return raw_kfs[:18]
+    except Exception as exc:
+        logger.warning("Falha no face tracking dinâmico: %s", exc)
+        return []
+
+
+def build_ffmpeg_dynamic_crop_x_expr(keyframes: List[Tuple[float, int]], max_crop_x: int) -> str:
+    """
+    Constrói uma expressão FFmpeg piecewise-linear segura para o parâmetro `x` do filtro crop,
+    interpolando suavemente entre keyframes consecutivos [(t0, x0), (t1, x1), ...].
+    """
+    if not keyframes:
+        return "0"
+    clamped = [(max(0.0, float(t)), max(0, min(max_crop_x, int(x)))) for t, x in keyframes]
+    if len(clamped) == 1:
+        return str(clamped[0][1])
+
+    xs = [x for _, x in clamped]
+    if (max(xs) - min(xs)) < 24:
+        med = int(round(float(np.median(xs))))
+        med -= med % 2
+        return str(max(0, min(max_crop_x, med)))
+
+    parts: List[str] = []
+    # Antes do primeiro keyframe (caso t0 > 0)
+    if clamped[0][0] > 0.0:
+        parts.append(f"lt(t,{clamped[0][0]:.2f})*{clamped[0][1]}")
+
+    for idx in range(len(clamped) - 1):
+        t0, x0 = clamped[idx]
+        t1, x1 = clamped[idx + 1]
+        dt = max(0.05, t1 - t0)
+        if x1 == x0:
+            seg = f"between(t,{t0:.2f},{t1:.2f})*{x0}"
+        else:
+            dx = x1 - x0
+            seg = f"between(t,{t0:.2f},{t1:.2f})*({x0}+({dx})*(t-{t0:.2f})/{dt:.2f})"
+        parts.append(seg)
+
+    last_t, last_x = clamped[-1]
+    parts.append(f"gt(t,{last_t:.2f})*{last_x}")
+    return f"min({max_crop_x},max(0,{'+'.join(parts)}))"

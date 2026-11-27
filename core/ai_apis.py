@@ -113,13 +113,24 @@ def transcribe_audio_groq(
                         model, attempt + 1, max_retries, target_audio_path.name)
 
             with open(target_audio_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    file=(target_audio_path.name, audio_file.read()),
-                    model=model,
-                    response_format="verbose_json",
-                    language=language,
-                    temperature=0.0
-                )
+                audio_bytes = audio_file.read()
+                try:
+                    transcription = client.audio.transcriptions.create(
+                        file=(target_audio_path.name, audio_bytes),
+                        model=model,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word", "segment"],
+                        language=language,
+                        temperature=0.0,
+                    )
+                except TypeError:
+                    transcription = client.audio.transcriptions.create(
+                        file=(target_audio_path.name, audio_bytes),
+                        model=model,
+                        response_format="verbose_json",
+                        language=language,
+                        temperature=0.0,
+                    )
 
             # Processa os segmentos de tempo
             segments = []
@@ -138,12 +149,31 @@ def transcribe_audio_groq(
                         "text": getattr(seg, "text", "").strip()
                     })
 
+            # Processa timestamps palavra-por-palavra (para legendas Karaoke .ass e Jump Cuts)
+            words = []
+            raw_words = getattr(transcription, "words", []) or []
+            for w_item in raw_words:
+                if isinstance(w_item, dict):
+                    w_txt = str(w_item.get("word", w_item.get("text", ""))).strip()
+                    w_start = float(w_item.get("start", 0.0))
+                    w_end = float(w_item.get("end", w_start))
+                else:
+                    w_txt = str(getattr(w_item, "word", getattr(w_item, "text", ""))).strip()
+                    w_start = float(getattr(w_item, "start", 0.0))
+                    w_end = float(getattr(w_item, "end", w_start))
+                if w_txt:
+                    words.append({"word": w_txt, "start": w_start, "end": max(w_start, w_end)})
+
             full_text = getattr(transcription, "text", "") or ""
-            logger.info("Transcrição concluída com sucesso. Total de segmentos: %d", len(segments))
+            logger.info(
+                "Transcrição concluída com sucesso. Segmentos: %d | Palavras: %d",
+                len(segments), len(words),
+            )
 
             return {
                 "text": full_text,
-                "segments": segments
+                "segments": segments,
+                "words": words,
             }
 
         except Exception as exc:
@@ -434,3 +464,128 @@ def detect_viral_moments(
                 raise RuntimeError(
                     f"Falha na análise de IA — Groq: {exc} | Gemini fallback: {fallback_exc}"
                 ) from fallback_exc
+
+
+def _parse_seo_kit_json(raw_text: str, fallback_title: str, fallback_excerpt: str) -> Dict[str, Any]:
+    """Sanitiza resposta JSON do kit de publicação SEO garantindo 3 títulos A/B, descrição e hashtags."""
+    cleaned = (raw_text or "").strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if m:
+            cleaned = m.group(1).strip()
+
+    data: Dict[str, Any] = {}
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        first_b = cleaned.find("{")
+        last_b = cleaned.rfind("}")
+        if first_b != -1 and last_b > first_b:
+            try:
+                parsed = json.loads(cleaned[first_b:last_b + 1])
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                data = {}
+
+    raw_titles = data.get("titles") or data.get("titulos") or []
+    titles = [str(t).strip()[:110] for t in raw_titles if str(t).strip()][:3]
+    if not titles:
+        base = (fallback_title or "Corte Viral").strip()[:80]
+        titles = [
+            base,
+            f"Você precisa ouvir isso: {base[:75]}",
+            f"O momento exato que mudou tudo — {base[:65]}",
+        ]
+    while len(titles) < 3:
+        titles.append(f"{titles[0]} (Parte {len(titles) + 1})")
+
+    desc = str(data.get("description") or data.get("descricao") or "").strip()
+    if not desc:
+        snippet = (fallback_excerpt or fallback_title or "").strip()[:220]
+        desc = f"{snippet}\n\nSalve para rever depois e comente sua opinião!"
+
+    raw_tags = data.get("hashtags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = [tok.strip() for tok in raw_tags.replace(",", " ").split() if tok.strip()]
+    hashtags: List[str] = []
+    for tag in raw_tags:
+        clean_tag = re.sub(r"[^a-zA-Z0-9_À-ÿ]", "", str(tag).lstrip("#"))
+        if clean_tag and f"#{clean_tag}" not in hashtags:
+            hashtags.append(f"#{clean_tag}")
+    if not hashtags:
+        hashtags = ["#shorts", "#reels", "#tiktok", "#cortes", "#viral"]
+
+    return {
+        "titles": titles[:3],
+        "description": desc[:2000],
+        "hashtags": hashtags[:12],
+        "hook": str(data.get("hook") or titles[0])[:120],
+    }
+
+
+def generate_seo_publish_kit(
+    cut_title: str,
+    transcript_excerpt: str,
+    justification: str = "",
+    provider: str = "gemini",
+) -> Dict[str, Any]:
+    """
+    Gera Kit de Publicação Viral via IA (3 títulos A/B, descrição otimizada, hook e hashtags)
+    com fallback automático Gemini ↔ Groq e fallback determinístico offline se chaves não existirem.
+    """
+    prompt = (
+        "Você é um estrategista de crescimento para YouTube Shorts, Instagram Reels e TikTok.\n"
+        "Com base no título do corte e no trecho transcrito abaixo, retorne EXCLUSIVAMENTE um JSON válido com as chaves:\n"
+        '{"titles": ["Título A", "Título B", "Título C"], "hook": "Frase curta de gancho (até 60 chars)", '
+        '"description": "Legenda pronta para publicação com CTA", "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"]}\n\n'
+        f"Título atual: {cut_title}\n"
+        f"Justificativa editorial: {justification}\n"
+        f"Transcrição do corte:\n{transcript_excerpt[:2500]}"
+    )
+
+    def _call_gemini() -> str:
+        client = get_gemini_client()
+        for model_name in GEMINI_MODELS:
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.5),
+                )
+                return resp.text or ""
+            except Exception as exc:
+                logger.warning("SEO Kit Gemini %s falhou: %s", model_name, exc)
+        raise RuntimeError("Nenhum modelo Gemini respondeu para SEO Kit.")
+
+    def _call_groq() -> str:
+        client = get_groq_client()
+        for model_name in GROQ_MODELS:
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.5,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as exc:
+                logger.warning("SEO Kit Groq %s falhou: %s", model_name, exc)
+        raise RuntimeError("Nenhum modelo Groq respondeu para SEO Kit.")
+
+    order = [_call_gemini, _call_groq] if provider.lower() == "gemini" else [_call_groq, _call_gemini]
+    for fn in order:
+        try:
+            raw = fn()
+            if raw.strip():
+                kit = _parse_seo_kit_json(raw, cut_title, transcript_excerpt)
+                kit["source"] = "ai"
+                return kit
+        except Exception as exc:
+            logger.warning("Fallback SEO Kit acionado: %s", exc)
+
+    kit = _parse_seo_kit_json("", cut_title, transcript_excerpt)
+    kit["source"] = "template_fallback"
+    return kit
