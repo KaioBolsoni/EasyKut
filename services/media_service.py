@@ -19,7 +19,8 @@ from core.config import CACHE_DIR
 from core.downloader import download_audio_with_metadata, download_video, is_valid_video_url
 from core.logging_config import request_id_var
 from core.media_utils import normalize_virality_score
-from core.video_engine import cut_video, extract_preview_frame, get_video_metadata
+from core.video_engine import JobCancelledError, cut_video, extract_preview_frame, get_video_metadata
+from database import platform_repo
 from database.db_manager import (
     add_corte,
     add_video,
@@ -179,13 +180,13 @@ def _format_suggested_cuts(
     return formatted
 
 
-def _load_transcript_segments(
+def _load_transcript_payload(
     video_id: int,
     *,
     cache_dir: Path,
     temp_dir: Path,
     manager: JobManager,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     transcript_cache_path = cache_dir / f"transcript_{video_id}.json"
     if not transcript_cache_path.exists():
         transcript_cache_path = temp_dir / f"transcript_{video_id}.json"
@@ -193,14 +194,26 @@ def _load_transcript_segments(
         try:
             with open(transcript_cache_path, "r", encoding="utf-8") as f_tr:
                 tr_data = json.load(f_tr)
-                return tr_data.get("segments", []) or []
+                return tr_data.get("segments", []) or [], tr_data.get("words", []) or []
         except Exception as exc_tr:
             logger.warning("Erro ao ler transcrição em cache do vídeo %d: %s", video_id, exc_tr)
 
     cached_entry = manager.get_analysis_cache(video_id)
     if cached_entry:
-        return cached_entry.get("transcript_data", {}).get("segments", []) or []
-    return []
+        td = cached_entry.get("transcript_data", {}) or {}
+        return td.get("segments", []) or [], td.get("words", []) or []
+    return [], []
+
+
+def _load_transcript_segments(
+    video_id: int,
+    *,
+    cache_dir: Path,
+    temp_dir: Path,
+    manager: JobManager,
+) -> List[Dict[str, Any]]:
+    segs, _ = _load_transcript_payload(video_id, cache_dir=cache_dir, temp_dir=temp_dir, manager=manager)
+    return segs
 
 
 def _extract_audio_from_local_video(video_path: str, temp_dir: Path) -> str:
@@ -504,7 +517,7 @@ def load_video_workspace(
 
     target_cache_dir = cache_dir or CACHE_DIR
     target_temp_dir = temp_dir or media_utils.TEMP_DIR
-    all_segments = _load_transcript_segments(
+    all_segments, all_words = _load_transcript_payload(
         video_id,
         cache_dir=target_cache_dir,
         temp_dir=target_temp_dir,
@@ -546,6 +559,7 @@ def load_video_workspace(
             "burn_subtitles": bool(c.get("burn_subtitles", True)),
             "status": str(c.get("status") or "pending"),
             "video_url": video_url,
+            "seo_kit": c.get("seo_kit"),
             "segments": cut_segs,
         })
 
@@ -562,7 +576,7 @@ def load_video_workspace(
             "file_path": video.get("file_path", ""),
             "audio_path": video.get("audio_path", ""),
             "direct_stream_url": cached_entry.get("direct_stream_url"),
-            "transcript_data": {"segments": all_segments},
+            "transcript_data": {"segments": all_segments, "words": all_words},
             "cortes": cortes_out,
         },
     )
@@ -577,17 +591,28 @@ def load_video_workspace(
         "is_local": str(video.get("url", "")).startswith("local://"),
         "cortes": cortes_out,
         "transcript_segments": all_segments,
+        "transcript_words": all_words,
     }
 
 
 def _render_single_cut(
     *,
+    job_id: str,
     video_id: int,
     video_file: str,
     cut_item: Any,
     idx: int,
     segments: List[Dict[str, Any]],
+    words: List[Dict[str, Any]],
     cut_video_fn: Callable[..., str],
+    manager: JobManager,
+    brand_kit: Optional[Dict[str, Any]] = None,
+    use_gpu: bool = False,
+    normalize_audio: bool = False,
+    denoise_audio: bool = False,
+    music_path: Optional[str] = None,
+    music_volume: float = 0.18,
+    export_formats: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     cut_title = cut_item.get_effective_title(fallback=f"Corte_{idx + 1}")
     corte_db_id = cut_item.id
@@ -614,17 +639,60 @@ def _render_single_cut(
             status="rendering",
         )
 
-    output_clip = cut_video_fn(
-        input_path=video_file,
-        start_time=cut_item.start_time,
-        end_time=cut_item.end_time,
-        layout_mode=cut_item.layout_mode,
-        layout_params=cut_item.layout_params or {},
-        segments=segments if cut_item.burn_subtitles else None,
-        burn_subtitles=bool(cut_item.burn_subtitles),
-    )
+    lp = dict(cut_item.layout_params or {})
+    inline_overrides = getattr(cut_item, "subtitle_overrides", None) or lp.get("subtitle_overrides")
+    eff_segments = inline_overrides if inline_overrides else segments
+    prefer_segs = bool(inline_overrides)
 
+    common_kwargs: Dict[str, Any] = {
+        "input_path": video_file,
+        "start_time": cut_item.start_time,
+        "end_time": cut_item.end_time,
+        "layout_mode": cut_item.layout_mode,
+        "layout_params": lp,
+        "segments": eff_segments if cut_item.burn_subtitles else None,
+        "words": words if (cut_item.burn_subtitles and not prefer_segs) else None,
+        "burn_subtitles": bool(cut_item.burn_subtitles),
+        "subtitle_preset": getattr(cut_item, "subtitle_preset", "hormozi"),
+        "karaoke_subtitles": bool(getattr(cut_item, "karaoke_subtitles", True)),
+        "prefer_segment_subtitles": prefer_segs,
+        "dynamic_face_tracking": bool(getattr(cut_item, "dynamic_face_tracking", True)),
+        "remove_silences": bool(getattr(cut_item, "remove_silences", False)),
+        "min_silence_sec": float(getattr(cut_item, "min_silence_sec", 0.6)),
+        "brand_kit": brand_kit,
+        "hook_title": cut_title,
+        "punch_in_zoom": bool(getattr(cut_item, "punch_in_zoom", False)),
+        "use_gpu": use_gpu,
+        "normalize_audio": normalize_audio,
+        "denoise_audio": denoise_audio,
+        "music_path": music_path,
+        "music_volume": music_volume,
+        "job_id": job_id,
+        "cancel_check": lambda: manager.is_cancelled(job_id),
+        "register_proc": lambda p: manager.register_process(job_id, p),
+        "unregister_proc": lambda p: manager.unregister_process(job_id, p),
+    }
+
+    output_clip = cut_video_fn(**common_kwargs)
     update_corte_status(corte_db_id, status="completed", output_path=output_clip)
+
+    # Multi-Export (Onda 3): renderiza formatos adicionais (1:1, 16:9, 9:16) se solicitados
+    extra_exports: List[Dict[str, str]] = []
+    fmt_map = {"9:16": "vertical_blur", "1:1": "square_1_1", "16:9": "horizontal_16_9"}
+    for fmt in export_formats or []:
+        target_mode = fmt_map.get(fmt)
+        if not target_mode or target_mode == cut_item.layout_mode:
+            continue
+        if manager.is_cancelled(job_id):
+            raise JobCancelledError(f"Job '{job_id}' cancelado durante multi-export.")
+        suffix = fmt.replace(":", "x")
+        extra_dest = str(Path(output_clip).with_name(f"{Path(output_clip).stem}_{suffix}.mp4"))
+        extra_kwargs = dict(common_kwargs)
+        extra_kwargs["layout_mode"] = target_mode
+        extra_kwargs["output_path"] = extra_dest
+        extra_out = cut_video_fn(**extra_kwargs)
+        extra_exports.append({"format": fmt, "video_url": f"/data/cortes/{Path(extra_out).name}"})
+
     return {
         "id": corte_db_id,
         "title": cut_title,
@@ -633,6 +701,7 @@ def _render_single_cut(
         "video_url": f"/data/cortes/{Path(output_clip).name}",
         "start_time": cut_item.start_time,
         "end_time": cut_item.end_time,
+        "extra_exports": extra_exports,
     }
 
 
@@ -647,8 +716,15 @@ def run_render_job(
     temp_dir: Optional[Path] = None,
     download_video_fn: Callable[..., str] = download_video,
     cut_video_fn: Callable[..., str] = cut_video,
+    use_gpu: bool = False,
+    brand_kit_id: Optional[int] = None,
+    normalize_audio: bool = False,
+    denoise_audio: bool = False,
+    music_path: Optional[str] = None,
+    music_volume: float = 0.18,
+    export_formats: Optional[List[str]] = None,
 ) -> None:
-    """Executa a esteira assíncrona de download (se remoto) e renderização FFmpeg."""
+    """Executa a esteira assíncrona de download (se remoto) e renderização FFmpeg V4.0."""
     token = request_id_var.set(job_id)
     target_cache_dir = cache_dir or CACHE_DIR
     target_temp_dir = temp_dir or media_utils.TEMP_DIR
@@ -658,6 +734,8 @@ def run_render_job(
         if not video:
             raise ValueError(f"Vídeo ID {video_id} não encontrado no banco de dados.")
 
+        brand_kit = platform_repo.get_brand_kit(brand_kit_id) if brand_kit_id else None
+
         video_file = video.get("file_path", "")
         if not video_file or not os.path.exists(video_file):
             if str(video.get("url", "")).startswith("local://"):
@@ -666,7 +744,7 @@ def run_render_job(
             video_file = download_video_fn(video["url"], max_resolution=max_resolution)
             update_video_status(video_id, status="cutting", file_path=video_file)
 
-        segments = _load_transcript_segments(
+        segments, words = _load_transcript_payload(
             video_id,
             cache_dir=target_cache_dir,
             temp_dir=target_temp_dir,
@@ -676,6 +754,8 @@ def run_render_job(
         rendered_results: List[Dict[str, Any]] = []
         total_cuts = len(cuts)
         for idx, c in enumerate(cuts):
+            if manager.is_cancelled(job_id):
+                raise JobCancelledError(f"Job '{job_id}' cancelado pelo usuário.")
             cut_title = c.get_effective_title(fallback=f"Corte_{idx + 1}")
             pct = 25 + int((idx / max(1, total_cuts)) * 70)
             manager.update_job(
@@ -685,12 +765,22 @@ def run_render_job(
             )
             rendered_results.append(
                 _render_single_cut(
+                    job_id=job_id,
                     video_id=video_id,
                     video_file=video_file,
                     cut_item=c,
                     idx=idx,
                     segments=segments,
+                    words=words,
                     cut_video_fn=cut_video_fn,
+                    manager=manager,
+                    brand_kit=brand_kit,
+                    use_gpu=use_gpu,
+                    normalize_audio=normalize_audio,
+                    denoise_audio=denoise_audio,
+                    music_path=music_path,
+                    music_volume=music_volume,
+                    export_formats=export_formats,
                 )
             )
 
@@ -702,6 +792,9 @@ def run_render_job(
             progress=100,
             result={"video_id": video_id, "rendered_cuts": rendered_results},
         )
+    except JobCancelledError as cancel_exc:
+        logger.info("Renderização cancelada (job %s): %s", job_id, cancel_exc)
+        manager.update_job(job_id, status="cancelled", step="Renderização cancelada pelo usuário.", error=str(cancel_exc))
     except Exception as exc:
         logger.exception("Erro crítico na esteira de renderização (job %s): %s", job_id, exc)
         if isinstance(video_id, int) and video_id > 0:
