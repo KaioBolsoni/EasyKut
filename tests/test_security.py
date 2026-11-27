@@ -208,7 +208,7 @@ def test_removed_orphan_frame_preview_and_private_transcript_cache(client):
 def test_frontend_es_modules_xss_regression_guard_and_blur_optimization():
     web_dir = Path(__file__).resolve().parent.parent / "web"
     js_files = [web_dir / "app.js", *sorted((web_dir / "js").glob("*.js"))]
-    assert len(js_files) >= 9, f"Esperado ao menos 9 módulos ES no frontend, encontrado {len(js_files)}"
+    assert len(js_files) >= 11, f"Esperado ao menos 11 módulos ES no frontend V4, encontrado {len(js_files)}"
 
     forbidden_interpolations = ("title", "justification", "video_url", "v.url", "s.text", "cut.", "error", "step")
     for js_file in js_files:

@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator
 from fastapi.testclient import TestClient
 import pytest
 
-from core import media_utils, video_engine
+from core import config, media_utils, video_engine
 from database import db_manager
 import server
 from services.job_manager import job_manager
@@ -19,21 +19,28 @@ from services.job_manager import job_manager
 @pytest.fixture()
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Dict[str, Path]]:
     """
-    Cria um diretório de dados temporário isolado (SQLite + temp + cortes + downloads + cache + logs)
-    e redireciona todas as referências globais de db_manager, core e server.
+    Cria um diretório de dados temporário isolado (SQLite + temp + cortes + downloads + cache + brands + music + broll + logs)
+    e redireciona todas as referências globais de config, db_manager, core e server.
     """
     data_dir = (tmp_path / "data").resolve()
     temp_dir = data_dir / "temp"
     cuts_dir = data_dir / "cortes"
     downloads_dir = data_dir / "downloads"
     cache_dir = data_dir / "cache"
+    brands_dir = data_dir / "brands"
+    music_dir = data_dir / "music"
+    broll_dir = data_dir / "broll"
     logs_dir = data_dir / "logs"
     db_path = data_dir / "cortador.db"
 
-    for d in (data_dir, temp_dir, cuts_dir, downloads_dir, cache_dir, logs_dir):
+    for d in (data_dir, temp_dir, cuts_dir, downloads_dir, cache_dir, brands_dir, music_dir, broll_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # Redireciona camada de banco de dados
+    # Redireciona camada de configuração e banco de dados
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "BRANDS_DIR", brands_dir)
+    monkeypatch.setattr(config, "MUSIC_DIR", music_dir)
+    monkeypatch.setattr(config, "BROLL_DIR", broll_dir)
     monkeypatch.setattr(db_manager, "DATA_DIR", data_dir)
     monkeypatch.setattr(db_manager, "DEFAULT_DB_PATH", db_path)
 
@@ -51,6 +58,9 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Di
     monkeypatch.setattr(server, "CUTS_DIR", cuts_dir)
     monkeypatch.setattr(server, "DOWNLOADS_DIR", downloads_dir)
     monkeypatch.setattr(server, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(server, "BRANDS_DIR", brands_dir)
+    monkeypatch.setattr(server, "MUSIC_DIR", music_dir)
+    monkeypatch.setattr(server, "BROLL_DIR", broll_dir)
     monkeypatch.setattr(server, "preview_ffmpeg_semaphore", threading.Semaphore(2))
 
     job_manager.clear()
@@ -62,6 +72,9 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Di
         "cuts_dir": cuts_dir,
         "downloads_dir": downloads_dir,
         "cache_dir": cache_dir,
+        "brands_dir": brands_dir,
+        "music_dir": music_dir,
+        "broll_dir": broll_dir,
         "logs_dir": logs_dir,
         "db_path": db_path,
     }

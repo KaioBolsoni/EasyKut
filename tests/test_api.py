@@ -453,7 +453,7 @@ def test_analyze_and_render_return_202_accepted(client, sample_video_and_cut, mo
 
 
 def test_job_manager_ttl_and_lru_eviction():
-    jm = JobManager(job_ttl_seconds=10.0, max_jobs=3, cache_ttl_seconds=10.0, max_cache_entries=2)
+    jm = JobManager(job_ttl_seconds=10.0, max_jobs=3, cache_ttl_seconds=10.0, max_cache_entries=2, persist_to_db=False)
     now = 1000.0
 
     with jm.lock:

@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from database import db_manager
+from database import db_manager, platform_repo
 
 
 def test_init_db_sets_schema_version_wal_mode_and_indexes(isolated_env):
@@ -24,15 +24,23 @@ def test_init_db_sets_schema_version_wal_mode_and_indexes(isolated_env):
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index';").fetchall()
         }
 
-    assert user_version == db_manager.SCHEMA_VERSION == 3
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table';").fetchall()
+        }
+
+    assert user_version == db_manager.SCHEMA_VERSION == 4
     assert str(journal_mode).lower() == "wal"
     assert fk_enabled == 1
-    assert {"tipo", "layout_mode", "layout_params", "burn_subtitles", "updated_at"}.issubset(cols)
+    assert {"tipo", "layout_mode", "layout_params", "burn_subtitles", "updated_at", "seo_kit_json"}.issubset(cols)
+    assert {"brand_kits", "job_queue", "scheduled_posts"}.issubset(tables)
     assert {
         "idx_cortes_video_id",
         "idx_cortes_virality_score",
         "idx_videos_created_at",
         "idx_videos_url",
+        "idx_job_queue_status",
+        "idx_scheduled_posts_status",
     }.issubset(indexes)
 
 
@@ -82,7 +90,7 @@ def test_legacy_db_migration_v0_to_v2_preserves_rows_and_is_idempotent(tmp_path:
     db_manager.init_db(db_path=legacy_db)
 
     with db_manager.get_connection(legacy_db) as conn:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 4
         indexes = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index';").fetchall()
@@ -385,4 +393,54 @@ def test_list_videos_with_cortes_eliminates_n_plus_1_and_paginates(isolated_env,
     assert total_filtered == 1
     assert len(filtered) == 1
     assert filtered[0]["title"] == "Podcast Ep 3"
+
+
+def test_platform_repo_brand_kits_job_queue_and_scheduled_posts(sample_video_and_cut, isolated_env):
+    # 1. Brand Kits CRUD + upsert por nome
+    kit1 = platform_repo.upsert_brand_kit(name="Canal Principal", subtitle_preset="neon", progress_bar_color="#00FFAA")
+    assert kit1["id"] > 0
+    assert kit1["subtitle_preset"] == "neon"
+
+    kit1_upd = platform_repo.upsert_brand_kit(name="Canal Principal", subtitle_preset="boxed", hook_banner_enabled=True)
+    assert kit1_upd["id"] == kit1["id"]
+    assert kit1_upd["subtitle_preset"] == "boxed"
+    assert kit1_upd["hook_banner_enabled"] is True
+    assert len(platform_repo.list_brand_kits()) == 1
+    assert platform_repo.delete_brand_kit(kit1["id"]) is True
+    assert platform_repo.get_brand_kit(kit1["id"]) is None
+
+    # 2. Job queue persistence + recuperação de órfãos
+    platform_repo.save_job_snapshot({
+        "job_id": "job_orphan_1",
+        "type": "render",
+        "status": "running",
+        "step": "Renderizando...",
+        "progress": 50,
+        "result": None,
+        "error": None,
+        "created_at": 1000.0,
+        "updated_at": 1005.0,
+    })
+    recovered = platform_repo.mark_orphaned_jobs_interrupted()
+    assert recovered == 1
+    persisted = platform_repo.list_persisted_jobs()
+    assert persisted[0]["status"] == "interrupted"
+
+    # 3. Scheduled posts CRUD
+    corte_id = sample_video_and_cut["corte_id"]
+    post = platform_repo.create_scheduled_post(
+        corte_id=corte_id,
+        platform="youtube_shorts",
+        title="Hook Imperdível",
+        caption="Legenda pronta",
+        hashtags="#shorts #viral",
+        scheduled_at="2026-12-01T18:00",
+    )
+    assert post["id"] > 0
+    assert len(platform_repo.list_scheduled_posts(corte_id=corte_id)) == 1
+    updated = platform_repo.update_scheduled_post_status(post["id"], status="published", external_id="yt_123")
+    assert updated["status"] == "published"
+    assert updated["external_id"] == "yt_123"
+    assert platform_repo.delete_scheduled_post(post["id"]) is True
+
 

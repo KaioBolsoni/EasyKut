@@ -43,5 +43,10 @@ jobs:
         run: |
           for f in web/js/*.js web/app.js; do node --check "$f"; done
 
-      - name: Run isolated pytest suite
-        run: pytest
+      - name: Run isolated pytest suite (with coverage if installed)
+        run: |
+          if python -c "import pytest_cov" 2>/dev/null; then
+            pytest --cov=core --cov=database --cov=schemas --cov=services --cov=server --cov-report=term-missing
+          else
+            pytest
+          fi
