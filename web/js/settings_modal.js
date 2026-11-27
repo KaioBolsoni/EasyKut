@@ -46,13 +46,19 @@ export function updateConfigModalUI(data, health) {
   if (health) {
     setStatusTag('cfg-status-db', Boolean(health.db_ok), 'Online (WAL v4)', 'Degradado');
     const gpuEl = document.getElementById('cfg-status-gpu');
+    const gpuPillLabel = document.querySelector('label[for="toggle-use-gpu"] span, #toggle-use-gpu + span');
     if (gpuEl) {
       if (health.gpu_encoder) {
         gpuEl.className = 'status-tag-ok';
         gpuEl.textContent = `GPU (${health.gpu_encoder})`;
+        if (gpuPillLabel) {
+          const shortEnc = String(health.gpu_encoder).replace('h264_', '').toUpperCase();
+          gpuPillLabel.textContent = `🚀 GPU (${shortEnc})`;
+        }
       } else {
         gpuEl.className = 'status-tag-off';
         gpuEl.textContent = 'CPU (libx264)';
+        if (gpuPillLabel) gpuPillLabel.textContent = '🚀 GPU (CPU)';
       }
     }
     const diskEl = document.getElementById('cfg-status-disk');

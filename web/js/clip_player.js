@@ -4,7 +4,7 @@
 
 import { apiExtractPreviewClip } from './api.js';
 import { initCutGeometry } from './canvas_engine.js';
-import { canvasState, getActiveCut, getCutSegments, state } from './state.js';
+import { canvasState, getActiveCut, getCutSegments, getCutWords, state } from './state.js';
 import { formatSecondsMMSS, showToast } from './utils.js';
 
 let _renderAllCanvases = () => {};
@@ -57,10 +57,36 @@ export function stopVideoCanvasLoop() {
   }
 }
 
+function maybeSkipSilenceInPreview() {
+  if (!state.removeSilences || !canvasState.videoEl || !canvasState.isVideoReady) return;
+  const cut = getActiveCut();
+  if (!cut) return;
+  const words = getCutWords(cut);
+  if (words.length < 2) return;
+
+  const vid = canvasState.videoEl;
+  const absSec = cut.start_time + (vid.currentTime || 0);
+  const minGap = 0.6;
+  const pad = 0.08;
+
+  for (let i = 0; i < words.length - 1; i++) {
+    const gapStart = words[i].end + pad;
+    const gapEnd = words[i + 1].start - pad;
+    if ((gapEnd - gapStart) >= minGap && absSec >= gapStart && absSec < gapEnd) {
+      const targetRel = Math.max(0, gapEnd - cut.start_time);
+      if (targetRel < (vid.duration || cut.duration)) {
+        vid.currentTime = targetRel;
+      }
+      break;
+    }
+  }
+}
+
 export function startVideoCanvasLoop() {
   stopVideoCanvasLoop();
   const loop = () => {
     if (!canvasState.isVideoPlaying) return;
+    maybeSkipSilenceInPreview();
     _renderAllCanvases();
     updateClipPlayerTimelineUI();
     canvasState.animFrameId = requestAnimationFrame(loop);

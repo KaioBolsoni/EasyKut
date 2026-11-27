@@ -44,10 +44,17 @@ export function initStudioView({ switchTab }) {
 
 export function renderAllCanvases() {
   const cut = getActiveCut();
+  const activeBrandKit = state.brandKitId
+    ? state.brandKits.find((k) => Number(k.id) === Number(state.brandKitId)) || null
+    : null;
   renderEditorCanvas(canvasState, cut);
   renderMockupCanvas(canvasState, cut, getCutSegments, {
     getCutWordsFn: getCutWords,
     subtitlePreset: cut?.layout_params?.subtitle_preset || state.subtitlePreset || 'hormozi',
+    brandKit: activeBrandKit,
+    punchInZoom: Boolean(state.punchInZoom),
+    removeSilences: Boolean(state.removeSilences),
+    onLogoLoad: () => renderAllCanvases(),
   });
 }
 

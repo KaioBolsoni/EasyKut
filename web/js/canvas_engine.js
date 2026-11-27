@@ -370,6 +370,83 @@ export const KARAOKE_PREVIEW_PRESETS = {
   },
 };
 
+const _brandLogoCache = new Map();
+
+function getCachedBrandLogo(logoUrl, onLoadCb) {
+  if (!logoUrl || !logoUrl.startsWith('/data/brands/')) return null;
+  let entry = _brandLogoCache.get(logoUrl);
+  if (!entry) {
+    const img = new Image();
+    entry = { img, loaded: false };
+    img.onload = () => {
+      entry.loaded = true;
+      if (typeof onLoadCb === 'function') onLoadCb();
+    };
+    img.src = logoUrl;
+    _brandLogoCache.set(logoUrl, entry);
+  }
+  return entry.loaded ? entry.img : null;
+}
+
+function drawMockupBrandOverlay(ctx, mW, mH, cut, canvasState, brandKit, onLogoLoad) {
+  if (!brandKit) return;
+  const elapsed = (canvasState.isVideoReady && canvasState.videoEl) ? (canvasState.videoEl.currentTime || 0) : 0;
+  const duration = Math.max(0.5, Number(cut.duration) || (Number(cut.end_time) - Number(cut.start_time)) || 10);
+
+  // 1. Logo Watermark PNG
+  const logoImg = getCachedBrandLogo(brandKit.logo_url, onLogoLoad);
+  if (logoImg && logoImg.naturalWidth > 0) {
+    const scale = Math.max(0.05, Math.min(0.4, Number(brandKit.logo_scale) || 0.14));
+    const opacity = Math.max(0.05, Math.min(1.0, Number(brandKit.logo_opacity) || 0.85));
+    const lw = Math.round(mW * scale);
+    const lh = Math.round(lw * (logoImg.naturalHeight / logoImg.naturalWidth));
+    const margin = Math.round(mW * 0.03);
+    const pos = brandKit.logo_position || 'top_right';
+    let lx = mW - lw - margin;
+    let ly = margin;
+    if (pos === 'top_left') { lx = margin; ly = margin; }
+    else if (pos === 'bottom_left') { lx = margin; ly = mH - lh - margin - 24; }
+    else if (pos === 'bottom_right') { lx = mW - lw - margin; ly = mH - lh - margin - 24; }
+    ctx.save();
+    ctx.globalAlpha = opacity;
+    ctx.drawImage(logoImg, lx, ly, lw, lh);
+    ctx.restore();
+  }
+
+  // 2. Barra de progresso animada na borda inferior
+  if (brandKit.progress_bar_enabled) {
+    const barH = Math.max(12, Math.round(mH * 0.007));
+    const ratio = (canvasState.isVideoReady && canvasState.videoEl)
+      ? Math.max(0.02, Math.min(1, elapsed / duration))
+      : 0.45; // Preview imediato quando pausado
+    ctx.save();
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+    ctx.fillRect(0, mH - barH, mW, barH);
+    ctx.fillStyle = brandKit.progress_bar_color || '#6366F1';
+    ctx.fillRect(0, mH - barH, Math.round(mW * ratio), barH);
+    ctx.restore();
+  }
+
+  // 3. Hook Banner (primeiros N segundos ou preview estático em t=0)
+  const hookDur = Math.max(0.5, Number(brandKit.hook_banner_duration) || 3.0);
+  const showHook = brandKit.hook_banner_enabled && cut.title && (!canvasState.isVideoReady || elapsed <= hookDur);
+  if (showHook) {
+    const bannerH = Math.round(mH * 0.055);
+    const bannerY = Math.round(mH * 0.06);
+    ctx.save();
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.84)';
+    ctx.beginPath();
+    ctx.roundRect(40, bannerY, mW - 80, bannerH, 16);
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 34px Inter, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(cut.title).slice(0, 48), mW / 2, bannerY + bannerH / 2);
+    ctx.restore();
+  }
+}
+
 export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn, options = {}) {
   const ctx = canvasState.mockupCtx;
   if (!ctx) return;
@@ -401,6 +478,18 @@ export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn, options =
   const scaleX = srcW / W;
   const scaleY = srcH / H;
   const mode = cut.layout_mode;
+
+  // Punch-in Zoom preview ao vivo (1.09x a cada ciclo de 6s a partir de 2.5s, ou 1.06x estático ao ativar)
+  const curRelSec = (canvasState.isVideoReady && canvasState.videoEl) ? (canvasState.videoEl.currentTime || 0) : -1;
+  const punchActive = Boolean(options.punchInZoom) && (curRelSec < 0 || (curRelSec % 6) > 2.5);
+  const punchScale = punchActive ? (curRelSec < 0 ? 1.06 : 1.09) : 1.0;
+
+  ctx.save();
+  if (punchScale > 1.0) {
+    ctx.translate(mW / 2, mH / 2);
+    ctx.scale(punchScale, punchScale);
+    ctx.translate(-mW / 2, -mH / 2);
+  }
 
   if (mode === 'manual_crop') {
     const { crop_x: x, crop_y: y, crop_w: w, crop_h: h } = cut.layout_params;
@@ -442,9 +531,24 @@ export function renderMockupCanvas(canvasState, cut, getCutSegmentsFn, options =
     const h = srcH * scale;
     ctx.drawImage(srcEl, 0, (mH - h) / 2, mW, h);
   }
+  ctx.restore();
 
   if (cut.burn_subtitles) {
     drawMockupSubtitles(ctx, mW, mH, cut, canvasState, getCutSegmentsFn, options);
+  }
+
+  if (options.brandKit) {
+    drawMockupBrandOverlay(ctx, mW, mH, cut, canvasState, options.brandKit, options.onLogoLoad);
+  }
+
+  // Badges compactos de efeitos Pro ativos no mockup
+  let badgeY = 38;
+  if (options.punchInZoom) {
+    drawBadge(ctx, punchActive ? '🔍 PUNCH ZOOM 1.09×' : '🔍 PUNCH ZOOM ATIVO', 24, badgeY, '#6366F1');
+    badgeY += 40;
+  }
+  if (options.removeSilences) {
+    drawBadge(ctx, '⚡ JUMP CUTS ATIVO', 24, badgeY, '#F59E0B');
   }
 }
 

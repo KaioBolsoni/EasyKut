@@ -109,15 +109,26 @@ function bindProControls() {
   });
   document.getElementById('toggle-jump-cuts')?.addEventListener('change', (e) => {
     state.removeSilences = e.target.checked;
+    renderAllCanvases();
+    showToast(e.target.checked ? '⚡ Jump Cuts ativado (pula pausas longas na prévia e no render)' : 'Jump Cuts desativado');
   });
   document.getElementById('toggle-punch-zoom')?.addEventListener('change', (e) => {
     state.punchInZoom = e.target.checked;
+    renderAllCanvases();
+    showToast(e.target.checked ? '🔍 Punch Zoom ativado (1.09× a cada 3s na prévia e no render)' : 'Punch Zoom desativado');
   });
   document.getElementById('toggle-loudnorm')?.addEventListener('change', (e) => {
     state.normalizeAudio = e.target.checked;
+    showToast(e.target.checked ? '🎚️ Masterização -14 LUFS ativada para renderização' : 'Normalização -14 LUFS desativada');
   });
   document.getElementById('toggle-use-gpu')?.addEventListener('change', (e) => {
     state.useGpu = e.target.checked;
+    const gpuName = state.health?.gpu_encoder;
+    if (e.target.checked) {
+      showToast(gpuName ? `🚀 Aceleração GPU ativada (${gpuName})` : 'GPU indisponível — fallback automático para CPU libx264');
+    } else {
+      showToast('Encoder CPU (libx264) selecionado');
+    }
   });
   document.getElementById('select-brand-kit')?.addEventListener('change', (e) => {
     state.brandKitId = e.target.value ? Number(e.target.value) : null;
@@ -132,8 +143,9 @@ function bindProControls() {
         c.layout_params.subtitle_preset = chosenKit.subtitle_preset;
         schedulePersistCutEdits(c);
       }
-      renderAllCanvases();
     }
+    renderAllCanvases();
+    if (chosenKit) showToast(`🎨 Brand Kit "${chosenKit.name}" aplicado na prévia e no render!`);
   });
   document.getElementById('select-bgm-track')?.addEventListener('change', (e) => {
     state.musicFilename = e.target.value || '';

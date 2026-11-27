@@ -1363,13 +1363,20 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  padding: 0.2rem 0.5rem;
+  padding: 0.2rem 0.55rem;
   border-radius: 999px;
   border: 1px solid var(--border-subtle);
   background: var(--bg-elevated);
   cursor: pointer;
   font-size: 0.73rem;
   user-select: none;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.pro-pill-toggle:has(input:checked) {
+  border-color: var(--primary);
+  background: rgba(99, 102, 241, 0.2);
+  color: var(--text-main);
 }
 
 .pro-select-xs {
