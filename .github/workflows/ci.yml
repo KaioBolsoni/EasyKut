@@ -31,20 +31,17 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Lint with Ruff
-        run: ruff check core database services server.py tests
+        run: ruff check core database schemas services server.py tests
 
       - name: SAST security scan with Bandit
-        run: bandit -c pyproject.toml -r core database services server.py -ll
+        run: bandit -c pyproject.toml -r core database schemas services server.py -ll
 
       - name: Dependency vulnerability audit (pip-audit)
         run: pip-audit -r requirements.txt
 
       - name: Frontend JS ES Module syntax check
         run: |
-          node --check web/js/utils.js
-          node --check web/js/api.js
-          node --check web/js/canvas_engine.js
-          node --check web/app.js
+          for f in web/js/*.js web/app.js; do node --check "$f"; done
 
       - name: Run isolated pytest suite
         run: pytest
