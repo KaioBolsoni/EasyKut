@@ -349,6 +349,7 @@ def _finalize_analysis_pipeline(
             "is_local": str(url).startswith("local://"),
             "cortes": cortes_formatados,
             "transcript_segments": all_segments,
+            "transcript_words": transcript_data.get("words", []) or [],
         },
     )
 

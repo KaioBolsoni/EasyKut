@@ -108,9 +108,15 @@ def build_brand_overlay_filters(
         banner_h = max(72, int(round(target_height * 0.055)))
         banner_y = max(48, int(round(target_height * 0.06)))
         font_sz = max(24, int(round(target_width * 0.034)))
+        font_arg = ""
+        for font_cand in (Path("C:/Windows/Fonts/arialbd.ttf"), Path("C:/Windows/Fonts/arial.ttf")):
+            if font_cand.exists():
+                escaped_font = str(font_cand).replace("\\", "/").replace(":", "\\:")
+                font_arg = f"fontfile='{escaped_font}':"
+                break
         filters.append(
             f"{cur_label}drawbox=x=40:y={banner_y}:w=iw-80:h={banner_h}:color=0x0F172A@0.82:t=fill:enable='between(t,0,{hook_dur:.2f})',"
-            f"drawtext=text='{safe_hook}':fontcolor=white:fontsize={font_sz}:"
+            f"drawtext={font_arg}text='{safe_hook}':fontcolor=white:fontsize={font_sz}:"
             f"x=(w-text_w)/2:y={banner_y}+({banner_h}-text_h)/2:enable='between(t,0,{hook_dur:.2f})'[v_hook]"
         )
         cur_label = "[v_hook]"

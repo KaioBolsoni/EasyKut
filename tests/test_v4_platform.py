@@ -58,14 +58,40 @@ def test_ass_karaoke_generation_all_presets_and_inline_overrides(isolated_env):
             temp_dir=isolated_env["temp_dir"],
         )
         assert ass_path is not None
-        content = Path(ass_path).read_text(encoding="utf-8")
+        content = Path(ass_path).read_text(encoding="utf-8-sig")
         assert "[Script Info]" in content
         assert "[V4+ Styles]" in content
         assert "Dialogue: 0," in content
-        assert "\\fscx112\\fscy112" in content
+        # Valida sintaxe ASS inline correta (\1c&HBBGGRR& com & de fechamento)
+        assert "\\1c&H" in content
+        assert "&\\fscx114\\fscy114" in content
 
         flt = subtitles.format_ffmpeg_ass_filter(ass_path)
         assert flt.startswith("ass='")
+
+    # Garante que palavras fora de ordem / sobrepostas do Whisper nunca geram eventos ASS sobrepostos
+    messy_words = [
+        {"word": "um", "start": 10.0, "end": 10.8},
+        {"word": "dois", "start": 10.9, "end": 11.4},
+        {"word": "tres", "start": 10.5, "end": 11.9},  # timestamp fora de ordem (10.5 < 10.9)
+    ]
+    ass_mono = subtitles.generate_ass_karaoke_for_segment(
+        segments=None,
+        words=messy_words,
+        start_time=10.0,
+        end_time=13.0,
+        preset="neon",
+        temp_dir=isolated_env["temp_dir"],
+    )
+    dialogue_lines = [ln for ln in Path(ass_mono).read_text(encoding="utf-8-sig").splitlines() if ln.startswith("Dialogue:")]
+    assert len(dialogue_lines) == 3
+    prev_end_ts = ""
+    for dl in dialogue_lines:
+        parts = dl.split(",")
+        start_ts, end_ts = parts[1], parts[2]
+        assert start_ts >= prev_end_ts
+        assert end_ts > start_ts
+        prev_end_ts = end_ts
 
     # Override inline de texto (prefer_segments=True ignora word-level antigo e usa texto corrigido)
     edited_segs = [{"start": 10.0, "end": 14.0, "text": "Texto Corrigido Manualmente"}]
@@ -207,7 +233,8 @@ def test_brand_overlay_filters_and_logo_confinement(isolated_env, tmp_path: Path
     joined = ";".join(filters)
     assert "colorchannelmixer=aa=0.80" in joined
     assert "0xFF5500@0.95" in joined
-    assert "drawtext=text='Gancho - Incrível (2026)'" in joined
+    assert "drawtext=" in joined
+    assert "text='Gancho - Incrível (2026)'" in joined
 
 
 # ==========================================

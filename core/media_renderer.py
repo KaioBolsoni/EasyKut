@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import subprocess  # nosec B404
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,41 +53,41 @@ def run_cancellable_ffmpeg(
 ) -> Tuple[int, str]:
     """
     Executa FFmpeg via subprocess.Popen com suporte a cancelamento cooperativo em tempo real,
-    timeout explícito e encerramento seguro do processo filho.
+    sem deadlock de buffer de pipe no Windows (redireciona stderr para arquivo temporário seguro).
     """
     if cancel_check and cancel_check():
         raise JobCancelledError(f"Job '{job_id}' cancelado antes de iniciar FFmpeg.")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )  # nosec B603
-    if register_proc:
-        register_proc(proc)
+    with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )  # nosec B603
+        if register_proc:
+            register_proc(proc)
 
-    deadline = time.monotonic() + float(timeout)
-    try:
-        while proc.poll() is None:
-            if cancel_check and cancel_check():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
+        deadline = time.monotonic() + float(timeout)
+        try:
+            while proc.poll() is None:
+                if cancel_check and cancel_check():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise JobCancelledError(f"Job '{job_id}' cancelado pelo usuário.")
+                if time.monotonic() > deadline:
                     proc.kill()
-                raise JobCancelledError(f"Job '{job_id}' cancelado pelo usuário.")
-            if time.monotonic() > deadline:
-                proc.kill()
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
-            time.sleep(0.15)
-        _, stderr = proc.communicate(timeout=5)
-        return int(proc.returncode or 0), stderr or ""
-    finally:
-        if unregister_proc:
-            unregister_proc(proc)
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+                time.sleep(0.15)
+            proc.wait(timeout=5)
+            stderr_file.seek(0)
+            stderr_text = stderr_file.read().decode("utf-8", errors="replace")
+            return int(proc.returncode or 0), stderr_text
+        finally:
+            if unregister_proc:
+                unregister_proc(proc)
 
 
 def get_video_metadata(video_path: str) -> Dict[str, Any]:
@@ -715,7 +716,7 @@ def cut_video(
             sub_words = remap_timestamps_for_intervals(words or [], intervals, base_start=start_time)
             sub_start, sub_end = 0.0, effective_duration
 
-    effective_preset = (brand_kit or {}).get("subtitle_preset") or subtitle_preset
+    effective_preset = subtitle_preset or (brand_kit or {}).get("subtitle_preset") or "hormozi"
     sub_filter = _build_subtitle_filter_for_cut(
         burn_subtitles=burn_subtitles,
         segments=sub_segments,

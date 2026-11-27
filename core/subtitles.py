@@ -140,6 +140,18 @@ def escape_libavfilter_path(file_path: str) -> str:
     )
 
 
+def _ass_inline_color(style_color: str) -> str:
+    """Converte cor de estilo ASS (&HAABBGGRR) em cor inline válida para tag \\1c (&HBBGGRR&)."""
+    raw = str(style_color or "&H00FFFFFF").strip().upper().replace("&", "")
+    if raw.startswith("H"):
+        raw = raw[1:]
+    if len(raw) == 8:
+        raw = raw[2:]  # descarta byte alpha AA para manter BBGGRR
+    if len(raw) != 6 or not re.fullmatch(r"[0-9A-F]{6}", raw):
+        raw = "FFFFFF"
+    return f"&H{raw}&"
+
+
 def _escape_ass_text(text: str) -> str:
     """Remove ou escapa tags ASS indesejadas no texto falado."""
     cleaned = str(text or "").replace("\r", " ").replace("\n", " ")
@@ -216,7 +228,8 @@ def extract_words_for_segment(
     rel_words: List[Dict[str, Any]] = []
 
     if words and not prefer_segments:
-        for w in words:
+        raw_indexed: List[tuple[float, int, float, str]] = []
+        for idx, w in enumerate(words):
             ws = float(w.get("start", 0.0))
             we = float(w.get("end", ws))
             txt = _escape_ass_text(w.get("word", w.get("text", "")))
@@ -225,7 +238,17 @@ def extract_words_for_segment(
             rs = max(0.0, ws - start_time)
             re_t = min(clip_dur, max(rs + 0.06, we - start_time))
             if re_t > rs:
-                rel_words.append({"word": txt, "start": rs, "end": re_t})
+                raw_indexed.append((rs, idx, re_t, txt))
+
+        # Ordena e garante timeline monotônica sem sobreposições (evita empilhamento no libass)
+        raw_indexed.sort(key=lambda item: (item[0], item[1]))
+        cursor = 0.0
+        for rs, _idx, re_t, txt in raw_indexed:
+            mono_s = max(cursor, rs)
+            mono_e = min(clip_dur, max(mono_s + 0.06, re_t))
+            if mono_e > mono_s and mono_s < clip_dur:
+                rel_words.append({"word": txt, "start": round(mono_s, 3), "end": round(mono_e, 3)})
+                cursor = mono_s
 
     if rel_words:
         return rel_words
@@ -314,23 +337,34 @@ def generate_ass_karaoke_for_segment(
         chunks.append(cur_chunk)
 
     events: List[str] = []
-    hl = cfg["highlight"]
-    pri = cfg["primary"]
+    hl = _ass_inline_color(cfg["highlight"])
+    pri = _ass_inline_color(cfg["primary"])
     upper = bool(cfg["uppercase"])
+    last_ev_end = 0.0
 
-    for chunk in chunks:
+    for c_idx, chunk in enumerate(chunks):
+        next_chunk_start = chunks[c_idx + 1][0]["start"] if c_idx + 1 < len(chunks) else None
         for active_idx, active_word in enumerate(chunk):
-            ev_start = active_word["start"]
-            ev_end = chunk[active_idx + 1]["start"] if active_idx + 1 < len(chunk) else active_word["end"]
+            ev_start = max(last_ev_end, float(active_word["start"]))
+            if active_idx + 1 < len(chunk):
+                ev_end = float(chunk[active_idx + 1]["start"])
+            else:
+                ev_end = float(active_word["end"])
+                if next_chunk_start is not None:
+                    ev_end = min(ev_end, float(next_chunk_start))
+
             if ev_end <= ev_start:
                 ev_end = ev_start + 0.08
+                if next_chunk_start is not None and active_idx == len(chunk) - 1:
+                    ev_end = max(ev_start + 0.04, min(ev_end, float(next_chunk_start)))
+            last_ev_end = ev_end
 
             rendered_tokens: List[str] = []
             for idx, tok in enumerate(chunk):
                 label = tok["word"].upper() if upper else tok["word"]
                 if idx == active_idx:
                     rendered_tokens.append(
-                        f"{{\\c{hl}\\fscx112\\fscy112\\t(0,85,\\fscx100\\fscy100)}}{label}{{\\c{pri}\\fscx100\\fscy100}}"
+                        f"{{\\1c{hl}\\fscx114\\fscy114\\t(0,90,\\fscx100\\fscy100)}}{label}{{\\1c{pri}\\fscx100\\fscy100}}"
                     )
                 else:
                     rendered_tokens.append(label)
@@ -350,7 +384,8 @@ def generate_ass_karaoke_for_segment(
         dest_ass = base_temp / f"karaoke_{preset}_{int(start_time)}_{int(end_time)}_{uuid.uuid4().hex[:6]}.ass"
 
     dest_ass.parent.mkdir(parents=True, exist_ok=True)
-    dest_ass.write_text(header + "\n" + "\n".join(events) + "\n", encoding="utf-8")
+    # UTF-8 com BOM garante acentuação PT-BR perfeita no libass no Windows
+    dest_ass.write_text(header + "\n" + "\n".join(events) + "\n", encoding="utf-8-sig")
     logger.info("Legenda Karaoke ASS (%s) gerada com sucesso: %s (%d eventos)", preset, dest_ass.name, len(events))
     return str(dest_ass.resolve())
 
