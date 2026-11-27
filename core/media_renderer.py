@@ -10,14 +10,14 @@ from pathlib import Path
 import re
 import subprocess  # nosec B404
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 
 from core import media_utils
 from core.downloader import get_direct_stream_url
-from core.face_tracker import detect_smooth_face_crop_x
+from core.layout_filters import build_layout_ffmpeg_args, normalize_effective_mode
 from core.subtitles import format_ffmpeg_subtitles_filter, generate_srt_for_segment
 
 logger = logging.getLogger(__name__)
@@ -445,19 +445,6 @@ def draw_framing_preview(
     return str(dest.resolve())
 
 
-def _normalize_effective_mode(mode: str, layout_mode: Optional[str], face_tracking: bool) -> Tuple[str, bool]:
-    effective_mode = (layout_mode or mode).lower().strip()
-    if effective_mode in ("blur_background", "blur"):
-        return "vertical_blur", face_tracking
-    if effective_mode in ("crop_center", "crop"):
-        return "manual_crop", face_tracking
-    if effective_mode in ("long_16_9", "original"):
-        return "horizontal_16_9", face_tracking
-    if effective_mode in ("face_tracking_9_16", "vertical_face"):
-        return "manual_crop", True
-    return effective_mode, face_tracking
-
-
 def cut_video(
     input_path: str,
     start_time: float,
@@ -473,8 +460,8 @@ def cut_video(
     layout_params: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Recorta um trecho do vídeo e renderiza nos 4 modos suportados (horizontal_16_9,
-    vertical_blur, manual_crop e split_screen) com suporte opcional a Face Tracking e legendas SRT.
+    Recorta um trecho do vídeo e renderiza nos modos suportados (horizontal_16_9,
+    vertical_blur, manual_crop, split_screen e face_tracking_9_16) via builders de layout.
     """
     media_utils.check_ffmpeg()
     src = Path(input_path)
@@ -485,224 +472,59 @@ def cut_video(
     if duration <= 0:
         raise ValueError(f"Intervalo de corte inválido: {start_time}s -> {end_time}s")
 
-    if output_path:
-        dest = Path(output_path)
-    else:
-        dest_filename = f"{src.stem}_cut_{int(start_time)}_{int(end_time)}.mp4"
-        dest = media_utils.CUTS_DIR / dest_filename
-
+    dest = Path(output_path) if output_path else (media_utils.CUTS_DIR / f"{src.stem}_cut_{int(start_time)}_{int(end_time)}.mp4")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     meta = get_video_metadata(str(src))
-    orig_w = int(meta["width"])
-    orig_h = int(meta["height"])
+    orig_w, orig_h = int(meta["width"]), int(meta["height"])
+    effective_mode, face_tracking = normalize_effective_mode(mode, layout_mode, face_tracking)
 
-    effective_mode, face_tracking = _normalize_effective_mode(mode, layout_mode, face_tracking)
-    cfg = layout_params or {}
+    target_width -= target_width % 2
+    target_height -= target_height % 2
 
-    if target_width % 2 != 0:
-        target_width -= 1
-    if target_height % 2 != 0:
-        target_height -= 1
-
-    srt_file_path = None
-    if burn_subtitles and segments:
-        srt_file_path = generate_srt_for_segment(segments, start_time, end_time)
-
-    is_vertical_format = effective_mode != "horizontal_16_9"
+    srt_file_path = generate_srt_for_segment(segments, start_time, end_time) if (burn_subtitles and segments) else None
     sub_filter = (
-        format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=is_vertical_format)
+        format_ffmpeg_subtitles_filter(srt_file_path, is_vertical=(effective_mode != "horizontal_16_9"))
         if srt_file_path
         else None
     )
 
     cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-y",
+        "ffmpeg", "-nostdin", "-y",
         "-ss", str(round(start_time, 2)),
         "-i", str(src),
         "-t", str(round(duration, 2)),
     ]
 
-    if effective_mode == "horizontal_16_9":
-        if not sub_filter:
-            cmd.extend(["-c", "copy", "-movflags", "+faststart", str(dest)])
-            logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)  # nosec B603
-            if proc.returncode != 0:
-                logger.error("Falha no FFmpeg stream copy: %s", proc.stderr)
-                raise RuntimeError(f"Erro ao processar corte horizontal: {proc.stderr[:350]}")
-            return str(dest.resolve())
-        video_filter = f"scale=trunc(iw/2)*2:trunc(ih/2)*2,{sub_filter}"
-        cmd.extend(["-vf", video_filter])
-
-    elif effective_mode == "vertical_blur":
-        zoom_factor = max(1.0, min(1.3, float(cfg.get("zoom_factor", 1.0))))
-        fg_w = int(round(target_width * zoom_factor))
-        if fg_w % 2 != 0:
-            fg_w += 1
-
-        bg_filter = (
-            f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
-            f"crop={target_width}:{target_height},boxblur=20:5,eq=brightness=-0.15[bg]"
-        )
-        if zoom_factor <= 1.0:
-            fg_filter = f"[0:v]scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
-        else:
-            fg_filter = (
-                f"[0:v]scale={fg_w}:-2:force_original_aspect_ratio=decrease,"
-                f"crop=min({target_width},iw):min({target_height},ih)[fg]"
-            )
-
-        filter_complex = f"{bg_filter};{fg_filter};[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
-        if sub_filter:
-            filter_complex += f";[merged]{sub_filter}[outv]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
-        else:
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[merged]", "-map", "0:a?"])
-
-    elif effective_mode in ("manual_crop", "crop"):
-        def_crop_w = int(orig_h * (9.0 / 16.0))
-        if def_crop_w % 2 != 0:
-            def_crop_w -= 1
-
-        if face_tracking:
-            face_x = None
-            try:
-                face_x = detect_smooth_face_crop_x(
-                    video_path=str(src),
-                    start_time=start_time,
-                    end_time=end_time,
-                    orig_w=orig_w,
-                    orig_h=orig_h,
-                    crop_w=def_crop_w,
-                )
-            except Exception as exc:
-                logger.warning("Preset Face Tracking falhou: %s. Utilizando fallback central.", exc)
-                face_x = None
-
-            if face_x is None:
-                face_x = max(0, (orig_w - def_crop_w) // 2)
-                if face_x % 2 != 0:
-                    face_x -= 1
-            crop_x, crop_y, crop_w, crop_h = face_x, 0, def_crop_w, orig_h
-        else:
-            ref_w = float(cfg.get("ref_w", 0) or 0)
-            ref_h = float(cfg.get("ref_h", 0) or 0)
-            sx = (orig_w / ref_w) if ref_w > 0 else 1.0
-            sy = (orig_h / ref_h) if ref_h > 0 else 1.0
-
-            raw_w = cfg.get("crop_w", cfg.get("w"))
-            raw_h = cfg.get("crop_h", cfg.get("h"))
-            raw_x = cfg.get("crop_x", cfg.get("x"))
-            raw_y = cfg.get("crop_y", cfg.get("y"))
-
-            crop_w = int(round(float(raw_w) * sx)) if raw_w is not None else def_crop_w
-            crop_h = int(round(float(raw_h) * sy)) if raw_h is not None else orig_h
-            crop_x = int(round(float(raw_x) * sx)) if raw_x is not None else (orig_w - crop_w) // 2
-            crop_y = int(round(float(raw_y) * sy)) if raw_y is not None else 0
-
-        target_ar = target_width / target_height
-        crop_w = max(2, min(orig_w, crop_w))
-        crop_h = max(2, min(orig_h, crop_h))
-        if crop_w / crop_h > target_ar:
-            crop_w = int(round(crop_h * target_ar))
-        else:
-            crop_h = int(round(crop_w / target_ar))
-        crop_w = max(2, min(orig_w, crop_w))
-        crop_h = max(2, min(orig_h, crop_h))
-        crop_x = max(0, min(orig_w - crop_w, crop_x))
-        crop_y = max(0, min(orig_h - crop_h, crop_y))
-
-        crop_x -= crop_x % 2
-        crop_y -= crop_y % 2
-        crop_w = max(2, crop_w - (crop_w % 2))
-        crop_h = max(2, crop_h - (crop_h % 2))
-
-        video_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={target_width}:{target_height}"
-        if sub_filter:
-            video_filter += f",{sub_filter}"
-        cmd.extend(["-vf", video_filter])
-
-    elif effective_mode in ("split_screen", "split"):
-        half_h = target_height // 2
-        target_ar = target_width / half_h
-
-        ref_w = float(cfg.get("ref_w", 0) or 0)
-        ref_h = float(cfg.get("ref_h", 0) or 0)
-        sx = (orig_w / ref_w) if ref_w > 0 else 1.0
-        sy = (orig_h / ref_h) if ref_h > 0 else 1.0
-
-        box_top = cfg.get("box_top") or {}
-        box_bottom = cfg.get("box_bottom") or {}
-
-        def_box_w = min(orig_w // 2, int(orig_h * target_ar))
-        def_box_h = int(def_box_w / target_ar)
-
-        def _fit_split_box(b: Dict[str, Any], def_x: int, def_y: int) -> Tuple[int, int, int, int]:
-            bx = int(round(float(b["x"]) * sx)) if "x" in b else def_x
-            by = int(round(float(b["y"]) * sy)) if "y" in b else def_y
-            bw = int(round(float(b["w"]) * sx)) if "w" in b else def_box_w
-            bh = int(round(float(b["h"]) * sy)) if "h" in b else def_box_h
-            bw = max(2, min(orig_w, bw))
-            bh = max(2, min(orig_h, bh))
-            if bw / bh > target_ar:
-                bw = int(round(bh * target_ar))
-            else:
-                bh = int(round(bw / target_ar))
-            bw = max(2, min(orig_w, bw))
-            bh = max(2, min(orig_h, bh))
-            bx = max(0, min(orig_w - bw, bx))
-            by = max(0, min(orig_h - bh, by))
-            return (bx - (bx % 2), by - (by % 2), max(2, bw - (bw % 2)), max(2, bh - (bh % 2)))
-
-        top_x, top_y, top_w, top_h = _fit_split_box(
-            box_top, max(0, (orig_w // 4) - (def_box_w // 2)), max(0, (orig_h - def_box_h) // 2)
-        )
-        bot_x, bot_y, bot_w, bot_h = _fit_split_box(
-            box_bottom, min(orig_w - def_box_w, (3 * orig_w // 4) - (def_box_w // 2)), max(0, (orig_h - def_box_h) // 2)
-        )
-
-        filter_complex = (
-            f"[0:v]crop={top_w}:{top_h}:{top_x}:{top_y},scale={target_width}:{half_h}[top];"
-            f"[0:v]crop={bot_w}:{bot_h}:{bot_x}:{bot_y},scale={target_width}:{half_h}[bot];"
-            f"[top][bot]vstack=inputs=2[stacked]"
-        )
-        if sub_filter:
-            filter_complex += f";[stacked]{sub_filter}[outv]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
-        else:
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[stacked]", "-map", "0:a?"])
-
-    else:
-        bg_filter = (
-            f"[0:v]scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
-            f"crop={target_width}:{target_height},boxblur=20:5,eq=brightness=-0.15[bg]"
-        )
-        fg_filter = f"[0:v]scale={target_width}:-2:force_original_aspect_ratio=decrease[fg]"
-        filter_complex = f"{bg_filter};{fg_filter};[bg][fg]overlay=(W-w)/2:(H-h)/2[merged]"
-        if sub_filter:
-            filter_complex += f";[merged]{sub_filter}[outv]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?"])
-        else:
-            cmd.extend(["-filter_complex", filter_complex, "-map", "[merged]", "-map", "0:a?"])
-
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        str(dest),
-    ])
-
-    logger.info(
-        "Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
-        start_time, end_time, effective_mode, bool(srt_file_path), dest.name,
+    layout_args, is_stream_copy = build_layout_ffmpeg_args(
+        effective_mode=effective_mode,
+        src_path=str(src),
+        start_time=start_time,
+        end_time=end_time,
+        orig_w=orig_w,
+        orig_h=orig_h,
+        target_width=target_width,
+        target_height=target_height,
+        cfg=layout_params or {},
+        face_tracking=face_tracking,
+        sub_filter=sub_filter,
     )
+    cmd.extend(layout_args)
+
+    if is_stream_copy:
+        cmd.append(str(dest))
+        logger.info("Executando corte horizontal 16:9 via stream copy (sem reencode): %s", dest.name)
+    else:
+        cmd.extend([
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "128k",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(dest),
+        ])
+        logger.info(
+            "Executando corte FFmpeg (%s -> %ss, layout: %s, legendas: %s): %s",
+            start_time, end_time, effective_mode, bool(srt_file_path), dest.name,
+        )
 
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)  # nosec B603
     if proc.returncode != 0:
