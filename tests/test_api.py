@@ -4,14 +4,17 @@ Cobre CRUD de cortes e histórico, validação Pydantic, fontes confiáveis de p
 limites de concorrência (429), deepcopy de jobs e pipelines de análise/renderização com mocks.
 """
 
+import json
 import socket
 import time
 
+from fastapi import HTTPException
 import pytest
 
 from core import downloader
 from database import db_manager
 import server
+from services import media_service
 from services.job_manager import JobManager, job_manager
 
 
@@ -473,4 +476,220 @@ def test_job_manager_ttl_and_lru_eviction():
     assert jm.get_analysis_cache(2) is None
     assert jm.get_analysis_cache(1) is not None
     assert jm.get_analysis_cache(3) is not None
+
+
+def test_create_corte_manual_endpoint_and_validation(client, sample_video_and_cut):
+    vid_id = sample_video_and_cut["video_id"]
+
+    # Criação válida (201 Created) com modo Face Tracking
+    r_create = client.post(
+        "/api/cortes",
+        json={
+            "video_id": vid_id,
+            "title": "Corte Manual Extra",
+            "start_time": 50.0,
+            "end_time": 85.0,
+            "layout_mode": "face_tracking_9_16",
+            "burn_subtitles": True,
+        },
+    )
+    assert r_create.status_code == 201
+    created = r_create.json()["corte"]
+    assert created["id"] > 0
+    assert created["title"] == "Corte Manual Extra"
+    assert created["tipo"] == "short"
+    assert created["layout_mode"] == "face_tracking_9_16"
+
+    # Corte longo (> 180s) recebe tipo="longo" automaticamente
+    r_long = client.post(
+        "/api/cortes",
+        json={
+            "video_id": vid_id,
+            "title": "Bloco Longo",
+            "start_time": 10.0,
+            "end_time": 260.0,
+            "layout_mode": "horizontal_16_9",
+        },
+    )
+    assert r_long.status_code == 201
+    assert r_long.json()["corte"]["tipo"] == "longo"
+
+    # Validações 404 e 422
+    assert (
+        client.post(
+            "/api/cortes",
+            json={"video_id": 999999, "title": "Inexistente", "start_time": 0.0, "end_time": 10.0},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/cortes",
+            json={"video_id": vid_id, "title": "Invertido", "start_time": 30.0, "end_time": 15.0},
+        ).status_code
+        == 422
+    )
+
+
+def test_get_video_workspace_reopens_saved_project_and_transcript(client, sample_video_and_cut, isolated_env):
+    vid_id = sample_video_and_cut["video_id"]
+    transcript_file = isolated_env["cache_dir"] / f"transcript_{vid_id}.json"
+    transcript_file.write_text(
+        json.dumps(
+            {
+                "text": "Fala dentro do corte. Fala fora do corte.",
+                "segments": [
+                    {"start": 12.0, "end": 18.0, "text": "Fala dentro do corte."},
+                    {"start": 90.0, "end": 95.0, "text": "Fala fora do corte."},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resp = client.get(f"/api/videos/{vid_id}/workspace")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["video_id"] == vid_id
+    assert body["is_local"] is False
+    assert len(body["cortes"]) == 1
+    assert body["cortes"][0]["id"] == sample_video_and_cut["corte_id"]
+    assert len(body["cortes"][0]["segments"]) == 1
+    assert body["cortes"][0]["segments"][0]["text"] == "Fala dentro do corte."
+    assert len(body["transcript_segments"]) == 2
+    assert job_manager.get_analysis_cache(vid_id) is not None
+
+    # Vídeo inexistente -> 404
+    assert client.get("/api/videos/999999/workspace").status_code == 404
+
+
+def test_upload_local_video_security_limits_and_202_accepted(client, isolated_env, monkeypatch):
+    started_args = []
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), daemon=True):
+            started_args.append((target, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+    valid_mp4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00" + (b"\x00" * 64)
+
+    # 1. Extensão não permitida -> 400
+    r_ext = client.post("/api/upload", files={"file": ("malware.exe", valid_mp4, "application/octet-stream")})
+    assert r_ext.status_code == 400
+
+    # 2. Assinatura binária (magic bytes) inválida -> 400 e sem arquivo residual
+    r_magic = client.post("/api/upload", files={"file": ("falso.mp4", b"NOT_A_REAL_VIDEO_HEADER", "video/mp4")})
+    assert r_magic.status_code == 400
+    assert list(isolated_env["downloads_dir"].iterdir()) == []
+
+    # 3. Arquivo vazio -> 400
+    r_empty = client.post("/api/upload", files={"file": ("vazio.mp4", b"", "video/mp4")})
+    assert r_empty.status_code == 400
+    assert list(isolated_env["downloads_dir"].iterdir()) == []
+
+    # 4. Arquivo excedendo MAX_UPLOAD_BYTES -> 413 e arquivo temporário removido
+    monkeypatch.setattr(server, "MAX_UPLOAD_BYTES", 16)
+    r_big = client.post("/api/upload", files={"file": ("grande.mp4", valid_mp4, "video/mp4")})
+    assert r_big.status_code == 413
+    assert list(isolated_env["downloads_dir"].iterdir()) == []
+    monkeypatch.setattr(server, "MAX_UPLOAD_BYTES", 1024 * 1024 * 1024)
+
+    # 5. Upload válido -> 202 Accepted com arquivo salvo com nome UUID em downloads_dir
+    r_ok = client.post(
+        "/api/upload",
+        data={"provider": "groq", "max_cuts": "4"},
+        files={"file": ("../tentativa_traversal/Podcast_Ep01.mp4", valid_mp4, "video/mp4")},
+    )
+    assert r_ok.status_code == 202
+    assert r_ok.json()["job_id"].startswith("job_analyze_")
+    saved_files = list(isolated_env["downloads_dir"].glob("local_*.mp4"))
+    assert len(saved_files) == 1
+    assert len(started_args) == 1
+    assert started_args[0][1][2] == "Podcast_Ep01"
+
+    # 6. Limite de concorrência atingido -> 429 e novo upload é removido do disco
+    with server.jobs_lock:
+        for i in range(server.MAX_CONCURRENT_ANALYZE_JOBS):
+            server.jobs[f"busy_{i}"] = {"job_id": f"busy_{i}", "type": "analyze", "status": "running"}
+
+    r_429 = client.post("/api/upload", files={"file": ("outro.mp4", valid_mp4, "video/mp4")})
+    assert r_429.status_code == 429
+    assert len(list(isolated_env["downloads_dir"].glob("local_*.mp4"))) == 1
+
+
+def test_local_video_analyze_pipeline_and_confined_source_resolution(isolated_env, tmp_path, monkeypatch):
+    local_video = isolated_env["downloads_dir"] / "local_abc123.mp4"
+    local_video.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00")
+    local_audio = isolated_env["temp_dir"] / "local_abc123_audio.mp3"
+    local_audio.write_bytes(b"mp3-local")
+    frame_file = isolated_env["temp_dir"] / "local_frame.jpg"
+    frame_file.write_bytes(b"jpg-local")
+
+    job_id = "job_local_mock_ok"
+    with server.jobs_lock:
+        server.jobs[job_id] = {"job_id": job_id, "type": "analyze", "status": "running", "progress": 0}
+
+    media_service.run_local_video_analyze_job(
+        job_id=job_id,
+        video_file_path=str(local_video),
+        original_title="Gravação Local",
+        provider="gemini",
+        max_cuts=3,
+        manager=job_manager,
+        cache_dir=isolated_env["cache_dir"],
+        temp_dir=isolated_env["temp_dir"],
+        metadata_fn=lambda _p: {"duration": 120.0, "width": 1920, "height": 1080},
+        extract_audio_fn=lambda _p, _t: str(local_audio),
+        transcribe_fn=lambda _a: {
+            "text": "Trecho local muito bom.",
+            "segments": [{"start": 5.0, "end": 35.0, "text": "Trecho local muito bom."}],
+        },
+        detect_fn=lambda _tr, provider="gemini": [
+            {
+                "title": "Highlight Local",
+                "start_time": 5.0,
+                "end_time": 35.0,
+                "virality_score": 91.0,
+                "tipo": "short",
+                "justification": "Ótimo ritmo",
+            }
+        ],
+        extract_frame_fn=lambda **kw: str(frame_file),
+    )
+
+    job = server.get_job_status(job_id)
+    assert job["status"] == "completed"
+    assert job["result"]["is_local"] is True
+    assert job["result"]["url"].startswith("local://")
+    vid_id = job["result"]["video_id"]
+    assert (isolated_env["cache_dir"] / f"transcript_{vid_id}.json").exists()
+
+    # Resolução via video_id confiável retorna o arquivo confinado em DATA_DIR
+    resolved_src, cached_stream, audio_path = server._resolve_trusted_video_source(vid_id, None)
+    assert resolved_src == str(local_video.resolve())
+    assert cached_stream is None
+    assert audio_path == str(local_audio)
+
+    # Passar o caminho local diretamente em `source` (sem video_id) continua estritamente bloqueado
+    with pytest.raises(HTTPException) as exc_raw:
+        server._resolve_trusted_video_source(None, str(local_video))
+    assert exc_raw.value.status_code == 400
+
+    # Registro local apontando para arquivo fora de DATA_DIR é bloqueado (confinamento LFI)
+    outside = tmp_path / "fora_de_data.mp4"
+    outside.write_bytes(b"secret")
+    bad_vid_id = db_manager.add_video(
+        url="local://outside.mp4",
+        title="Fora",
+        duration=30.0,
+        file_path=str(outside),
+        status="analyzed",
+    )
+    with pytest.raises(HTTPException) as exc_out:
+        server._resolve_trusted_video_source(bad_vid_id, None)
+    assert exc_out.value.status_code == 400
+
 

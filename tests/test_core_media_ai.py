@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core import ai_apis, downloader, face_tracker, logging_config, video_engine
+from core import ai_apis, downloader, face_tracker, layout_filters, logging_config, video_engine
 
 
 def test_clean_and_parse_json_handles_plain_fenced_regex_and_score_scaling():
@@ -262,4 +262,100 @@ def test_rotating_logging_and_request_id_filter(tmp_path: Path):
 
     assert log_path.exists()
     assert "[req=req-test-999]" in log_path.read_text(encoding="utf-8")
+
+
+def test_layout_filters_strategy_builders(monkeypatch):
+    # 1. Normalização de aliases legados e Face Tracking
+    assert layout_filters.normalize_effective_mode("blur_background", None, False) == ("vertical_blur", False)
+    assert layout_filters.normalize_effective_mode("crop_center", None, False) == ("manual_crop", False)
+    assert layout_filters.normalize_effective_mode("original", None, False) == ("horizontal_16_9", False)
+    assert layout_filters.normalize_effective_mode("blur", "face_tracking_9_16", False) == ("manual_crop", True)
+
+    base_kwargs = {
+        "src_path": "fake.mp4",
+        "start_time": 0.0,
+        "end_time": 10.0,
+        "orig_w": 1920,
+        "orig_h": 1080,
+        "target_width": 1080,
+        "target_height": 1920,
+        "cfg": {},
+        "face_tracking": False,
+        "sub_filter": None,
+    }
+
+    # 2. horizontal_16_9: stream copy sem legendas vs re-encode com legendas
+    args_copy, is_copy = layout_filters.build_layout_ffmpeg_args(effective_mode="horizontal_16_9", **base_kwargs)
+    assert is_copy is True
+    assert args_copy == ["-c", "copy", "-movflags", "+faststart"]
+
+    args_sub, is_copy_sub = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="horizontal_16_9",
+        **{**base_kwargs, "sub_filter": "subtitles='a.srt'"},
+    )
+    assert is_copy_sub is False
+    assert args_sub[0] == "-vf" and "subtitles='a.srt'" in args_sub[1]
+
+    # 3. vertical_blur: zoom 1.0 vs zoom 1.25 + legendas
+    args_blur_1, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="vertical_blur",
+        **{**base_kwargs, "cfg": {"zoom_factor": 1.0}},
+    )
+    assert "boxblur=20:5" in args_blur_1[1]
+    assert "[merged]" in args_blur_1
+
+    args_blur_z, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="vertical_blur",
+        **{**base_kwargs, "cfg": {"zoom_factor": 1.25}, "sub_filter": "subtitles='b.srt'"},
+    )
+    assert "crop=min(1080,iw):min(1920,ih)[fg]" in args_blur_z[1]
+    assert "[outv]" in args_blur_z
+
+    # 4. manual_crop com ref_w / ref_h rescaling e dimensões pares
+    args_crop, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="manual_crop",
+        **{
+            **base_kwargs,
+            "cfg": {"ref_w": 640, "ref_h": 360, "crop_x": 100, "crop_y": 0, "crop_w": 203, "crop_h": 360},
+        },
+    )
+    assert args_crop[0] == "-vf"
+    assert "crop=608:1080:300:0,scale=1080:1920" in args_crop[1]
+
+    # 5. face_tracking_9_16 com detecção mockada e fallback central em caso de erro
+    monkeypatch.setattr(layout_filters, "detect_smooth_face_crop_x", lambda **kw: 420)
+    args_ft, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="manual_crop",
+        **{**base_kwargs, "face_tracking": True},
+    )
+    assert "crop=606:1076:420:0,scale=1080:1920" in args_ft[1]
+
+    monkeypatch.setattr(
+        layout_filters,
+        "detect_smooth_face_crop_x",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("detector falhou")),
+    )
+    args_ft_fb, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="manual_crop",
+        **{**base_kwargs, "face_tracking": True},
+    )
+    assert "scale=1080:1920" in args_ft_fb[1]
+
+    # 6. split_screen com vstack=inputs=2 e legendas
+    args_split, _ = layout_filters.build_layout_ffmpeg_args(
+        effective_mode="split_screen",
+        **{
+            **base_kwargs,
+            "cfg": {
+                "ref_w": 640,
+                "ref_h": 360,
+                "box_top": {"x": 20, "y": 10, "w": 280, "h": 250},
+                "box_bottom": {"x": 340, "y": 10, "w": 280, "h": 250},
+            },
+            "sub_filter": "subtitles='c.srt'",
+        },
+    )
+    assert "vstack=inputs=2[stacked]" in args_split[1]
+    assert "[outv]" in args_split
+
 

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from core import config, downloader, face_tracker, media_utils, video_engine
+import server
 
 
 def _mock_public_dns(host, port, *args, **kwargs):
@@ -206,12 +207,8 @@ def test_removed_orphan_frame_preview_and_private_transcript_cache(client):
 
 def test_frontend_es_modules_xss_regression_guard_and_blur_optimization():
     web_dir = Path(__file__).resolve().parent.parent / "web"
-    js_files = [
-        web_dir / "app.js",
-        web_dir / "js" / "utils.js",
-        web_dir / "js" / "api.js",
-        web_dir / "js" / "canvas_engine.js",
-    ]
+    js_files = [web_dir / "app.js", *sorted((web_dir / "js").glob("*.js"))]
+    assert len(js_files) >= 9, f"Esperado ao menos 9 módulos ES no frontend, encontrado {len(js_files)}"
 
     forbidden_interpolations = ("title", "justification", "video_url", "v.url", "s.text", "cut.", "error", "step")
     for js_file in js_files:
@@ -222,10 +219,19 @@ def test_frontend_es_modules_xss_regression_guard_and_blur_optimization():
                 for bad_token in forbidden_interpolations:
                     assert bad_token not in expr, f"Interpolação insegura em {js_file.name}: ${{{expr}}}"
 
-    # Verifica presença da otimização de blur 60fps via canvas offscreen
+    # Verifica ausência total de handlers inline (on*=) no index.html e ausência de window.* em app.js
+    html_src = (web_dir / "index.html").read_text(encoding="utf-8")
+    inline_handlers = re.findall(r"\bon[a-z]+\s*=", html_src, flags=re.IGNORECASE)
+    assert inline_handlers == [], f"Handlers inline proibidos no index.html: {inline_handlers}"
+
+    app_src = (web_dir / "app.js").read_text(encoding="utf-8")
+    assert "Object.assign(window" not in app_src, "app.js não deve poluir o escopo global window.*"
+
+    # Verifica presença da otimização de blur 60fps via canvas offscreen e modo Face Tracking
     canvas_src = (web_dir / "js" / "canvas_engine.js").read_text(encoding="utf-8")
     assert "drawOptimizedBlurredBackground" in canvas_src
     assert "initBlurBuffer" in canvas_src
+    assert "face_tracking_9_16" in canvas_src
 
     utils_src = (web_dir / "js" / "utils.js").read_text(encoding="utf-8")
     assert "export function escapeHtml(" in utils_src
@@ -263,6 +269,18 @@ def test_frontend_es_modules_xss_regression_guard_and_blur_optimization():
             timeout=10,
         )
         assert res.returncode == 0, res.stderr
+
+
+def test_upload_video_magic_bytes_validation():
+    assert server._is_valid_video_magic_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00", ".mp4") is True
+    assert server._is_valid_video_magic_bytes(b"\x00\x00\x00\x14moov\x00\x00\x00\x00", ".mov") is True
+    assert server._is_valid_video_magic_bytes(b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81", ".mkv") is True
+    assert server._is_valid_video_magic_bytes(b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81", ".webm") is True
+
+    assert server._is_valid_video_magic_bytes(b"MZ\x90\x00\x03\x00\x00\x00", ".mp4") is False
+    assert server._is_valid_video_magic_bytes(b"<script>alert(1)</script>", ".webm") is False
+    assert server._is_valid_video_magic_bytes(b"short", ".mp4") is False
+    assert server._is_valid_video_magic_bytes(b"\x00\x00\x00\x18ftypmp42", ".exe") is False
 
 
 def test_yunet_model_sha256_verification_rejects_tampered_binary(tmp_path: Path, monkeypatch):
