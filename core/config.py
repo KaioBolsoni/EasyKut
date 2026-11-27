@@ -32,14 +32,14 @@ DOWNLOADS_DIR = DATA_DIR / "downloads"
 CUTS_DIR = DATA_DIR / "cortes"
 CACHE_DIR = DATA_DIR / "cache"
 LOGS_DIR = DATA_DIR / "logs"
+BRANDS_DIR = DATA_DIR / "brands"
+MUSIC_DIR = DATA_DIR / "music"
+BROLL_DIR = DATA_DIR / "broll"
 PROMPTS_DIR = BASE_DIR / "prompts"
 
 # Cria diretórios essenciais caso não existam
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-CUTS_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+for _dir in (DOWNLOADS_DIR, CUTS_DIR, CACHE_DIR, LOGS_DIR, BRANDS_DIR, MUSIC_DIR, BROLL_DIR, PROMPTS_DIR):
+    _dir.mkdir(parents=True, exist_ok=True)
 
 # Procura e carrega arquivo .env de forma determinística
 env_file = BASE_DIR / ".env"
@@ -62,6 +62,15 @@ for stray_name in ("APIS.txt", ".env"):
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 YOUTUBE_COOKIES_ENV = os.getenv("YOUTUBE_COOKIES_PATH", "").strip()
+
+# Integrações opcionais (Onda 4: B-Roll & Publicação OAuth)
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
+YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "").strip()
+YOUTUBE_REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN", "").strip()
+TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN", "").strip()
+INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+IG_BUSINESS_ACCOUNT_ID = os.getenv("IG_BUSINESS_ACCOUNT_ID", "").strip()
 
 
 def get_cookies_file() -> Optional[Path]:

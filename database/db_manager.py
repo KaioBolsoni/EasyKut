@@ -17,13 +17,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = (BASE_DIR / "data").resolve()
 DEFAULT_DB_PATH = (DATA_DIR / "cortador.db").resolve()
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 VALID_LAYOUT_MODES = {
     "horizontal_16_9",
     "vertical_blur",
     "manual_crop",
     "split_screen",
     "face_tracking_9_16",
+    "square_1_1",
 }
 
 
@@ -73,6 +74,14 @@ def _deserialize_corte_row(row: sqlite3.Row) -> Dict[str, Any]:
         item["layout_params"] = {}
     if "burn_subtitles" in item:
         item["burn_subtitles"] = bool(item["burn_subtitles"])
+    raw_seo = item.get("seo_kit_json")
+    if isinstance(raw_seo, str) and raw_seo.strip() and raw_seo.strip() != "{}":
+        try:
+            item["seo_kit"] = json.loads(raw_seo)
+        except Exception:
+            item["seo_kit"] = None
+    else:
+        item["seo_kit"] = None
     return item
 
 
@@ -139,6 +148,65 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cortes_virality_score ON cortes (virality_score);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos (created_at DESC, id DESC);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_url ON videos (url);")
+
+    if current_version < 4:
+        existing_cols = {
+            row["name"]
+            for row in cursor.execute("PRAGMA table_info(cortes);").fetchall()
+        }
+        if "seo_kit_json" not in existing_cols:
+            cursor.execute("ALTER TABLE cortes ADD COLUMN seo_kit_json TEXT DEFAULT '{}';")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS brand_kits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                logo_path TEXT DEFAULT '',
+                logo_position TEXT DEFAULT 'top_right',
+                logo_opacity REAL DEFAULT 0.85 CHECK (logo_opacity >= 0.0 AND logo_opacity <= 1.0),
+                logo_scale REAL DEFAULT 0.14 CHECK (logo_scale >= 0.05 AND logo_scale <= 0.40),
+                subtitle_preset TEXT DEFAULT 'hormozi',
+                progress_bar_enabled INTEGER DEFAULT 1,
+                progress_bar_color TEXT DEFAULT '#6366F1',
+                hook_banner_enabled INTEGER DEFAULT 0,
+                hook_banner_duration REAL DEFAULT 3.0 CHECK (hook_banner_duration >= 0.5 AND hook_banner_duration <= 10.0),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS job_queue (
+                job_id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                step TEXT DEFAULT '',
+                progress INTEGER DEFAULT 0,
+                result_json TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                corte_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                title TEXT NOT NULL,
+                caption TEXT DEFAULT '',
+                hashtags TEXT DEFAULT '',
+                scheduled_at TEXT NOT NULL,
+                status TEXT DEFAULT 'scheduled',
+                external_id TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (corte_id) REFERENCES cortes (id) ON DELETE CASCADE
+            );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue (status, updated_at DESC);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status ON scheduled_posts (status, scheduled_at ASC);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_posts_corte_id ON scheduled_posts (corte_id);")
 
     if current_version < SCHEMA_VERSION:
         cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -510,6 +578,7 @@ def update_corte(
     burn_subtitles: Optional[bool] = None,
     output_path: Optional[str] = None,
     status: Optional[str] = None,
+    seo_kit: Optional[Dict[str, Any]] = None,
     db_path: Optional[Path] = None,
 ) -> bool:
     """
@@ -571,6 +640,9 @@ def update_corte(
         if status is not None:
             updates.append("status = ?")
             params.append(str(status))
+        if seo_kit is not None:
+            updates.append("seo_kit_json = ?")
+            params.append(json.dumps(seo_kit, ensure_ascii=False))
 
         params.append(corte_id)
         query = f"UPDATE cortes SET {', '.join(updates)} WHERE id = ?"
