@@ -1,7 +1,7 @@
 """
-Servidor Backend FastAPI do EasyKut Studio (V3.0)
-Camada HTTP fina responsável por rotas REST, contratos Pydantic/OpenAPI,
-hardening de segurança local, observabilidade (X-Request-ID, /api/health) e arquivos estáticos.
+Servidor Backend FastAPI do EasyKut Studio (V3.2)
+Camada HTTP fina responsável por rotas REST, middlewares de segurança/correlação,
+upload seguro de vídeos locais, reabertura de workspace e arquivos estáticos.
 """
 
 import logging
@@ -20,11 +20,10 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
 
 from core.ai_apis import detect_viral_moments, transcribe_audio_groq
 from core.config import (
@@ -45,8 +44,10 @@ from core.video_engine import (
     cut_video,
     extract_preview_clip,
     extract_preview_frame,
+    get_video_metadata,
 )
 from database.db_manager import (
+    add_corte,
     delete_corte,
     delete_video,
     get_connection,
@@ -56,10 +57,32 @@ from database.db_manager import (
     list_videos_with_cortes,
     update_corte,
 )
+from schemas.api_schemas import (
+    AllowedLayoutMode,
+    AnalyzeRequest,
+    CleanupRequest,
+    CleanupResponse,
+    ConfigResponse,
+    CorteMutationResponse,
+    CreateCorteRequest,
+    FrameRequest,
+    FrameResponse,
+    HealthResponse,
+    JobAcceptedResponse,
+    MessageResponse,
+    PreviewClipRequest,
+    PreviewClipResponse,
+    RenderCutItem,
+    RenderRequest,
+    UpdateCorteRequest,
+    WorkspaceResponse,
+)
 from services.job_manager import job_manager
 from services.media_service import (
+    load_video_workspace as _service_load_workspace,
     resolve_trusted_video_source as _service_resolve_source,
     run_analyze_job as _service_run_analyze_job,
+    run_local_video_analyze_job as _service_run_local_analyze_job,
     run_render_job as _service_run_render_job,
 )
 
@@ -79,12 +102,24 @@ WEB_DIR = (BASE_DIR / "web").resolve()
 for _d in (TEMP_DIR, CUTS_DIR, DOWNLOADS_DIR, CACHE_DIR, WEB_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+ALLOWED_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
+def _is_valid_video_magic_bytes(header: bytes, ext: str) -> bool:
+    """Valida assinatura binária (magic bytes) básica de contêineres MP4/MOV/MKV/WebM."""
+    if len(header) < 8:
+        return False
+    if ext in (".mp4", ".mov", ".m4v"):
+        return b"ftyp" in header[:16] or header[4:8] in (b"moov", b"mdat", b"wide", b"free")
+    if ext in (".mkv", ".webm"):
+        return header.startswith(b"\x1a\x45\xdf\xa3")
+    return False
+
 
 def _migrate_legacy_transcripts_to_cache() -> None:
-    """
-    Move arquivos transcript_*.json legados de data/temp/ (exposto via StaticFiles)
-    para data/cache/ (privado, não servido via HTTP).
-    """
+    """Move arquivos transcript_*.json legados de data/temp/ para data/cache/."""
     for legacy_file in TEMP_DIR.glob("transcript_*.json"):
         try:
             dest = CACHE_DIR / legacy_file.name
@@ -97,17 +132,15 @@ def _migrate_legacy_transcripts_to_cache() -> None:
 
 
 _migrate_legacy_transcripts_to_cache()
-# GC automático de arquivos temporários com mais de 24h no startup
 cleanup_temporary_files(temp_dir=TEMP_DIR, remove_raw_downloads=False, max_age_hours=24.0)
 
 # Instância FastAPI
 app = FastAPI(
     title="EasyKut Studio API",
-    version="3.1.0",
+    version="3.2.0",
     description="Backend local REST de alta performance para curadoria, enquadramento e renderização de cortes virais.",
 )
 
-# Política estrita de CORS e origens locais permitidas
 ALLOWED_ORIGINS = [
     "http://127.0.0.1:8502",
     "http://localhost:8502",
@@ -133,13 +166,10 @@ app.add_middleware(
 async def local_security_middleware(request: Request, call_next):
     """
     Proteção contra DNS rebinding, CSRF cross-origin em rotas mutáveis /api/*,
-    rastreamento por X-Request-ID e injeção de cabeçalhos defensivos padrão.
+    rastreamento por X-Request-ID e cabeçalhos defensivos padrão.
     """
     incoming_req_id = (request.headers.get("x-request-id") or "").strip()
-    if incoming_req_id and re.fullmatch(r"[A-Za-z0-9_.-]{4,64}", incoming_req_id):
-        req_id = incoming_req_id
-    else:
-        req_id = uuid.uuid4().hex[:12]
+    req_id = incoming_req_id if (incoming_req_id and re.fullmatch(r"[A-Za-z0-9_.-]{4,64}", incoming_req_id)) else uuid.uuid4().hex[:12]
 
     token = request_id_var.set(req_id)
     try:
@@ -187,153 +217,13 @@ def update_job(
     result: Optional[Any] = None,
     error: Optional[str] = None,
 ) -> None:
-    job_manager.update_job(
-        job_id=job_id,
-        status=status,
-        step=step,
-        progress=progress,
-        result=result,
-        error=error,
-    )
-
-
-# ==========================================
-# MODELOS PYDANTIC (REQUEST & RESPONSE SCHEMAS)
-# ==========================================
-AllowedLayoutMode = Literal[
-    "horizontal_16_9",
-    "vertical_blur",
-    "manual_crop",
-    "split_screen",
-    "face_tracking_9_16",
-]
-
-
-class AnalyzeRequest(BaseModel):
-    url: str
-    provider: Literal["gemini", "groq"] = "gemini"
-    max_cuts: int = Field(default=5, ge=1, le=20)
-
-
-class FrameRequest(BaseModel):
-    video_id: Optional[int] = None
-    source: Optional[str] = None
-    timestamp_sec: float = Field(default=1.0, ge=0.0)
-
-
-class PreviewClipRequest(BaseModel):
-    video_id: Optional[int] = None
-    source: Optional[str] = None
-    start_time: float = Field(default=0.0, ge=0.0)
-    end_time: float = Field(default=30.0, gt=0.0)
-
-
-class UpdateCorteRequest(BaseModel):
-    title: Optional[str] = None
-    start_time: Optional[float] = Field(default=None, ge=0.0)
-    end_time: Optional[float] = Field(default=None, gt=0.0)
-    tipo: Optional[Literal["short", "longo"]] = None
-    layout_mode: Optional[AllowedLayoutMode] = None
-    layout_params: Optional[Dict[str, Any]] = None
-    burn_subtitles: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def validate_time_order(self):
-        if self.start_time is not None and self.end_time is not None and self.end_time <= self.start_time:
-            raise ValueError("end_time deve ser maior que start_time.")
-        return self
-
-
-class RenderCutItem(BaseModel):
-    id: Optional[int] = None
-    title: Optional[str] = None
-    titulo: Optional[str] = None
-    start_time: float = Field(..., ge=0.0)
-    end_time: float = Field(..., gt=0.0)
-    layout_mode: AllowedLayoutMode = "vertical_blur"
-    layout_params: Optional[Dict[str, Any]] = None
-    burn_subtitles: Optional[bool] = True
-
-    @model_validator(mode="after")
-    def validate_time_order(self):
-        if self.end_time <= self.start_time:
-            raise ValueError("end_time deve ser maior que start_time.")
-        return self
-
-    def get_effective_title(self, fallback: str = "Corte") -> str:
-        return self.titulo or self.title or fallback
-
-
-class RenderRequest(BaseModel):
-    video_id: int
-    cuts: List[RenderCutItem]
-    max_resolution: Literal[720, 1080] = 1080
-
-
-class CleanupRequest(BaseModel):
-    remove_raw_downloads: bool = False
-    max_age_hours: Optional[float] = Field(default=None, ge=0.0)
-
-
-class JobAcceptedResponse(BaseModel):
-    job_id: str
-    message: str
-
-
-class ConfigResponse(BaseModel):
-    ready: bool
-    keys: Dict[str, bool]
-    default_provider: Literal["gemini", "groq"]
-    status_details: Dict[str, Any]
-
-
-class HealthResponse(BaseModel):
-    status: Literal["ok", "degraded"]
-    version: str
-    db_ok: bool
-    ffmpeg_available: bool
-    disk_free_mb: float
-    active_jobs: Dict[str, int]
-
-
-class FrameResponse(BaseModel):
-    success: bool
-    frame_url: str
-    timestamp_sec: float
-
-
-class PreviewClipResponse(BaseModel):
-    success: bool
-    clip_url: str
-    start_time: float
-    end_time: float
-
-
-class CleanupResponse(BaseModel):
-    success: bool
-    deleted_count: int
-    freed_mb: float
-    pruned_jobs: int
-    pruned_cache: int
-
-
-class MessageResponse(BaseModel):
-    success: bool
-    message: str
-
-
-class CorteMutationResponse(BaseModel):
-    success: bool
-    corte: Dict[str, Any]
+    job_manager.update_job(job_id=job_id, status=status, step=step, progress=progress, result=result, error=error)
 
 
 # ==========================================
 # WRAPPERS INTERNOS DE SERVIÇO
 # ==========================================
-def _resolve_trusted_video_source(
-    video_id: Optional[int],
-    source: Optional[str],
-) -> tuple[str, Optional[str], Optional[str]]:
+def _resolve_trusted_video_source(video_id: Optional[int], source: Optional[str]) -> tuple[str, Optional[str], Optional[str]]:
     return _service_resolve_source(video_id=video_id, source=source, manager=job_manager)
 
 
@@ -346,6 +236,23 @@ def _run_analyze_job(job_id: str, url: str, provider: str, max_cuts: int) -> Non
         manager=job_manager,
         cache_dir=CACHE_DIR,
         download_audio_fn=download_audio_with_metadata,
+        transcribe_fn=transcribe_audio_groq,
+        detect_fn=detect_viral_moments,
+        extract_frame_fn=extract_preview_frame,
+    )
+
+
+def _run_local_analyze_job(job_id: str, video_file_path: str, original_title: str, provider: str, max_cuts: int) -> None:
+    _service_run_local_analyze_job(
+        job_id=job_id,
+        video_file_path=video_file_path,
+        original_title=original_title,
+        provider=provider,
+        max_cuts=max_cuts,
+        manager=job_manager,
+        cache_dir=CACHE_DIR,
+        temp_dir=TEMP_DIR,
+        metadata_fn=get_video_metadata,
         transcribe_fn=transcribe_audio_groq,
         detect_fn=detect_viral_moments,
         extract_frame_fn=extract_preview_frame,
@@ -387,12 +294,11 @@ def health_check(response: Response):
         disk_free_mb = -1.0
 
     counts = job_manager.active_counts()
-    is_healthy = db_ok
-    if not is_healthy:
+    if not db_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return HealthResponse(
-        status="ok" if is_healthy else "degraded",
+        status="ok" if db_ok else "degraded",
         version=app.version,
         db_ok=db_ok,
         ffmpeg_available=bool(FFMPEG_AVAILABLE),
@@ -403,7 +309,7 @@ def health_check(response: Response):
 
 @app.get("/api/config", response_model=ConfigResponse)
 def get_config():
-    """Retorna o status das chaves de API, disponibilidade do FFmpeg, cookies e provedor padrão."""
+    """Retorna status das chaves de API, disponibilidade do FFmpeg, cookies e provedor padrão."""
     is_ready, details = validate_config()
     return ConfigResponse(
         ready=is_ready,
@@ -420,7 +326,7 @@ def get_config():
 
 @app.post("/api/analyze", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
 def start_analyze(req: AnalyzeRequest):
-    """Inicia a esteira assíncrona de análise IA para uma URL suportada (retorna 202 Accepted)."""
+    """Inicia a esteira assíncrona de análise IA para uma URL pública suportada (202 Accepted)."""
     target_url = (req.url or "").strip()
     if not target_url.startswith(("http://", "https://")):
         target_url = "https://" + target_url
@@ -428,16 +334,9 @@ def start_analyze(req: AnalyzeRequest):
     if not is_valid_video_url(target_url):
         raise HTTPException(status_code=400, detail="URL de vídeo inválida ou não suportada.")
 
-    job_id = job_manager.create_job(
-        job_type="analyze",
-        step="Iniciando esteira de análise...",
-        progress=5,
-    )
+    job_id = job_manager.create_job(job_type="analyze", step="Iniciando esteira de análise...", progress=5)
     if job_id is None:
-        raise HTTPException(
-            status_code=429,
-            detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual.",
-        )
+        raise HTTPException(status_code=429, detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual.")
 
     threading.Thread(
         target=_run_analyze_job,
@@ -445,10 +344,85 @@ def start_analyze(req: AnalyzeRequest):
         daemon=True,
     ).start()
 
-    return JobAcceptedResponse(
-        job_id=job_id,
-        message="Análise de vídeo iniciada com sucesso em segundo plano.",
+    return JobAcceptedResponse(job_id=job_id, message="Análise de vídeo iniciada com sucesso em segundo plano.")
+
+
+@app.post("/api/upload", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
+async def upload_local_video(
+    file: UploadFile = File(...),
+    provider: Literal["gemini", "groq"] = Form("gemini"),
+    max_cuts: int = Form(5, ge=1, le=20),
+):
+    """
+    Recebe upload de arquivo de vídeo local (.mp4/.mov/.mkv/.webm/.m4v), valida extensão,
+    magic bytes e tamanho máximo em streaming seguro dentro de data/downloads/ e inicia a análise IA.
+    """
+    orig_name = Path(file.filename or "video.mp4").name
+    ext = Path(orig_name).suffix.lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato não suportado ('{ext or 'sem extensão'}'). Use: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}.",
+        )
+
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    dest_path = (DOWNLOADS_DIR / f"local_{uuid.uuid4().hex[:12]}{ext}").resolve()
+
+    total_bytes = 0
+    first_chunk = b""
+    try:
+        with open(dest_path, "wb") as out_f:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                if not first_chunk:
+                    first_chunk = chunk[:32]
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Arquivo excede o limite máximo permitido de 1 GB.")
+                out_f.write(chunk)
+    except HTTPException:
+        dest_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        dest_path.unlink(missing_ok=True)
+        logger.error("Erro ao receber upload local: %s", exc)
+        raise HTTPException(status_code=500, detail="Erro interno ao salvar vídeo enviado.")
+    finally:
+        await file.close()
+
+    if total_bytes == 0 or not _is_valid_video_magic_bytes(first_chunk, ext):
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Arquivo enviado está vazio ou não possui assinatura válida de vídeo.")
+
+    job_id = job_manager.create_job(job_type="analyze", step="Vídeo recebido! Iniciando análise local...", progress=5)
+    if job_id is None:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=429, detail="Limite de análises simultâneas atingido. Aguarde a conclusão do job atual.")
+
+    title = Path(orig_name).stem or "Vídeo Local"
+    threading.Thread(
+        target=_run_local_analyze_job,
+        args=(job_id, str(dest_path), title, provider, max_cuts),
+        daemon=True,
+    ).start()
+
+    return JobAcceptedResponse(job_id=job_id, message="Upload recebido e análise iniciada em segundo plano.")
+
+
+@app.get("/api/videos/{video_id}/workspace", response_model=WorkspaceResponse)
+def get_video_workspace(video_id: int):
+    """Carrega vídeo, cortes salvos e transcrição em cache para reabertura direta no Estúdio."""
+    workspace = _service_load_workspace(
+        video_id=video_id,
+        manager=job_manager,
+        cache_dir=CACHE_DIR,
+        temp_dir=TEMP_DIR,
     )
+    if not workspace:
+        raise HTTPException(status_code=404, detail=f"Vídeo ID {video_id} não encontrado.")
+    return WorkspaceResponse(**workspace)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -465,35 +439,17 @@ def get_frame(req: FrameRequest):
     """Extrai 1 frame JPEG no timestamp informado a partir de vídeo previamente cadastrado."""
     trusted_url, cached_stream, _ = _resolve_trusted_video_source(req.video_id, req.source)
 
-    acquired = preview_ffmpeg_semaphore.acquire(timeout=1.5)
-    if not acquired:
-        raise HTTPException(
-            status_code=429,
-            detail="Muitas extrações de prévia em andamento. Tente novamente em instantes.",
-        )
+    if not preview_ffmpeg_semaphore.acquire(timeout=1.5):
+        raise HTTPException(status_code=429, detail="Muitas extrações de prévia em andamento. Tente novamente em instantes.")
 
     try:
-        frame_path = extract_preview_frame(
-            source=trusted_url,
-            timestamp_sec=req.timestamp_sec,
-            direct_stream_url=cached_stream,
-        )
-        if not frame_path or not os.path.exists(frame_path):
-            if cached_stream:
-                logger.info("Tentando extrair frame novamente sem o stream URL em cache...")
-                frame_path = extract_preview_frame(
-                    source=trusted_url,
-                    timestamp_sec=req.timestamp_sec,
-                    direct_stream_url=None,
-                )
+        frame_path = extract_preview_frame(source=trusted_url, timestamp_sec=req.timestamp_sec, direct_stream_url=cached_stream)
+        if (not frame_path or not os.path.exists(frame_path)) and cached_stream:
+            frame_path = extract_preview_frame(source=trusted_url, timestamp_sec=req.timestamp_sec, direct_stream_url=None)
         if not frame_path or not os.path.exists(frame_path):
             raise HTTPException(status_code=500, detail="Não foi possível extrair o frame solicitado via FFmpeg.")
 
-        return FrameResponse(
-            success=True,
-            frame_url=f"/data/temp/{Path(frame_path).name}",
-            timestamp_sec=req.timestamp_sec,
-        )
+        return FrameResponse(success=True, frame_url=f"/data/temp/{Path(frame_path).name}", timestamp_sec=req.timestamp_sec)
     except HTTPException:
         raise
     except Exception as exc:
@@ -511,12 +467,8 @@ def get_preview_clip(req: PreviewClipRequest):
 
     trusted_url, cached_stream, local_audio = _resolve_trusted_video_source(req.video_id, req.source)
 
-    acquired = preview_ffmpeg_semaphore.acquire(timeout=1.5)
-    if not acquired:
-        raise HTTPException(
-            status_code=429,
-            detail="Muitas prévias em vídeo sendo geradas simultaneamente. Aguarde alguns segundos.",
-        )
+    if not preview_ffmpeg_semaphore.acquire(timeout=1.5):
+        raise HTTPException(status_code=429, detail="Muitas prévias em vídeo sendo geradas simultaneamente. Aguarde alguns segundos.")
 
     try:
         clip_path = extract_preview_clip(
@@ -546,7 +498,7 @@ def get_preview_clip(req: PreviewClipRequest):
 
 @app.post("/api/render", status_code=status.HTTP_202_ACCEPTED, response_model=JobAcceptedResponse)
 def start_render(req: RenderRequest):
-    """Inicia a renderização assíncrona em background dos cortes selecionados (retorna 202 Accepted)."""
+    """Inicia a renderização assíncrona em background dos cortes selecionados (202 Accepted)."""
     if not req.cuts:
         raise HTTPException(status_code=400, detail="Nenhum corte selecionado para renderização.")
 
@@ -554,16 +506,9 @@ def start_render(req: RenderRequest):
     if not video:
         raise HTTPException(status_code=404, detail=f"Vídeo ID {req.video_id} não encontrado.")
 
-    job_id = job_manager.create_job(
-        job_type="render",
-        step=f"Iniciando renderização de {len(req.cuts)} corte(s)...",
-        progress=5,
-    )
+    job_id = job_manager.create_job(job_type="render", step=f"Iniciando renderização de {len(req.cuts)} corte(s)...", progress=5)
     if job_id is None:
-        raise HTTPException(
-            status_code=429,
-            detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar.",
-        )
+        raise HTTPException(status_code=429, detail="Limite de renderizações simultâneas atingido. Aguarde o job em andamento terminar.")
 
     threading.Thread(
         target=_run_render_job,
@@ -571,10 +516,7 @@ def start_render(req: RenderRequest):
         daemon=True,
     ).start()
 
-    return JobAcceptedResponse(
-        job_id=job_id,
-        message="Processo de renderização iniciado em segundo plano.",
-    )
+    return JobAcceptedResponse(job_id=job_id, message="Processo de renderização iniciado em segundo plano.")
 
 
 @app.get("/api/history")
@@ -585,18 +527,11 @@ def get_history(
     limit: int = Query(50, ge=1, le=200, description="Máximo de vídeos por página"),
     offset: int = Query(0, ge=0, description="Deslocamento de paginação"),
 ):
-    """
-    Retorna vídeos paginados com seus cortes em consulta em lote (sem N+1).
-    Expõe o total de vídeos correspondentes no cabeçalho X-Total-Count.
-    """
+    """Retorna vídeos paginados com seus cortes em consulta em lote (sem N+1) + X-Total-Count."""
     videos, total_count = list_videos_with_cortes(search=search, limit=limit, offset=offset)
     response.headers["X-Total-Count"] = str(total_count)
 
-    existing_cut_names = (
-        {p.name for p in CUTS_DIR.iterdir() if p.is_file()}
-        if CUTS_DIR.exists()
-        else set()
-    )
+    existing_cut_names = {p.name for p in CUTS_DIR.iterdir() if p.is_file()} if CUTS_DIR.exists() else set()
 
     history_items: List[Dict[str, Any]] = []
     for v in videos:
@@ -642,6 +577,37 @@ def delete_history_item(
     )
 
 
+@app.post("/api/cortes", status_code=status.HTTP_201_CREATED, response_model=CorteMutationResponse)
+def create_corte_item(req: CreateCorteRequest):
+    """Cria manualmente um novo corte associado a um vídeo existente (201 Created)."""
+    if not get_video(req.video_id):
+        raise HTTPException(status_code=404, detail=f"Vídeo ID {req.video_id} não encontrado.")
+
+    dur = req.end_time - req.start_time
+    tipo = req.tipo or ("short" if dur <= 180.0 else "longo")
+    layout_params = req.layout_params if req.layout_params is not None else (
+        {"zoom_factor": 1.0} if req.layout_mode == "vertical_blur" else {}
+    )
+    try:
+        new_id = add_corte(
+            video_id=req.video_id,
+            title=req.title.strip(),
+            start_time=req.start_time,
+            end_time=req.end_time,
+            virality_score=req.virality_score,
+            justification=req.justification,
+            tipo=tipo,
+            layout_mode=req.layout_mode,
+            layout_params=layout_params,
+            burn_subtitles=req.burn_subtitles,
+            status="pending",
+        )
+    except ValueError as val_exc:
+        raise HTTPException(status_code=400, detail=str(val_exc))
+
+    return CorteMutationResponse(success=True, corte=get_corte(new_id) or {})
+
+
 @app.get("/api/cortes/{corte_id}")
 def get_corte_item(corte_id: int):
     """Retorna metadados completos de um corte individual pelo ID."""
@@ -673,10 +639,7 @@ def patch_corte_item(corte_id: int, req: UpdateCorteRequest):
     if not updated:
         raise HTTPException(status_code=404, detail=f"Corte ID {corte_id} não encontrado.")
 
-    return CorteMutationResponse(
-        success=True,
-        corte=get_corte(corte_id) or {},
-    )
+    return CorteMutationResponse(success=True, corte=get_corte(corte_id) or {})
 
 
 @app.delete("/api/cortes/{corte_id}", response_model=MessageResponse)
@@ -696,10 +659,7 @@ def delete_corte_item(
 
 @app.post("/api/cleanup", response_model=CleanupResponse)
 def cleanup_resources(req: Optional[CleanupRequest] = None):
-    """
-    Executa limpeza sob demanda de arquivos temporários (data/temp/, opcionalmente downloads brutos)
-    e poda entradas expiradas de jobs/cache em memória, preservando data/cortes/.
-    """
+    """Executa limpeza sob demanda de data/temp/ (e opcionalmente downloads) + poda TTL/LRU."""
     payload = req or CleanupRequest()
     disk_res = cleanup_temporary_files(
         temp_dir=TEMP_DIR,
@@ -726,10 +686,7 @@ def open_folder():
             os.startfile(cuts_abs)  # nosec B606
         else:
             subprocess.Popen(["explorer", cuts_abs])  # nosec B603, B607
-        return MessageResponse(
-            success=True,
-            message="Pasta data/cortes/ aberta no Explorador de Arquivos.",
-        )
+        return MessageResponse(success=True, message="Pasta data/cortes/ aberta no Explorador de Arquivos.")
     except Exception as exc:
         logger.error("Erro ao abrir pasta data/cortes/: %s", exc)
         raise HTTPException(status_code=500, detail="Erro interno ao abrir pasta de cortes no Explorador.")
@@ -741,6 +698,8 @@ def open_folder():
 app.mount("/data/temp", StaticFiles(directory=str(BASE_DIR / "data" / "temp")), name="data_temp")
 app.mount("/data/cortes", StaticFiles(directory=str(BASE_DIR / "data" / "cortes")), name="data_cortes")
 app.mount("/", StaticFiles(directory=str(BASE_DIR / "web"), html=True), name="web")
+
+__all__ = ["AllowedLayoutMode", "RenderCutItem", "app"]
 
 
 if __name__ == "__main__":
